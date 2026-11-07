@@ -1,3 +1,4 @@
+use crate::annotations::{load_annotations_from_pdf, AnnotationManager};
 use crate::memory_manager::LruTextureCache;
 use crate::pdf_engine::{LoadedPdfDocument, PageDimensions, PdfEngine};
 use crate::text_search::{PageTextLayer, TextSelectionState};
@@ -130,8 +131,8 @@ pub struct DocumentTab {
     pub document: Option<LoadedPdfDocument<'static>>,
     pub text_layers: Vec<PageTextLayer>,
     pub text_selection: TextSelectionState,
+    pub annotations: AnnotationManager,
     pub viewport: ViewportState,
-    #[allow(dead_code)]
     pub is_modified: bool,
     pub badge_color: Color32,
 }
@@ -145,6 +146,13 @@ impl DocumentTab {
         let path = doc.path.clone();
         let title = doc.title.clone();
         let page_dimensions = doc.page_dimensions.clone();
+        let mut annotations = AnnotationManager::new();
+        if let Ok(loaded_annots) = load_annotations_from_pdf(&path, &page_dimensions) {
+            for a in loaded_annots {
+                annotations.add_annotation(a);
+            }
+            annotations.selected_id = None;
+        }
         Self {
             id,
             path,
@@ -153,6 +161,7 @@ impl DocumentTab {
             document: Some(doc),
             text_layers: Vec::new(),
             text_selection: TextSelectionState::default(),
+            annotations,
             viewport: ViewportState::default(),
             is_modified: false,
             badge_color,
@@ -205,9 +214,14 @@ pub enum PaletteCommand {
     SwitchTab(usize),
     ToggleSidebarPin,
     OpenFileDialog,
+    SaveAnnotatedPdf,
     NewDemoTab,
     Open15TabsBenchmark,
     HibernateInactiveTabs,
+    PopulateDemoAnnotations,
+    UndoAnnotation,
+    RedoAnnotation,
+    DeleteSelectedAnnotation,
     CloseActiveTab,
     SelectTool(ActiveTool),
     FitToWidth,
@@ -284,7 +298,37 @@ impl CommandPaletteState {
             });
         }
 
-        // 2. Commandes Mémoire & Onglets
+        // 2. Commandes Annotations ISO 32000, Mémoire & Onglets
+        all.push(PaletteEntry {
+            category: "Annotations",
+            label: "Enregistrer le PDF avec les annotations standard ISO 32000 (Compatible Adobe Acrobat)".to_string(),
+            shortcut: "Ctrl+S",
+            command: PaletteCommand::SaveAnnotatedPdf,
+        });
+        all.push(PaletteEntry {
+            category: "Annotations",
+            label: "Générer la vitrine complète d'annotations ISO 32000 sur la page courante".to_string(),
+            shortcut: "Démo Annot",
+            command: PaletteCommand::PopulateDemoAnnotations,
+        });
+        all.push(PaletteEntry {
+            category: "Annotations",
+            label: "Annuler la dernière action d'annotation (Undo)".to_string(),
+            shortcut: "Ctrl+Z",
+            command: PaletteCommand::UndoAnnotation,
+        });
+        all.push(PaletteEntry {
+            category: "Annotations",
+            label: "Rétablir l'action d'annotation (Redo)".to_string(),
+            shortcut: "Ctrl+Y",
+            command: PaletteCommand::RedoAnnotation,
+        });
+        all.push(PaletteEntry {
+            category: "Annotations",
+            label: "Supprimer l'annotation sélectionnée".to_string(),
+            shortcut: "Suppr",
+            command: PaletteCommand::DeleteSelectedAnnotation,
+        });
         all.push(PaletteEntry {
             category: "Mémoire",
             label: "Ouvrir 15 PDF en simultané (Stress-Test Virtualisation & Hibernation)".to_string(),
@@ -417,10 +461,16 @@ mod tests {
             (1, "Spécification_ISO_32000.pdf".to_string(), 8, true),
         ];
 
-        palette.query = "iso".to_string();
+        palette.query = "spécification".to_string();
         let results = palette.filtered_entries(&tabs, 5);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].command, PaletteCommand::SwitchTab(1));
+
+        palette.query = "iso".to_string();
+        let iso_results = palette.filtered_entries(&tabs, 5);
+        assert!(iso_results
+            .iter()
+            .any(|e| e.command == PaletteCommand::SaveAnnotatedPdf));
 
         palette.query = "surligner".to_string();
         let tool_results = palette.filtered_entries(&tabs, 5);

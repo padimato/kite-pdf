@@ -1,3 +1,6 @@
+use crate::annotations::{
+    save_annotations_to_pdf, AnnotationKind, PdfAnnotation, ShapeKind, PALETTE_COLORS,
+};
 use crate::memory_manager::{
     query_process_memory_bytes, LruTextureCache, PageTextureKey, DEFAULT_TEXTURE_BUDGET_BYTES,
 };
@@ -5,7 +8,7 @@ use crate::pdf_engine::{ensure_custom_sample_pdf, PdfEngine};
 use crate::tabs::{
     ActiveTool, CommandPaletteState, DocumentTab, PaletteCommand, SidebarState, SIDEBAR_WIDTH,
 };
-use crate::text_search::{PdfTopDownRect, SearchBarState};
+use crate::text_search::{PdfTopDownRect, SearchBarState, SelectionGestureMode};
 use crate::viewport::BASE_DPI_SCALE;
 use egui::{
     Align2, Color32, Context, CornerRadius, FontId, Key, Margin, Order, Pos2, Rect, Sense, Stroke,
@@ -39,6 +42,9 @@ pub struct AutomationConfig {
     pub initial_search_query: Option<String>,
     pub initial_match_index: Option<usize>,
     pub initial_select_rect: Option<PdfTopDownRect>,
+    pub initial_select_stream: Option<(usize, usize)>,
+    pub demo_annotations: bool,
+    pub save_annotated_output: Option<PathBuf>,
     pub screenshot_output: Option<PathBuf>,
 }
 
@@ -63,6 +69,9 @@ pub struct SuperPdfApp {
     pub texture_cache: LruTextureCache,
     /// Consommation RAM réelle du processus Windows (Working Set en octets)
     pub process_working_set_bytes: usize,
+    /// Indique si un glisser de déplacement d'annotation est en cours
+    dragging_annotation_id: Option<u64>,
+    last_drag_pt: Option<(f32, f32)>,
     /// Dernière erreur éventuelle à afficher
     error_message: Option<String>,
     /// Compteur de frames pour le mode capture d'écran automatisée
@@ -139,6 +148,8 @@ impl SuperPdfApp {
             search_bar: SearchBarState::default(),
             texture_cache: LruTextureCache::new(DEFAULT_TEXTURE_BUDGET_BYTES),
             process_working_set_bytes: ws_bytes,
+            dragging_annotation_id: None,
+            last_drag_pt: None,
             error_message: None,
             frame_count: 0,
             screenshot_requested: false,
@@ -183,7 +194,6 @@ impl SuperPdfApp {
             app.command_palette.query = q.clone();
         }
 
-        // Recherche initiale Ctrl+F si demandée par CLI
         if let Some(sq) = &automation.initial_search_query {
             app.search_bar.open();
             app.search_bar.query = sq.clone();
@@ -199,7 +209,7 @@ impl SuperPdfApp {
             }
         }
 
-        // Sélection de texte initiale si demandée par CLI
+        // Sélection rectangulaire initiale (Alt + Glisser)
         if let Some(sel_rect) = automation.initial_select_rect {
             if let Some(tab) = app.tabs.get_mut(app.active_tab) {
                 tab.ensure_text_layers(app.engine);
@@ -207,10 +217,47 @@ impl SuperPdfApp {
                 if let Some(layer) = tab.text_layers.get(target_page) {
                     let (txt, boxes) = layer.select_in_rect(&sel_rect);
                     tab.text_selection.page_index = Some(target_page);
+                    tab.text_selection.mode = SelectionGestureMode::RectangularBlock;
                     tab.text_selection.drag_start_pt = Some((sel_rect.x_min, sel_rect.y_min));
                     tab.text_selection.drag_current_pt = Some((sel_rect.x_max, sel_rect.y_max));
                     tab.text_selection.selected_text = txt;
                     tab.text_selection.highlight_boxes = boxes;
+                }
+            }
+        }
+
+        // Sélection au fil des phrases initiale (Curseur I)
+        if let Some((c_start, c_end)) = automation.initial_select_stream {
+            if let Some(tab) = app.tabs.get_mut(app.active_tab) {
+                tab.ensure_text_layers(app.engine);
+                let target_page = automation.initial_page.unwrap_or(1).saturating_sub(1);
+                if let Some(layer) = tab.text_layers.get(target_page) {
+                    let (txt, boxes) = layer.select_char_stream(c_start, c_end);
+                    tab.text_selection.page_index = Some(target_page);
+                    tab.text_selection.mode = SelectionGestureMode::StreamIBeam;
+                    tab.text_selection.anchor_char_index = Some(c_start);
+                    tab.text_selection.current_char_index = Some(c_end);
+                    tab.text_selection.selected_text = txt;
+                    tab.text_selection.highlight_boxes = boxes;
+                }
+            }
+        }
+
+        // Vitrine d'annotations ISO 32000 si demandée par CLI
+        if automation.demo_annotations {
+            if let Some(tab) = app.tabs.get_mut(app.active_tab) {
+                let target_page = automation.initial_page.unwrap_or(1).saturating_sub(1);
+                tab.annotations.populate_demo_showcase(target_page);
+                tab.is_modified = true;
+
+                if let Some(save_path) = &automation.save_annotated_output {
+                    let _ = save_annotations_to_pdf(
+                        &tab.path,
+                        save_path,
+                        &tab.annotations.items,
+                        &tab.page_dimensions,
+                    );
+                    tab.annotations.saved_feedback_frames = 120;
                 }
             }
         }
@@ -221,7 +268,6 @@ impl SuperPdfApp {
         app
     }
 
-    /// Bascule vers l'onglet `target_index`, réveille son document PDFium et met en hibernation les autres onglets.
     pub fn switch_to_tab(&mut self, target_index: usize) {
         if target_index >= self.tabs.len() {
             return;
@@ -245,7 +291,6 @@ impl SuperPdfApp {
         self.active_tab = target_index;
     }
 
-    /// Ouvre un fichier PDF dans un nouvel onglet, hiberne les précédents et bascule dessus
     pub fn open_pdf_in_new_tab(&mut self, path: &Path) {
         let color_idx = self.tabs.len() % TAB_BADGE_COLORS.len();
         let (badge_color, _) = TAB_BADGE_COLORS[color_idx];
@@ -321,7 +366,33 @@ impl SuperPdfApp {
         ((zoom * 20.0).round() as u32).max(1)
     }
 
-    /// Centre la vue sur l'occurrence de recherche courante (`current_match_index`)
+    /// Enregistre les annotations de l'onglet actif directement dans le fichier PDF selon la norme ISO 32000 (`Ctrl+S`)
+    pub fn save_active_tab_annotations(&mut self) {
+        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+            // Relâcher temporairement le handle PDFium sur Windows pour écrire dans le fichier en place
+            let tab_id = tab.id;
+            tab.hibernate(&mut self.texture_cache);
+            let res = save_annotations_to_pdf(
+                &tab.path,
+                &tab.path,
+                &tab.annotations.items,
+                &tab.page_dimensions,
+            );
+            let _ = tab.ensure_awake(self.engine);
+            self.texture_cache.evict_tab(tab_id);
+            match res {
+                Ok(()) => {
+                    tab.is_modified = false;
+                    tab.annotations.saved_feedback_frames = 120;
+                    self.error_message = None;
+                }
+                Err(e) => {
+                    self.error_message = Some(format!("Erreur sauvegarde PDF : {:#}", e));
+                }
+            }
+        }
+    }
+
     pub fn scroll_to_current_search_match(&mut self, viewport_size: Vec2) {
         let Some(m) = self
             .search_bar
@@ -364,6 +435,31 @@ impl SuperPdfApp {
                     .pick_file()
                 {
                     self.open_pdf_in_new_tab(&path);
+                }
+            }
+            PaletteCommand::SaveAnnotatedPdf => {
+                self.save_active_tab_annotations();
+            }
+            PaletteCommand::PopulateDemoAnnotations => {
+                if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                    let p = tab.viewport.current_page_index(viewport_size, &tab.page_dimensions);
+                    tab.annotations.populate_demo_showcase(p);
+                    tab.is_modified = true;
+                }
+            }
+            PaletteCommand::UndoAnnotation => {
+                if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                    tab.annotations.undo();
+                }
+            }
+            PaletteCommand::RedoAnnotation => {
+                if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                    tab.annotations.redo();
+                }
+            }
+            PaletteCommand::DeleteSelectedAnnotation => {
+                if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                    tab.annotations.delete_selected();
                 }
             }
             PaletteCommand::NewDemoTab => {
@@ -454,6 +550,7 @@ impl SuperPdfApp {
         let mut tab_cycle_dir: i32 = 0;
         let mut trigger_search_open = false;
         let mut copy_selected_text = false;
+        let text_input_focused = ctx.wants_keyboard_input();
 
         ctx.input(|input| {
             // 1. Capture d'écran GPU automatisée
@@ -484,7 +581,7 @@ impl SuperPdfApp {
             let ctrl = input.modifiers.ctrl || input.modifiers.command;
             let shift = input.modifiers.shift;
 
-            // 3. Raccourcis globaux (Ctrl+F Recherche, Ctrl+C Copie, Ctrl+K Palette, Ctrl+B Sidebar)
+            // 3. Raccourcis globaux (Ctrl+F, Ctrl+C, Ctrl+S, Ctrl+Z, Ctrl+Y, Ctrl+K, Ctrl+B)
             if ctrl && input.key_pressed(Key::F) {
                 trigger_search_open = true;
             }
@@ -496,6 +593,25 @@ impl SuperPdfApp {
             {
                 copy_selected_text = true;
             }
+            if ctrl && input.key_pressed(Key::S) {
+                pending_commands.push(PaletteCommand::SaveAnnotatedPdf);
+            }
+            if ctrl && input.key_pressed(Key::Z) {
+                if shift {
+                    pending_commands.push(PaletteCommand::RedoAnnotation);
+                } else {
+                    pending_commands.push(PaletteCommand::UndoAnnotation);
+                }
+            }
+            if ctrl && input.key_pressed(Key::Y) {
+                pending_commands.push(PaletteCommand::RedoAnnotation);
+            }
+            if !text_input_focused
+                && (input.key_pressed(Key::Delete) || input.key_pressed(Key::Backspace))
+            {
+                pending_commands.push(PaletteCommand::DeleteSelectedAnnotation);
+            }
+
             if ctrl && (input.key_pressed(Key::K) || input.key_pressed(Key::P)) {
                 self.command_palette.toggle();
             }
@@ -506,6 +622,7 @@ impl SuperPdfApp {
                     self.search_bar.close();
                 } else if let Some(tab) = self.tabs.get_mut(self.active_tab) {
                     tab.text_selection.clear();
+                    tab.annotations.selected_id = None;
                 }
             }
 
@@ -549,11 +666,11 @@ impl SuperPdfApp {
                 }
             }
 
-            if self.command_palette.is_open {
+            if self.command_palette.is_open || text_input_focused {
                 return;
             }
 
-            // 4. Raccourcis d'outils à 1 touche (si aucun champ texte n'a le focus)
+            // 4. Raccourcis d'outils à 1 touche
             if !ctrl && !self.search_bar.is_open {
                 if input.key_pressed(Key::V) {
                     self.active_tool = ActiveTool::Select;
@@ -634,7 +751,6 @@ impl SuperPdfApp {
                 }
             }
 
-            // Zoom clavier Ctrl++ / Ctrl+-
             if ctrl && (input.key_pressed(Key::Plus) || input.key_pressed(Key::Equals)) {
                 tab.viewport.apply_zoom_around_anchor(
                     1.2,
@@ -642,8 +758,6 @@ impl SuperPdfApp {
                     viewport_size,
                     pages,
                 );
-                tab.viewport.last_gesture_label =
-                    format!("Zoom + ({:.0}%)", tab.viewport.zoom * 100.0);
             }
             if ctrl && input.key_pressed(Key::Minus) {
                 tab.viewport.apply_zoom_around_anchor(
@@ -652,11 +766,8 @@ impl SuperPdfApp {
                     viewport_size,
                     pages,
                 );
-                tab.viewport.last_gesture_label =
-                    format!("Zoom - ({:.0}%)", tab.viewport.zoom * 100.0);
             }
 
-            // Défilement clavier (hors barre de recherche ouverte)
             let step_y = 75.0;
             let step_x = 60.0;
             if !ctrl && !self.search_bar.is_open {
@@ -733,14 +844,16 @@ impl SuperPdfApp {
         }
     }
 
-    /// Gère la sélection de texte par cliquer-glisser (Trackpad / Souris) sur une page visible lorsque `ActiveTool::Select` est actif
-    fn handle_page_text_selection_drag(
+    /// Gère sur une page donnée :
+    /// 1. Le curseur `I` (`CursorIcon::Text`), la sélection au fil des phrases (glisser simple), le double-clic sur un mot, et `Alt + Glisser` (bloc rectangulaire).
+    /// 2. La sélection, le déplacement et la création d'annotations ISO 32000 (`Highlight`, `FreeText`, `Ink`, `Shape`, `StickyNote`, `Measure`).
+    fn handle_page_canvas_interactions(
         &mut self,
         ctx: &Context,
         page_index: usize,
         page_rect: Rect,
     ) {
-        if self.active_tool != ActiveTool::Select || self.command_palette.is_open {
+        if self.command_palette.is_open {
             return;
         }
         let pointer_over_sidebar = self.sidebar.is_expanded()
@@ -752,17 +865,20 @@ impl SuperPdfApp {
             return;
         }
 
-        let (press_pos, hover_pos, primary_pressed, primary_down, space_down) = ctx.input(|i| {
-            (
-                i.pointer.press_origin(),
-                i.pointer.hover_pos(),
-                i.pointer.primary_pressed(),
-                i.pointer.primary_down(),
-                i.key_down(Key::Space),
-            )
-        });
+        let (hover_pos, primary_pressed, primary_down, primary_released, double_clicked, alt_held, space_down) =
+            ctx.input(|i| {
+                (
+                    i.pointer.hover_pos(),
+                    i.pointer.primary_pressed(),
+                    i.pointer.primary_down(),
+                    i.pointer.primary_released(),
+                    i.pointer.button_double_clicked(egui::PointerButton::Primary),
+                    i.modifiers.alt,
+                    i.key_down(Key::Space),
+                )
+            });
 
-        if space_down {
+        if space_down || self.active_tool == ActiveTool::Pan {
             return;
         }
 
@@ -771,44 +887,289 @@ impl SuperPdfApp {
         };
         let page_dim = tab.page_dimensions[page_index];
 
-        // Début du glisser sur cette page
-        if primary_pressed {
-            if let Some(origin) = press_pos {
-                // Éviter d'intercepter les clics sur la barre de recherche en haut à droite
-                if page_rect.contains(origin) && origin.y > 56.0 {
-                    tab.ensure_text_layers(self.engine);
-                    let pt_x = ((origin.x - page_rect.min.x) / page_rect.width().max(1.0))
-                        * page_dim.width_pt;
-                    let pt_y = ((origin.y - page_rect.min.y) / page_rect.height().max(1.0))
-                        * page_dim.height_pt;
-                    tab.text_selection.page_index = Some(page_index);
-                    tab.text_selection.drag_start_pt = Some((pt_x, pt_y));
-                    tab.text_selection.drag_current_pt = Some((pt_x, pt_y));
-                    tab.text_selection.selected_text.clear();
-                    tab.text_selection.highlight_boxes.clear();
-                }
-            }
+        let Some(cursor) = hover_pos else {
+            return;
+        };
+        if !page_rect.contains(cursor) || cursor.y < 52.0 {
+            return;
         }
 
-        // Mise à jour en temps réel pendant le glissement sur cette page
-        if primary_down && tab.text_selection.page_index == Some(page_index) {
-            if let Some(curr) = hover_pos {
-                let pt_x = (((curr.x - page_rect.min.x) / page_rect.width().max(1.0))
-                    * page_dim.width_pt)
-                    .clamp(0.0, page_dim.width_pt);
-                let pt_y = (((curr.y - page_rect.min.y) / page_rect.height().max(1.0))
-                    * page_dim.height_pt)
-                    .clamp(0.0, page_dim.height_pt);
-                tab.text_selection.drag_current_pt = Some((pt_x, pt_y));
+        let pt_x =
+            (((cursor.x - page_rect.min.x) / page_rect.width().max(1.0)) * page_dim.width_pt)
+                .clamp(0.0, page_dim.width_pt);
+        let pt_y =
+            (((cursor.y - page_rect.min.y) / page_rect.height().max(1.0)) * page_dim.height_pt)
+                .clamp(0.0, page_dim.height_pt);
 
-                if let Some(sel_rect) = tab.text_selection.active_drag_rect() {
-                    if sel_rect.width() > 3.0 || sel_rect.height() > 3.0 {
-                        if let Some(layer) = tab.text_layers.get(page_index) {
-                            let (txt, boxes) = layer.select_in_rect(&sel_rect);
-                            tab.text_selection.selected_text = txt;
-                            tab.text_selection.highlight_boxes = boxes;
+        // Curseur I-Beam quand on survole du texte en mode Sélection ou Surligner
+        if matches!(self.active_tool, ActiveTool::Select | ActiveTool::Highlight) {
+            tab.ensure_text_layers(self.engine);
+            let over_annot = tab
+                .annotations
+                .items
+                .iter()
+                .any(|a| a.page_index == page_index && a.hit_test(pt_x, pt_y));
+            if over_annot && self.active_tool == ActiveTool::Select {
+                ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+            } else if let Some(layer) = tab.text_layers.get(page_index) {
+                if layer.char_index_near_point(pt_x, pt_y, 12.0).is_some() {
+                    ctx.set_cursor_icon(egui::CursorIcon::Text);
+                }
+            }
+        } else {
+            ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+        }
+
+        // --- CAS 1 : OUTIL SÉLECTION (V) OU SURLIGNER (H) ---
+        if matches!(self.active_tool, ActiveTool::Select | ActiveTool::Highlight) {
+            // Double-clic sur un mot : sélectionne le mot entier !
+            if double_clicked {
+                tab.ensure_text_layers(self.engine);
+                if let Some(layer) = tab.text_layers.get(page_index) {
+                    if let Some((s, e, txt, boxes)) = layer.select_word_at_point(pt_x, pt_y) {
+                        tab.text_selection.page_index = Some(page_index);
+                        tab.text_selection.mode = SelectionGestureMode::StreamIBeam;
+                        tab.text_selection.anchor_char_index = Some(s);
+                        tab.text_selection.current_char_index = Some(e);
+                        tab.text_selection.selected_text = txt;
+                        tab.text_selection.highlight_boxes = boxes;
+                        return;
+                    }
+                }
+            }
+
+            if primary_pressed {
+                // 1a. Vérifier d'abord si l'utilisateur clique sur une annotation existante pour la sélectionner / déplacer
+                if self.active_tool == ActiveTool::Select && !alt_held {
+                    if let Some(hit_id) = tab
+                        .annotations
+                        .items
+                        .iter()
+                        .rev()
+                        .find(|a| a.page_index == page_index && a.hit_test(pt_x, pt_y))
+                        .map(|a| a.id)
+                    {
+                        tab.annotations.selected_id = Some(hit_id);
+                        tab.annotations.push_undo_snapshot();
+                        self.dragging_annotation_id = Some(hit_id);
+                        self.last_drag_pt = Some((pt_x, pt_y));
+                        tab.text_selection.clear();
+                        return;
+                    }
+                }
+
+                // 1b. Sinon, démarrer une sélection de texte (Flux Curseur I par défaut, ou Rectangle si Alt maintenu)
+                tab.annotations.selected_id = None;
+                self.dragging_annotation_id = None;
+                tab.ensure_text_layers(self.engine);
+                tab.text_selection.page_index = Some(page_index);
+                tab.text_selection.drag_start_pt = Some((pt_x, pt_y));
+                tab.text_selection.drag_current_pt = Some((pt_x, pt_y));
+                tab.text_selection.selected_text.clear();
+                tab.text_selection.highlight_boxes.clear();
+
+                if alt_held {
+                    tab.text_selection.mode = SelectionGestureMode::RectangularBlock;
+                } else {
+                    tab.text_selection.mode = SelectionGestureMode::StreamIBeam;
+                    if let Some(layer) = tab.text_layers.get(page_index) {
+                        let start_idx = layer.char_index_near_point(pt_x, pt_y, 28.0);
+                        tab.text_selection.anchor_char_index = start_idx;
+                        tab.text_selection.current_char_index = start_idx;
+                    }
+                }
+            }
+
+            if primary_down {
+                // Déplacement en direct d'une annotation sélectionnée
+                if let (Some(drag_id), Some((lx, ly))) =
+                    (self.dragging_annotation_id, self.last_drag_pt)
+                {
+                    let dx = pt_x - lx;
+                    let dy = pt_y - ly;
+                    if dx.abs() > 0.2 || dy.abs() > 0.2 {
+                        if let Some(annot) =
+                            tab.annotations.items.iter_mut().find(|a| a.id == drag_id)
+                        {
+                            annot.translate(dx, dy);
+                            tab.is_modified = true;
+                        }
+                        self.last_drag_pt = Some((pt_x, pt_y));
+                    }
+                    return;
+                }
+
+                // Mise à jour de la sélection de texte en cours
+                if tab.text_selection.page_index == Some(page_index) {
+                    tab.text_selection.drag_current_pt = Some((pt_x, pt_y));
+                    if let Some(layer) = tab.text_layers.get(page_index) {
+                        match tab.text_selection.mode {
+                            SelectionGestureMode::StreamIBeam => {
+                                if let Some(anchor_idx) = tab.text_selection.anchor_char_index {
+                                    if let Some(curr_idx) =
+                                        layer.char_index_near_point(pt_x, pt_y, 40.0)
+                                    {
+                                        tab.text_selection.current_char_index = Some(curr_idx);
+                                        if curr_idx != anchor_idx {
+                                            let (txt, boxes) =
+                                                layer.select_char_stream(anchor_idx, curr_idx);
+                                            tab.text_selection.selected_text = txt;
+                                            tab.text_selection.highlight_boxes = boxes;
+                                        }
+                                    }
+                                }
+                            }
+                            SelectionGestureMode::RectangularBlock => {
+                                if let Some(sel_rect) = tab.text_selection.active_drag_rect() {
+                                    if sel_rect.width() > 3.0 || sel_rect.height() > 3.0 {
+                                        let (txt, boxes) = layer.select_in_rect(&sel_rect);
+                                        tab.text_selection.selected_text = txt;
+                                        tab.text_selection.highlight_boxes = boxes;
+                                    }
+                                }
+                            }
                         }
                     }
+                }
+            }
+
+            if primary_released {
+                self.dragging_annotation_id = None;
+                self.last_drag_pt = None;
+
+                // Si l'outil actif est Surligner (H) et qu'une sélection vient d'être faite, créer l'annotation /Highlight ISO 32000 !
+                if self.active_tool == ActiveTool::Highlight && tab.text_selection.has_selection() {
+                    let quads = tab.text_selection.highlight_boxes.clone();
+                    if let Some(first) = quads.first() {
+                        let union_rect = quads.iter().fold(*first, |acc, q| acc.union(q));
+                        let color = tab.annotations.active_color_rgb;
+                        tab.annotations.add_annotation(PdfAnnotation {
+                            id: 0,
+                            page_index,
+                            rect: union_rect,
+                            color_rgb: color,
+                            kind: AnnotationKind::Highlight { quads },
+                        });
+                        tab.is_modified = true;
+                        tab.text_selection.clear();
+                    }
+                }
+            }
+            return;
+        }
+
+        // --- CAS 2 : OUTIL BLOC DE TEXTE (/FreeText - Touche T) OU NOTE (/Text - Touche N) ---
+        if matches!(self.active_tool, ActiveTool::FreeText | ActiveTool::StickyNote) {
+            if primary_pressed {
+                let color = tab.annotations.active_color_rgb;
+                if self.active_tool == ActiveTool::FreeText {
+                    let rect = PdfTopDownRect {
+                        x_min: pt_x,
+                        y_min: pt_y,
+                        x_max: (pt_x + 185.0).min(page_dim.width_pt - 10.0),
+                        y_max: (pt_y + 48.0).min(page_dim.height_pt - 10.0),
+                        angle_deg: 0.0,
+                    };
+                    tab.annotations.add_annotation(PdfAnnotation {
+                        id: 0,
+                        page_index,
+                        rect,
+                        color_rgb: color,
+                        kind: AnnotationKind::FreeText {
+                            text: "Nouveau bloc texte ISO 32000".to_string(),
+                            font_size: 11.5,
+                        },
+                    });
+                } else {
+                    let rect = PdfTopDownRect {
+                        x_min: pt_x,
+                        y_min: pt_y,
+                        x_max: (pt_x + 175.0).min(page_dim.width_pt - 10.0),
+                        y_max: (pt_y + 46.0).min(page_dim.height_pt - 10.0),
+                        angle_deg: 0.0,
+                    };
+                    tab.annotations.add_annotation(PdfAnnotation {
+                        id: 0,
+                        page_index,
+                        rect,
+                        color_rgb: color,
+                        kind: AnnotationKind::StickyNote {
+                            comment: "Nouvelle note PDF".to_string(),
+                            is_popup_open: true,
+                        },
+                    });
+                }
+                tab.is_modified = true;
+                self.active_tool = ActiveTool::Select;
+            }
+            return;
+        }
+
+        // --- CAS 3 : OUTILS DESSIN LIBRE (/Ink - D), FORMES (/Line & /Square - R), ET MESURE (/Measure - M) ---
+        if matches!(
+            self.active_tool,
+            ActiveTool::Ink | ActiveTool::Shape | ActiveTool::Measure
+        ) {
+            if primary_pressed {
+                tab.annotations.active_draft_page = Some(page_index);
+                tab.annotations.active_draft_points.clear();
+                tab.annotations.active_draft_points.push((pt_x, pt_y));
+            }
+            if primary_down && tab.annotations.active_draft_page == Some(page_index) {
+                if let Some(&last) = tab.annotations.active_draft_points.last() {
+                    let dist_sq = (pt_x - last.0).powi(2) + (pt_y - last.1).powi(2);
+                    if dist_sq > 2.0 {
+                        tab.annotations.active_draft_points.push((pt_x, pt_y));
+                    }
+                }
+            }
+            if primary_released && tab.annotations.active_draft_page == Some(page_index) {
+                let pts = std::mem::take(&mut tab.annotations.active_draft_points);
+                tab.annotations.active_draft_page = None;
+                if pts.len() >= 2 {
+                    let start = pts[0];
+                    let end = *pts.last().unwrap();
+                    let min_x = pts.iter().map(|p| p.0).fold(f32::INFINITY, f32::min);
+                    let max_x = pts.iter().map(|p| p.0).fold(f32::NEG_INFINITY, f32::max);
+                    let min_y = pts.iter().map(|p| p.1).fold(f32::INFINITY, f32::min);
+                    let max_y = pts.iter().map(|p| p.1).fold(f32::NEG_INFINITY, f32::max);
+                    let rect = PdfTopDownRect {
+                        x_min: (min_x - 4.0).max(0.0),
+                        y_min: (min_y - 4.0).max(0.0),
+                        x_max: (max_x + 4.0).min(page_dim.width_pt),
+                        y_max: (max_y + 4.0).min(page_dim.height_pt),
+                        angle_deg: 0.0,
+                    };
+                    let color = tab.annotations.active_color_rgb;
+                    let kind = match self.active_tool {
+                        ActiveTool::Ink => AnnotationKind::Ink {
+                            strokes: vec![pts],
+                            thickness: 2.5,
+                        },
+                        ActiveTool::Shape => AnnotationKind::Shape {
+                            shape_kind: if alt_held {
+                                ShapeKind::Rectangle
+                            } else {
+                                ShapeKind::ArrowLine
+                            },
+                            start_pt: start,
+                            end_pt: end,
+                        },
+                        ActiveTool::Measure => AnnotationKind::Measure {
+                            start_pt: start,
+                            end_pt: end,
+                            stamp_tag: Some("COTE ISO".to_string()),
+                        },
+                        _ => unreachable!(),
+                    };
+                    tab.annotations.add_annotation(PdfAnnotation {
+                        id: 0,
+                        page_index,
+                        rect,
+                        color_rgb: color,
+                        kind,
+                    });
+                    tab.is_modified = true;
                 }
             }
         }
@@ -839,7 +1200,6 @@ impl eframe::App for SuperPdfApp {
         visuals.panel_fill = Color32::from_rgb(18, 20, 26);
         ctx.set_visuals(visuals);
 
-        // Si la barre latérale est épinglée, elle occupe un SidePanel gauche fixe
         if self.sidebar.pinned {
             egui::SidePanel::left("superpdf_sidebar_pinned")
                 .exact_width(SIDEBAR_WIDTH)
@@ -854,7 +1214,6 @@ impl eframe::App for SuperPdfApp {
                 });
         }
 
-        // Zone principale du document PDF (100% de la hauteur d'écran !)
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(Color32::from_rgb(18, 20, 26)))
             .show(ctx, |ui| {
@@ -870,6 +1229,9 @@ impl eframe::App for SuperPdfApp {
                     if tab.text_selection.copied_feedback_frames > 0 {
                         tab.text_selection.copied_feedback_frames -= 1;
                     }
+                    if tab.annotations.saved_feedback_frames > 0 {
+                        tab.annotations.saved_feedback_frames -= 1;
+                    }
                     if tab.viewport.is_panning {
                         ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
                     } else if self.active_tool == ActiveTool::Pan {
@@ -877,7 +1239,6 @@ impl eframe::App for SuperPdfApp {
                     }
                 }
 
-                // Collecter les géométries des pages visibles pour gérer la sélection et le dessin
                 let visible_pages_info: Vec<(usize, Rect)> =
                     if let Some(tab) = self.tabs.get(self.active_tab) {
                         let (layouts, _, _) = tab.viewport.compute_layout(&tab.page_dimensions);
@@ -898,11 +1259,17 @@ impl eframe::App for SuperPdfApp {
                     };
 
                 for (p_idx, p_rect) in &visible_pages_info {
-                    self.handle_page_text_selection_drag(ctx, *p_idx, *p_rect);
+                    self.handle_page_canvas_interactions(ctx, *p_idx, *p_rect);
                 }
 
                 let painter = ui.painter_at(canvas_rect);
-                let mut selection_toolbar_anchor: Option<(Pos2, String, usize, bool)> = None;
+                let mut selection_toolbar_anchor: Option<(
+                    Pos2,
+                    String,
+                    usize,
+                    bool,
+                    SelectionGestureMode,
+                )> = None;
 
                 if let Some(err) = &self.error_message {
                     painter.text(
@@ -967,7 +1334,39 @@ impl eframe::App for SuperPdfApp {
 
                         let page_dim = tab.page_dimensions[page_index];
 
-                        // --- DESSIN DES SURBRILLANCES DE RECHERCHE `Ctrl+F` (JALON 4) ---
+                        // --- 1. DESSIN DES ANNOTATIONS ISO 32000 SUR LA PAGE (JALON 5) ---
+                        Self::paint_page_annotations(
+                            &painter,
+                            &tab.annotations.items,
+                            tab.annotations.selected_id,
+                            page_index,
+                            page_rect,
+                            page_dim,
+                            tab.viewport.zoom,
+                        );
+
+                        // Tracé temporaire en cours de dessin au Trackpad / Souris
+                        if tab.annotations.active_draft_page == Some(page_index)
+                            && tab.annotations.active_draft_points.len() >= 2
+                        {
+                            let sx = page_rect.width() / page_dim.width_pt.max(1.0);
+                            let sy = page_rect.height() / page_dim.height_pt.max(1.0);
+                            let screen_pts: Vec<Pos2> = tab
+                                .annotations
+                                .active_draft_points
+                                .iter()
+                                .map(|&(x, y)| {
+                                    Pos2::new(page_rect.min.x + x * sx, page_rect.min.y + y * sy)
+                                })
+                                .collect();
+                            let (r, g, b) = tab.annotations.active_color_rgb;
+                            painter.add(egui::Shape::line(
+                                screen_pts,
+                                Stroke::new(2.5_f32, Color32::from_rgb(r, g, b)),
+                            ));
+                        }
+
+                        // --- 2. DESSIN DES SURBRILLANCES DE RECHERCHE `Ctrl+F` (JALON 4) ---
                         if self.search_bar.is_open && !self.search_bar.matches.is_empty() {
                             for (m_idx, m) in self.search_bar.matches.iter().enumerate() {
                                 if m.page_index != page_index {
@@ -999,14 +1398,20 @@ impl eframe::App for SuperPdfApp {
                                     );
                                 }
 
-                                // Badge au-dessus de l'occurrence active (avec indication d'angle si le texte est en diagonale/vertical !)
                                 if is_active_match {
                                     if let Some(first_b) = m.highlight_boxes.first() {
                                         let screen_b = first_b.to_screen_rect(page_rect, page_dim);
                                         let badge_rect = Rect::from_min_size(
-                                            Pos2::new(screen_b.min.x, (screen_b.min.y - 24.0).max(page_rect.min.y + 4.0)),
+                                            Pos2::new(
+                                                screen_b.min.x,
+                                                (screen_b.min.y - 24.0).max(page_rect.min.y + 4.0),
+                                            ),
                                             Vec2::new(
-                                                if m.angle_deg.abs() > 1.0 { 195.0 } else { 130.0 },
+                                                if m.angle_deg.abs() > 1.0 {
+                                                    195.0
+                                                } else {
+                                                    130.0
+                                                },
                                                 20.0,
                                             ),
                                         );
@@ -1041,7 +1446,7 @@ impl eframe::App for SuperPdfApp {
                             }
                         }
 
-                        // --- DESSIN DE LA SÉLECTION DE TEXTE (`Ctrl+C`) (JALON 4) ---
+                        // --- 3. DESSIN DE LA SÉLECTION DE TEXTE (CURSEUR I OU ALT+RECTANGLE) ---
                         if tab.text_selection.page_index == Some(page_index) {
                             if let Some(drag_r) = tab.text_selection.active_drag_rect() {
                                 if drag_r.width() > 3.0 || drag_r.height() > 3.0 {
@@ -1071,10 +1476,14 @@ impl eframe::App for SuperPdfApp {
                                 if let Some(last_b) = tab.text_selection.highlight_boxes.last() {
                                     let sb = last_b.to_screen_rect(page_rect, page_dim);
                                     selection_toolbar_anchor = Some((
-                                        Pos2::new(sb.min.x.max(canvas_rect.min.x + 16.0), sb.max.y + 8.0),
+                                        Pos2::new(
+                                            sb.min.x.max(canvas_rect.min.x + 16.0),
+                                            sb.max.y + 8.0,
+                                        ),
                                         tab.text_selection.selected_text.clone(),
                                         tab.text_selection.selected_text.chars().count(),
                                         tab.text_selection.copied_feedback_frames > 0,
+                                        tab.text_selection.mode,
                                     ));
                                 }
                             }
@@ -1110,42 +1519,38 @@ impl eframe::App for SuperPdfApp {
                             Color32::from_rgba_unmultiplied(150, 170, 210, 140),
                         );
                     }
-                } else {
-                    painter.text(
-                        canvas_rect.center(),
-                        Align2::CENTER_CENTER,
-                        "Aucun onglet ouvert — Appuyez sur Ctrl+O ou Ctrl+T",
-                        FontId::proportional(16.0),
-                        Color32::from_rgb(150, 160, 180),
+                }
+
+                // Barre flottante d'action sur le texte sélectionné (`📋 Copier Ctrl+C` + `✒ Surligner H`)
+                if let Some((anchor_pos, sel_text, char_count, copied_ok, sel_mode)) =
+                    selection_toolbar_anchor
+                {
+                    self.render_selection_floating_bar(
+                        ctx,
+                        anchor_pos,
+                        &sel_text,
+                        char_count,
+                        copied_ok,
+                        sel_mode,
                     );
                 }
 
-                // Barre flottante d'action sur le texte sélectionné (`📋 Copier Ctrl+C`)
-                if let Some((anchor_pos, sel_text, char_count, copied_ok)) = selection_toolbar_anchor
-                {
-                    self.render_selection_floating_bar(ctx, anchor_pos, &sel_text, char_count, copied_ok);
-                }
-
-                // Barre de recherche flottante `Ctrl+F` en haut à droite du canevas
+                // Barre de recherche flottante `Ctrl+F`
                 if self.search_bar.is_open {
                     self.render_floating_search_bar(ctx, canvas_rect);
                 }
 
-                // Si la barre latérale est en mode Auto-Hide (100% plein écran), on dessine la lisière réactive gauche
                 if !self.sidebar.pinned {
                     self.render_autohide_sidebar_overlay(ctx, canvas_rect);
                 }
 
-                // Mini-pilule d'état flottante en bas à droite
                 self.render_status_pill(ui, canvas_rect);
 
-                // Palette de commandes flottante (`Ctrl+K`)
                 if self.command_palette.is_open {
                     self.render_command_palette(ctx, canvas_rect);
                 }
             });
 
-        // Déclenchement automatique de la capture d'écran après stabilisation du rendu GPU
         if self.automation.screenshot_output.is_some() {
             if self.frame_count < 5 {
                 ctx.request_repaint();
@@ -1159,7 +1564,233 @@ impl eframe::App for SuperPdfApp {
 }
 
 impl SuperPdfApp {
-    /// Dessine la barre flottante de copie lorsque du texte est sélectionné (`Ctrl+C`)
+    /// Dessine toutes les annotations ISO 32000 d'une page sur le canevas GPU
+    fn paint_page_annotations(
+        painter: &egui::Painter,
+        annotations: &[PdfAnnotation],
+        selected_id: Option<u64>,
+        page_index: usize,
+        page_rect: Rect,
+        page_dim: crate::pdf_engine::PageDimensions,
+        zoom: f32,
+    ) {
+        let sx = page_rect.width() / page_dim.width_pt.max(1.0);
+        let sy = page_rect.height() / page_dim.height_pt.max(1.0);
+        let to_screen_pos = |pt: (f32, f32)| -> Pos2 {
+            Pos2::new(page_rect.min.x + pt.0 * sx, page_rect.min.y + pt.1 * sy)
+        };
+
+        for annot in annotations.iter().filter(|a| a.page_index == page_index) {
+            let is_selected = selected_id == Some(annot.id);
+            let screen_rect = annot.rect.to_screen_rect(page_rect, page_dim);
+            let stroke_col = annot.egui_color(240);
+
+            match &annot.kind {
+                AnnotationKind::Highlight { quads } => {
+                    let fill_col = annot.egui_color(95);
+                    for q in quads {
+                        let sr = q.to_screen_rect(page_rect, page_dim).expand(1.5);
+                        painter.rect_filled(sr, CornerRadius::same(2), fill_col);
+                    }
+                }
+                AnnotationKind::FreeText { text, font_size } => {
+                    // Carte de texte visible directement sur la page (style Adobe Acrobat FreeText)
+                    painter.rect_filled(
+                        screen_rect,
+                        CornerRadius::same(4),
+                        Color32::from_rgba_unmultiplied(255, 253, 242, 242),
+                    );
+                    painter.rect_stroke(
+                        screen_rect,
+                        CornerRadius::same(4),
+                        Stroke::new(1.5_f32, stroke_col),
+                        StrokeKind::Outside,
+                    );
+                    // Bandeau d'en-tête discret
+                    let header_rect = Rect::from_min_size(
+                        screen_rect.min,
+                        Vec2::new(screen_rect.width(), (16.0 * zoom).clamp(13.0, 22.0)),
+                    );
+                    painter.rect_filled(header_rect, CornerRadius::same(3), stroke_col);
+                    painter.text(
+                        Pos2::new(header_rect.min.x + 6.0, header_rect.center().y),
+                        Align2::LEFT_CENTER,
+                        "🅰 /FreeText (ISO 32000)",
+                        FontId::proportional((9.5 * zoom).clamp(8.5, 13.0)),
+                        Color32::WHITE,
+                    );
+
+                    let scaled_font = (font_size * zoom * 1.15).clamp(9.0, 24.0);
+                    painter.text(
+                        Pos2::new(screen_rect.min.x + 7.0, header_rect.max.y + 4.0),
+                        Align2::LEFT_TOP,
+                        text,
+                        FontId::proportional(scaled_font),
+                        Color32::from_rgb(20, 24, 34),
+                    );
+                }
+                AnnotationKind::Ink { strokes, thickness } => {
+                    for stroke in strokes {
+                        if stroke.len() >= 2 {
+                            let pts: Vec<Pos2> =
+                                stroke.iter().copied().map(to_screen_pos).collect();
+                            painter.add(egui::Shape::line(
+                                pts,
+                                Stroke::new((*thickness * zoom).clamp(1.5, 8.0), stroke_col),
+                            ));
+                        }
+                    }
+                }
+                AnnotationKind::Shape {
+                    shape_kind,
+                    start_pt,
+                    end_pt,
+                } => match shape_kind {
+                    ShapeKind::Rectangle => {
+                        painter.rect_filled(
+                            screen_rect,
+                            CornerRadius::same(2),
+                            annot.egui_color(35),
+                        );
+                        painter.rect_stroke(
+                            screen_rect,
+                            CornerRadius::same(2),
+                            Stroke::new(2.0_f32, stroke_col),
+                            StrokeKind::Outside,
+                        );
+                    }
+                    ShapeKind::ArrowLine => {
+                        let p1 = to_screen_pos(*start_pt);
+                        let p2 = to_screen_pos(*end_pt);
+                        painter.line_segment([p1, p2], Stroke::new(2.2_f32, stroke_col));
+
+                        // Pointe de flèche vectorielle (/ClosedArrow)
+                        let dir = (p2 - p1).normalized();
+                        if dir.length_sq() > 0.1 {
+                            let perp = Vec2::new(-dir.y, dir.x);
+                            let tip_len = (11.0 * zoom).clamp(8.0, 18.0);
+                            let tip_w = (5.5 * zoom).clamp(4.0, 9.0);
+                            let base = p2 - dir * tip_len;
+                            painter.add(egui::Shape::convex_polygon(
+                                vec![p2, base + perp * tip_w, base - perp * tip_w],
+                                stroke_col,
+                                Stroke::NONE,
+                            ));
+                        }
+                    }
+                },
+                AnnotationKind::StickyNote {
+                    comment,
+                    is_popup_open,
+                } => {
+                    painter.rect_filled(
+                        screen_rect,
+                        CornerRadius::same(6),
+                        Color32::from_rgba_unmultiplied(255, 246, 205, 245),
+                    );
+                    painter.rect_stroke(
+                        screen_rect,
+                        CornerRadius::same(6),
+                        Stroke::new(1.5_f32, stroke_col),
+                        StrokeKind::Outside,
+                    );
+                    let header_h = (17.0 * zoom).clamp(14.0, 22.0);
+                    let header_r =
+                        Rect::from_min_size(screen_rect.min, Vec2::new(screen_rect.width(), header_h));
+                    painter.rect_filled(header_r, CornerRadius::same(4), stroke_col);
+                    painter.text(
+                        Pos2::new(header_r.min.x + 6.0, header_r.center().y),
+                        Align2::LEFT_CENTER,
+                        "💬 Note /Text",
+                        FontId::proportional((9.5 * zoom).clamp(8.5, 13.0)),
+                        Color32::WHITE,
+                    );
+                    if *is_popup_open {
+                        painter.text(
+                            Pos2::new(screen_rect.min.x + 6.0, header_r.max.y + 4.0),
+                            Align2::LEFT_TOP,
+                            comment,
+                            FontId::proportional((10.5 * zoom).clamp(9.0, 16.0)),
+                            Color32::from_rgb(35, 30, 20),
+                        );
+                    }
+                }
+                AnnotationKind::Measure {
+                    start_pt,
+                    end_pt,
+                    stamp_tag,
+                } => {
+                    let p1 = to_screen_pos(*start_pt);
+                    let p2 = to_screen_pos(*end_pt);
+                    painter.line_segment([p1, p2], Stroke::new(2.0_f32, stroke_col));
+
+                    // Barres d'extrémité de cote
+                    let dir = (p2 - p1).normalized();
+                    let perp = if dir.length_sq() > 0.1 {
+                        Vec2::new(-dir.y, dir.x) * 7.0
+                    } else {
+                        Vec2::new(0.0, 7.0)
+                    };
+                    painter.line_segment([p1 - perp, p1 + perp], Stroke::new(2.0_f32, stroke_col));
+                    painter.line_segment([p2 - perp, p2 + perp], Stroke::new(2.0_f32, stroke_col));
+
+                    let (dist_pt, dist_mm) =
+                        PdfAnnotation::measure_distance_pt_and_mm(*start_pt, *end_pt);
+                    let mid = p1 + (p2 - p1) * 0.5;
+                    let badge_text = match stamp_tag {
+                        Some(tag) => format!("📏 {:.1} mm ({:.0} pt) • {}", dist_mm, dist_pt, tag),
+                        None => format!("📏 {:.1} mm ({:.0} pt)", dist_mm, dist_pt),
+                    };
+                    let pill_w = (badge_text.len() as f32 * 6.4).max(130.0);
+                    let pill_rect = Rect::from_center_size(mid, Vec2::new(pill_w, 20.0));
+                    painter.rect_filled(
+                        pill_rect,
+                        CornerRadius::same(10),
+                        Color32::from_rgba_unmultiplied(20, 26, 38, 240),
+                    );
+                    painter.rect_stroke(
+                        pill_rect,
+                        CornerRadius::same(10),
+                        Stroke::new(1.2_f32, stroke_col),
+                        StrokeKind::Outside,
+                    );
+                    painter.text(
+                        pill_rect.center(),
+                        Align2::CENTER_CENTER,
+                        badge_text,
+                        FontId::proportional(10.5),
+                        Color32::WHITE,
+                    );
+                }
+            }
+
+            // Cadre de sélection et poignées si cette annotation est sélectionnée
+            if is_selected {
+                let sel_box = screen_rect.expand(4.0);
+                painter.rect_stroke(
+                    sel_box,
+                    CornerRadius::same(4),
+                    Stroke::new(1.8_f32, Color32::from_rgb(90, 175, 255)),
+                    StrokeKind::Outside,
+                );
+                let corners = [
+                    sel_box.left_top(),
+                    sel_box.right_top(),
+                    sel_box.left_bottom(),
+                    sel_box.right_bottom(),
+                ];
+                for c in corners {
+                    painter.rect_filled(
+                        Rect::from_center_size(c, Vec2::splat(7.0)),
+                        CornerRadius::same(1),
+                        Color32::from_rgb(90, 175, 255),
+                    );
+                }
+            }
+        }
+    }
+
+    /// Dessine la barre flottante de copie (`Ctrl+C`) et de surlignage direct (`✒ Surligner H`)
     fn render_selection_floating_bar(
         &mut self,
         ctx: &Context,
@@ -1167,20 +1798,27 @@ impl SuperPdfApp {
         sel_text: &str,
         char_count: usize,
         copied_ok: bool,
+        sel_mode: SelectionGestureMode,
     ) {
-        let preview: String = if sel_text.chars().count() > 38 {
-            let s: String = sel_text.chars().take(36).collect();
+        let preview: String = if sel_text.chars().count() > 34 {
+            let s: String = sel_text.chars().take(32).collect();
             format!("\"{}...\"", s)
         } else {
             format!("\"{}\"", sel_text)
         };
+        let mode_badge = match sel_mode {
+            SelectionGestureMode::StreamIBeam => "Curseur I (Flux)",
+            SelectionGestureMode::RectangularBlock => "Bloc (Alt+Glisser)",
+        };
+
+        let mut create_highlight = false;
 
         egui::Area::new(egui::Id::new("superpdf_text_selection_bar"))
             .fixed_pos(pos)
             .order(Order::Foreground)
             .show(ctx, |ui| {
                 egui::Frame::NONE
-                    .fill(Color32::from_rgba_unmultiplied(20, 26, 40, 245))
+                    .fill(Color32::from_rgba_unmultiplied(20, 26, 40, 248))
                     .stroke(Stroke::new(1.5_f32, Color32::from_rgb(75, 145, 255)))
                     .corner_radius(CornerRadius::same(10))
                     .inner_margin(Margin::symmetric(10, 6))
@@ -1197,11 +1835,24 @@ impl SuperPdfApp {
                                     tab.text_selection.copied_feedback_frames = 90;
                                 }
                             }
+                            if ui
+                                .small_button("✒ Surligner (H)")
+                                .on_hover_text(
+                                    "Convertir la sélection en annotation /Highlight ISO 32000",
+                                )
+                                .clicked()
+                            {
+                                create_highlight = true;
+                            }
                             ui.separator();
+                            ui.colored_label(
+                                Color32::from_rgb(135, 195, 255),
+                                format!("[{}]", mode_badge),
+                            );
                             ui.label(
                                 egui::RichText::new(format!("{} car. : {}", char_count, preview))
                                     .size(11.5)
-                                    .color(Color32::from_rgb(200, 220, 255)),
+                                    .color(Color32::from_rgb(215, 228, 255)),
                             );
                             if ui.small_button("✖").clicked() {
                                 if let Some(tab) = self.tabs.get_mut(self.active_tab) {
@@ -1211,9 +1862,29 @@ impl SuperPdfApp {
                         });
                     });
             });
+
+        if create_highlight {
+            if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                if let Some(page_index) = tab.text_selection.page_index {
+                    let quads = tab.text_selection.highlight_boxes.clone();
+                    if let Some(first) = quads.first() {
+                        let union_rect = quads.iter().fold(*first, |acc, q| acc.union(q));
+                        let color = tab.annotations.active_color_rgb;
+                        tab.annotations.add_annotation(PdfAnnotation {
+                            id: 0,
+                            page_index,
+                            rect: union_rect,
+                            color_rgb: color,
+                            kind: AnnotationKind::Highlight { quads },
+                        });
+                        tab.is_modified = true;
+                        tab.text_selection.clear();
+                    }
+                }
+            }
+        }
     }
 
-    /// Dessine la barre de recherche flottante `Ctrl+F` en haut à droite du canevas PDF
     fn render_floating_search_bar(&mut self, ctx: &Context, canvas_rect: Rect) {
         let bar_w = 430.0;
         let bar_pos = Pos2::new(
@@ -1325,14 +1996,13 @@ impl SuperPdfApp {
         }
     }
 
-    /// Dessine le contenu complet de la barre latérale gauche
     fn render_sidebar_contents(&mut self, ui: &mut egui::Ui) {
         let mut pending_cmd: Option<PaletteCommand> = None;
         let mut tab_to_close: Option<usize> = None;
         let mut tab_to_select: Option<usize> = None;
         let mut match_to_select: Option<usize> = None;
 
-        ui.spacing_mut().item_spacing = Vec2::new(6.0, 5.0);
+        ui.spacing_mut().item_spacing = Vec2::new(6.0, 4.0);
 
         // 1. En-tête de la barre latérale
         egui::Frame::NONE
@@ -1380,7 +2050,7 @@ impl SuperPdfApp {
                     });
                 });
 
-                ui.add_space(4.0);
+                ui.add_space(3.0);
 
                 // Barre de déclenchement rapide Ctrl+K
                 let search_btn = egui::Button::new(
@@ -1390,24 +2060,52 @@ impl SuperPdfApp {
                 )
                 .fill(Color32::from_rgb(33, 38, 50))
                 .corner_radius(CornerRadius::same(8))
-                .min_size(Vec2::new(SIDEBAR_WIDTH - 26.0, 26.0));
+                .min_size(Vec2::new(SIDEBAR_WIDTH - 26.0, 25.0));
 
                 if ui.add(search_btn).clicked() {
                     self.command_palette.open();
                 }
 
-                ui.add_space(6.0);
+                ui.add_space(5.0);
 
-                // 2. Grille d'outils compacts (2 lignes x 4 colonnes)
-                ui.label(
-                    egui::RichText::new("OUTILS RAPIDES (1 TOUCHE)")
-                        .size(10.0)
-                        .strong()
-                        .color(Color32::from_rgb(120, 132, 158)),
-                );
+                // 2. Grille d'outils compacts (2 lignes x 4 colonnes) + Actions Annotations ISO 32000
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("OUTILS ISO 32000")
+                            .size(10.0)
+                            .strong()
+                            .color(Color32::from_rgb(120, 132, 158)),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .small_button("💾 Ctrl+S")
+                            .on_hover_text(
+                                "Enregistrer les annotations au format standard ISO 32000 dans le PDF",
+                            )
+                            .clicked()
+                        {
+                            pending_cmd = Some(PaletteCommand::SaveAnnotatedPdf);
+                        }
+                        if ui
+                            .small_button("↪")
+                            .on_hover_text("Rétablir (Ctrl+Y)")
+                            .clicked()
+                        {
+                            pending_cmd = Some(PaletteCommand::RedoAnnotation);
+                        }
+                        if ui
+                            .small_button("↩")
+                            .on_hover_text("Annuler (Ctrl+Z)")
+                            .clicked()
+                        {
+                            pending_cmd = Some(PaletteCommand::UndoAnnotation);
+                        }
+                    });
+                });
+
                 egui::Grid::new("superpdf_tools_grid")
                     .num_columns(4)
-                    .spacing([5.0, 5.0])
+                    .spacing([5.0, 4.0])
                     .show(ui, |ui| {
                         for (i, tool) in ActiveTool::all().iter().enumerate() {
                             let (icon, label, shortcut) = tool.icon_and_label();
@@ -1430,7 +2128,7 @@ impl SuperPdfApp {
                             )
                             .fill(fill)
                             .corner_radius(CornerRadius::same(7))
-                            .min_size(Vec2::new(55.0, 34.0));
+                            .min_size(Vec2::new(55.0, 33.0));
 
                             if ui
                                 .add(btn)
@@ -1445,7 +2143,7 @@ impl SuperPdfApp {
                         }
                     });
 
-                ui.add_space(6.0);
+                ui.add_space(4.0);
 
                 // 3. En-tête de la liste verticale des onglets
                 let hibernated_count = self.tabs.iter().filter(|t| t.is_hibernated()).count();
@@ -1488,11 +2186,18 @@ impl SuperPdfApp {
 
         ui.separator();
 
-        // Si une recherche Ctrl+F est active avec des résultats, on réserve un tiroir en bas pour la liste des occurrences
-        let has_search_drawer =
-            self.search_bar.is_open && !self.search_bar.matches.is_empty();
-        let tabs_reserved_bottom = if has_search_drawer { 285.0 } else { 155.0 };
-        let available_h = (ui.available_height() - tabs_reserved_bottom).max(95.0);
+        let has_search_drawer = self.search_bar.is_open && !self.search_bar.matches.is_empty();
+        let has_annot_inspector = self
+            .tabs
+            .get(self.active_tab)
+            .and_then(|t| t.annotations.selected())
+            .is_some();
+        let tabs_reserved_bottom = if has_search_drawer || has_annot_inspector {
+            285.0
+        } else {
+            155.0
+        };
+        let available_h = (ui.available_height() - tabs_reserved_bottom).max(85.0);
 
         // 4. Liste déroulante verticale des onglets
         egui::ScrollArea::vertical()
@@ -1532,19 +2237,20 @@ impl SuperPdfApp {
                                 ) + 1;
                                 let total_p = tab.page_count();
 
-                                let short_title = if tab.title.chars().count() > 22 {
-                                    let s: String = tab.title.chars().take(20).collect();
+                                let short_title = if tab.title.chars().count() > 21 {
+                                    let s: String = tab.title.chars().take(19).collect();
                                     format!("{}...", s)
                                 } else {
                                     tab.title.clone()
                                 };
-
+                                let mod_star = if tab.is_modified { " *" } else { "" };
                                 let ram_state = if is_hib { "💤 0 Mo" } else { "⚡ Actif" };
 
                                 let title_btn = egui::Button::new(
                                     egui::RichText::new(format!(
-                                        "{}\np.{}/{} • {:.0}% • {}",
+                                        "{}{}\np.{}/{} • {:.0}% • {}",
                                         short_title,
+                                        mod_star,
                                         current_p,
                                         total_p,
                                         tab.viewport.zoom * 100.0,
@@ -1584,8 +2290,77 @@ impl SuperPdfApp {
                 }
             });
 
-        // Tiroir contextuel des résultats de recherche `Ctrl+F` dans la barre latérale
-        if has_search_drawer {
+        // Tiroir Inspecteur d'Annotation ISO 32000 (édition texte FreeText/Note, couleur, suppression)
+        if has_annot_inspector {
+            ui.separator();
+            if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                let mut delete_clicked = false;
+                egui::Frame::NONE
+                    .inner_margin(Margin::symmetric(10, 4))
+                    .show(ui, |ui| {
+                        if let Some(annot) = tab.annotations.selected_mut() {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new(format!("✏ {}", annot.type_badge()))
+                                        .size(10.5)
+                                        .strong()
+                                        .color(Color32::from_rgb(130, 200, 255)),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui
+                                            .small_button("🗑 Suppr")
+                                            .on_hover_text("Supprimer l'annotation (Touche Suppr)")
+                                            .clicked()
+                                        {
+                                            delete_clicked = true;
+                                        }
+                                    },
+                                );
+                            });
+
+                            // Sélecteur de couleur rapide
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("Couleur :").size(10.5));
+                                for (cname, crgb) in PALETTE_COLORS {
+                                    let c32 = Color32::from_rgb(crgb.0, crgb.1, crgb.2);
+                                    let is_curr = annot.color_rgb == crgb;
+                                    let btn = egui::Button::new(if is_curr { "✔" } else { " " })
+                                        .fill(c32)
+                                        .min_size(Vec2::new(22.0, 16.0));
+                                    if ui.add(btn).on_hover_text(cname).clicked() {
+                                        annot.color_rgb = crgb;
+                                    }
+                                }
+                            });
+
+                            // Édition directe du contenu texte pour FreeText et StickyNote
+                            match &mut annot.kind {
+                                AnnotationKind::FreeText { text, .. } => {
+                                    ui.add(
+                                        egui::TextEdit::multiline(text)
+                                            .desired_rows(2)
+                                            .desired_width(SIDEBAR_WIDTH - 24.0),
+                                    );
+                                }
+                                AnnotationKind::StickyNote { comment, .. } => {
+                                    ui.add(
+                                        egui::TextEdit::multiline(comment)
+                                            .desired_rows(2)
+                                            .desired_width(SIDEBAR_WIDTH - 24.0),
+                                    );
+                                }
+                                _ => {}
+                            }
+                        }
+                    });
+                if delete_clicked {
+                    tab.annotations.delete_selected();
+                    tab.is_modified = true;
+                }
+            }
+        } else if has_search_drawer {
             ui.separator();
             egui::Frame::NONE
                 .inner_margin(Margin::symmetric(10, 4))
@@ -1657,7 +2432,7 @@ impl SuperPdfApp {
 
                 ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new(format!("🧠 RAM Processus : {:.1} Mo", ram_mb))
+                        egui::RichText::new(format!("⚡ RAM Processus : {:.1} Mo", ram_mb))
                             .size(11.0)
                             .strong()
                             .color(Color32::from_rgb(125, 225, 165)),
@@ -1853,14 +2628,14 @@ impl SuperPdfApp {
         let (tool_icon, tool_name, tool_key) = self.active_tool.icon_and_label();
         let hibernated_count = self.tabs.iter().filter(|t| t.is_hibernated()).count();
         let ram_mb = self.process_working_set_bytes as f32 / (1024.0 * 1024.0);
-        let cache_mb = self.texture_cache.allocated_bytes as f32 / (1024.0 * 1024.0);
+        let annot_count = tab.annotations.items.len();
 
         let pill_pos = Pos2::new(
-            (canvas_rect.max.x - 670.0).max(canvas_rect.min.x + 12.0),
+            (canvas_rect.max.x - 690.0).max(canvas_rect.min.x + 12.0),
             canvas_rect.max.y - 40.0,
         );
 
-        egui::Area::new(egui::Id::new("status_pill_jalon4"))
+        egui::Area::new(egui::Id::new("status_pill_jalon5"))
             .fixed_pos(pill_pos)
             .order(Order::Foreground)
             .show(ui.ctx(), |ui| {
@@ -1877,15 +2652,21 @@ impl SuperPdfApp {
                                 format!("{} {} ({})", tool_icon, tool_name, tool_key),
                             );
                             ui.separator();
+                            let saved_tag = if tab.annotations.saved_feedback_frames > 0 {
+                                "✅ ISO 32000 Enregistré"
+                            } else {
+                                ""
+                            };
                             ui.label(
                                 egui::RichText::new(format!(
-                                    "Onglet {}/{} ({} 💤) • Page {}/{} • {:.0}%",
+                                    "Onglet {}/{} ({} 💤) • P.{}/{} • {} Annot. {}",
                                     self.active_tab + 1,
                                     self.tabs.len(),
                                     hibernated_count,
                                     current_page,
                                     page_count,
-                                    tab.viewport.zoom * 100.0
+                                    annot_count,
+                                    saved_tag
                                 ))
                                 .strong()
                                 .size(11.5)
@@ -1894,8 +2675,8 @@ impl SuperPdfApp {
                             ui.separator();
                             ui.label(
                                 egui::RichText::new(format!(
-                                    "🧠 RAM {:.1} Mo (Cache {:.1} Mo) | ⚡ {:.0} FPS",
-                                    ram_mb, cache_mb, self.fps_smoothed
+                                    "RAM {:.1} Mo | ⚡ {:.0} FPS",
+                                    ram_mb, self.fps_smoothed
                                 ))
                                 .size(11.0)
                                 .color(Color32::from_rgb(130, 225, 175)),

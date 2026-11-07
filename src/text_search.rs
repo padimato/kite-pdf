@@ -25,6 +25,13 @@ impl PdfTopDownRect {
         ((self.x_min + self.x_max) * 0.5, (self.y_min + self.y_max) * 0.5)
     }
 
+    pub fn contains_pt(&self, x: f32, y: f32, margin: f32) -> bool {
+        x >= self.x_min - margin
+            && x <= self.x_max + margin
+            && y >= self.y_min - margin
+            && y <= self.y_max + margin
+    }
+
     #[allow(dead_code)]
     pub fn intersects(&self, other: &PdfTopDownRect) -> bool {
         self.x_min <= other.x_max
@@ -39,6 +46,16 @@ impl PdfTopDownRect {
             y_min: self.y_min.min(other.y_min),
             x_max: self.x_max.max(other.x_max),
             y_max: self.y_max.max(other.y_max),
+            angle_deg: self.angle_deg,
+        }
+    }
+
+    pub fn translate(&self, dx: f32, dy: f32) -> PdfTopDownRect {
+        PdfTopDownRect {
+            x_min: self.x_min + dx,
+            y_min: self.y_min + dy,
+            x_max: self.x_max + dx,
+            y_max: self.y_max + dy,
             angle_deg: self.angle_deg,
         }
     }
@@ -71,10 +88,12 @@ impl PdfTopDownRect {
         let sy = page_dim.height_pt / page_screen_rect.height().max(1.0);
 
         Self {
-            x_min: ((screen_rect.min.x - page_screen_rect.min.x) * sx).clamp(0.0, page_dim.width_pt),
+            x_min: ((screen_rect.min.x - page_screen_rect.min.x) * sx)
+                .clamp(0.0, page_dim.width_pt),
             y_min: ((screen_rect.min.y - page_screen_rect.min.y) * sy)
                 .clamp(0.0, page_dim.height_pt),
-            x_max: ((screen_rect.max.x - page_screen_rect.min.x) * sx).clamp(0.0, page_dim.width_pt),
+            x_max: ((screen_rect.max.x - page_screen_rect.min.x) * sx)
+                .clamp(0.0, page_dim.width_pt),
             y_max: ((screen_rect.max.y - page_screen_rect.min.y) * sy)
                 .clamp(0.0, page_dim.height_pt),
             angle_deg: 0.0,
@@ -101,15 +120,80 @@ pub struct PageTextLayer {
 
 impl PageTextLayer {
     pub fn new(page_index: usize, chars: Vec<PositionedChar>) -> Self {
-        let normalized_chars = chars
-            .iter()
-            .map(|c| normalize_char(c.ch))
-            .collect();
+        let normalized_chars = chars.iter().map(|c| normalize_char(c.ch)).collect();
         Self {
             page_index,
             chars,
             normalized_chars,
         }
+    }
+
+    /// Trouve l'index du caractère situé sous (ou à proximité immédiate de) `(x_pt, y_pt)`.
+    /// Utilisé pour afficher le curseur texte `I` (`CursorIcon::Text`) et pour la sélection au fil des phrases.
+    pub fn char_index_near_point(&self, x_pt: f32, y_pt: f32, max_dist_pt: f32) -> Option<usize> {
+        let mut best_idx = None;
+        let mut best_dist_sq = max_dist_pt * max_dist_pt;
+
+        for (i, pc) in self.chars.iter().enumerate() {
+            if pc.rect.width() < 0.1 && pc.rect.height() < 0.1 {
+                continue;
+            }
+            if pc.rect.contains_pt(x_pt, y_pt, 2.0) {
+                return Some(i);
+            }
+            let (cx, cy) = pc.rect.center();
+            let dx = cx - x_pt;
+            let dy = (cy - y_pt) * 1.6; // Pondération verticale pour privilégier la ligne courante
+            let d2 = dx * dx + dy * dy;
+            if d2 < best_dist_sq {
+                best_dist_sq = d2;
+                best_idx = Some(i);
+            }
+        }
+        best_idx
+    }
+
+    /// Sélectionne un flux continu de caractères au fil des phrases (du caractère `idx_a` au caractère `idx_b`),
+    /// exactement comme un curseur texte `I` dans Adobe Acrobat ou Word.
+    pub fn select_char_stream(&self, idx_a: usize, idx_b: usize) -> (String, Vec<PdfTopDownRect>) {
+        if self.chars.is_empty() {
+            return (String::new(), Vec::new());
+        }
+        let start = idx_a.min(idx_b).min(self.chars.len() - 1);
+        let end = idx_a.max(idx_b).min(self.chars.len() - 1);
+
+        let mut text = String::with_capacity(end - start + 1);
+        for i in start..=end {
+            let c = self.chars[i].ch;
+            if c == '\r' {
+                continue;
+            }
+            text.push(c);
+        }
+
+        let boxes = self.merge_highlight_boxes(start..(end + 1));
+        (text.trim().to_string(), boxes)
+    }
+
+    /// Sélectionne le mot complet sous le point `(x_pt, y_pt)` lors d'un double-clic au Trackpad / Souris.
+    pub fn select_word_at_point(&self, x_pt: f32, y_pt: f32) -> Option<(usize, usize, String, Vec<PdfTopDownRect>)> {
+        let pivot = self.char_index_near_point(x_pt, y_pt, 14.0)?;
+        let is_word_char = |c: char| c.is_alphanumeric() || c == '_' || c == '-' || c == '+';
+        if !is_word_char(self.chars[pivot].ch) {
+            return None;
+        }
+
+        let mut start = pivot;
+        while start > 0 && is_word_char(self.chars[start - 1].ch) {
+            start -= 1;
+        }
+        let mut end = pivot;
+        while end + 1 < self.chars.len() && is_word_char(self.chars[end + 1].ch) {
+            end += 1;
+        }
+
+        let (txt, boxes) = self.select_char_stream(start, end);
+        Some((start, end, txt, boxes))
     }
 
     /// Fusionne une plage de caractères consécutifs en boîtes de surbrillance par ligne/orientation
@@ -124,8 +208,8 @@ impl PageTextLayer {
             }
             if let Some(last) = boxes.last_mut() {
                 let same_angle = (last.angle_deg - pc.rect.angle_deg).abs() < 8.0;
-                let same_line_y = (last.y_min - pc.rect.y_min).abs() < 12.0;
-                let close_x = (pc.rect.x_min - last.x_max).abs() < 24.0;
+                let same_line_y = (last.y_min - pc.rect.y_min).abs() < 10.0;
+                let close_x = (pc.rect.x_min - last.x_max).abs() < 24.0 && pc.rect.x_min >= last.x_min - 4.0;
                 if same_angle && (same_line_y || last.angle_deg.abs() > 5.0) && close_x {
                     *last = last.union(&pc.rect);
                     continue;
@@ -158,7 +242,7 @@ impl PageTextLayer {
         s.trim().to_string()
     }
 
-    /// Sélectionne les caractères dont le centre tombe dans le rectangle `selection_rect` (en points PDF top-down)
+    /// Sélectionne les caractères dont le centre tombe dans le rectangle `selection_rect` (`Alt + Glisser` pour tableaux/graphiques)
     pub fn select_in_rect(&self, selection_rect: &PdfTopDownRect) -> (String, Vec<PdfTopDownRect>) {
         let mut selected_indices = Vec::new();
         for (i, pc) in self.chars.iter().enumerate() {
@@ -232,10 +316,21 @@ pub struct SearchMatch {
     pub is_ocr: bool,
 }
 
+/// Mode de sélection de texte : Au fil des phrases (Curseur `I` par défaut) ou Bloc rectangulaire (`Alt + Glisser`)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SelectionGestureMode {
+    #[default]
+    StreamIBeam,
+    RectangularBlock,
+}
+
 /// État de la sélection de texte à la souris / Trackpad sur une page
 #[derive(Debug, Clone, Default)]
 pub struct TextSelectionState {
     pub page_index: Option<usize>,
+    pub mode: SelectionGestureMode,
+    pub anchor_char_index: Option<usize>,
+    pub current_char_index: Option<usize>,
     pub drag_start_pt: Option<(f32, f32)>,
     pub drag_current_pt: Option<(f32, f32)>,
     pub selected_text: String,
@@ -246,6 +341,8 @@ pub struct TextSelectionState {
 impl TextSelectionState {
     pub fn clear(&mut self) {
         self.page_index = None;
+        self.anchor_char_index = None;
+        self.current_char_index = None;
         self.drag_start_pt = None;
         self.drag_current_pt = None;
         self.selected_text.clear();
@@ -257,6 +354,9 @@ impl TextSelectionState {
     }
 
     pub fn active_drag_rect(&self) -> Option<PdfTopDownRect> {
+        if self.mode != SelectionGestureMode::RectangularBlock {
+            return None;
+        }
         let (x0, y0) = self.drag_start_pt?;
         let (x1, y1) = self.drag_current_pt?;
         Some(PdfTopDownRect {
@@ -291,7 +391,6 @@ impl SearchBarState {
         self.focus_requested = false;
     }
 
-    /// Exécute la recherche sur l'ensemble des couches de texte des pages du document
     pub fn execute_search(&mut self, pages_text: &[PageTextLayer]) {
         self.last_executed_query = self.query.clone();
         self.matches.clear();

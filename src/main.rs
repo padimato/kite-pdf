@@ -1,3 +1,4 @@
+mod annotations;
 mod app;
 mod memory_manager;
 mod pdf_engine;
@@ -109,6 +110,27 @@ fn parse_args() -> AutomationConfig {
                     i += 1;
                 }
             }
+            "--select-stream" => {
+                if let Some(s_str) = args.get(i + 1) {
+                    let parts: Vec<usize> = s_str
+                        .split(',')
+                        .filter_map(|p| p.trim().parse::<usize>().ok())
+                        .collect();
+                    if parts.len() == 2 {
+                        cfg.initial_select_stream = Some((parts[0], parts[1]));
+                    }
+                    i += 1;
+                }
+            }
+            "--demo-annotations" => {
+                cfg.demo_annotations = true;
+            }
+            "--save-annotated" => {
+                if let Some(out_path) = args.get(i + 1) {
+                    cfg.save_annotated_output = Some(PathBuf::from(out_path));
+                    i += 1;
+                }
+            }
             "--tool" => {
                 if let Some(t) = args.get(i + 1) {
                     cfg.initial_tool = match t.as_str() {
@@ -146,7 +168,7 @@ fn main() -> eframe::Result<()> {
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Super Lecteur PDF — Jalon 4 (Sélection de Texte Ctrl+C & Recherche Ctrl+F Multi-Orientation)")
+            .with_title("Super Lecteur PDF — Jalon 5 (Sélection Curseur I & Annotations ISO 32000 Compatibles Acrobat)")
             .with_inner_size([1280.0, 820.0])
             .with_min_inner_size([640.0, 400.0]),
         ..Default::default()

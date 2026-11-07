@@ -144,7 +144,7 @@ impl<'a> LoadedPdfDocument<'a> {
             .set_target_width(width_px)
             .set_target_height(height_px)
             .render_form_data(true)
-            .render_annotations(true)
+            .render_annotations(false)
             .use_lcd_text_rendering(true);
 
         let bitmap = page
@@ -542,7 +542,7 @@ mod tests {
             "Doit trouver le texte vertical 'Consommation RAM' sur les 5 pages"
         );
 
-        // 3. Test Sélection de zone rectangulaire (Ctrl+C) dans le bandeau de titre (haut de page)
+        // 3. Test Sélection par bloc rectangulaire (Alt + Glisser)
         let selection_zone = PdfTopDownRect {
             x_min: 40.0,
             y_min: 30.0,
@@ -557,6 +557,26 @@ mod tests {
             selected_text
         );
         assert!(!boxes.is_empty());
+
+        // 4. Test Sélection au fil des phrases (Curseur I : Glisser simple d'un mot de la ligne 1 à la ligne 3)
+        let (stream_text, stream_boxes) = layers[0].select_char_stream(0, 65);
+        assert!(
+            stream_text.len() >= 50,
+            "La sélection en flux continu (Curseur I) doit capturer toute la séquence de caractères"
+        );
+        assert!(!stream_boxes.is_empty());
+
+        // 5. Test Double-clic sur un mot
+        let first_char_center = layers[0].chars[1].rect.center();
+        let (_, _, word_txt, word_boxes) = layers[0]
+            .select_word_at_point(first_char_center.0, first_char_center.1)
+            .expect("Le double-clic doit sélectionner le mot sous le pointeur");
+        assert!(
+            !word_txt.is_empty() && !word_txt.contains(' '),
+            "Le double-clic doit isoler un mot complet : '{}'",
+            word_txt
+        );
+        assert!(!word_boxes.is_empty());
     }
 }
 
