@@ -1,3 +1,4 @@
+use crate::text_search::{PageTextLayer, PdfTopDownRect, PositionedChar};
 use anyhow::{Context, Result};
 use egui::ColorImage;
 use lopdf::content::{Content, Operation};
@@ -155,6 +156,72 @@ impl<'a> LoadedPdfDocument<'a> {
         let actual_h = bitmap.height() as usize;
 
         Ok(ColorImage::from_rgba_unmultiplied([actual_w, actual_h], &rgba))
+    }
+
+    /// Extrait la couche de texte natif de toutes les pages du document (avec boîtes englobantes et angles de rotation).
+    pub fn extract_all_pages_text_layers(&self) -> Vec<PageTextLayer> {
+        let _lock = PDFIUM_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let pages = self.doc.pages();
+        let count = pages.len() as usize;
+        let mut layers = Vec::with_capacity(count);
+
+        for page_idx in 0..count {
+            let mut positioned_chars = Vec::new();
+            if let Ok(page) = pages.get(page_idx as u16) {
+                let page_w = page.width().value;
+                let page_h = page.height().value;
+                if let Ok(text_page) = page.text() {
+                    for ch_item in text_page.chars().iter() {
+                        let Some(ch) = ch_item.unicode_char() else {
+                            continue;
+                        };
+                        if ch == '\0' {
+                            continue;
+                        }
+                        let bounds_res = ch_item
+                            .loose_bounds()
+                            .or_else(|_| ch_item.tight_bounds());
+                        let rect = if let Ok(b) = bounds_res {
+                            let left = b.left().value;
+                            let right = b.right().value;
+                            let top = b.top().value;
+                            let bottom = b.bottom().value;
+
+                            let x_min = left.min(right).clamp(0.0, page_w);
+                            let x_max = left.max(right).clamp(0.0, page_w);
+                            let y_min = (page_h - top.max(bottom)).clamp(0.0, page_h);
+                            let y_max = (page_h - top.min(bottom)).clamp(0.0, page_h);
+                            let angle_deg = ch_item.angle_degrees().unwrap_or(0.0);
+
+                            PdfTopDownRect {
+                                x_min,
+                                y_min,
+                                x_max,
+                                y_max,
+                                angle_deg,
+                            }
+                        } else {
+                            PdfTopDownRect {
+                                x_min: 0.0,
+                                y_min: 0.0,
+                                x_max: 0.0,
+                                y_max: 0.0,
+                                angle_deg: 0.0,
+                            }
+                        };
+
+                        positioned_chars.push(PositionedChar {
+                            ch,
+                            rect,
+                            is_ocr: false,
+                        });
+                    }
+                }
+            }
+            layers.push(PageTextLayer::new(page_idx, positioned_chars));
+        }
+
+        layers
     }
 }
 
@@ -431,6 +498,65 @@ mod tests {
             .expect("Doit rendre la page 1 en RGBA");
         assert_eq!(img.width(), 800);
         assert_eq!(img.height(), 1132);
+    }
+
+    #[test]
+    fn test_native_text_extraction_search_and_selection_including_diagonal_text() {
+        use crate::text_search::SearchBarState;
+
+        let sample_path = PathBuf::from("test_pdfs/unit_test_text_search.pdf");
+        ensure_sample_pdf(&sample_path).expect("Doit créer le PDF de test");
+
+        let engine = PdfEngine::instance();
+        let doc = engine
+            .load_document(&sample_path)
+            .expect("Doit charger le PDF de test");
+
+        let layers = doc.extract_all_pages_text_layers();
+        assert_eq!(layers.len(), 5);
+        assert!(
+            layers[0].chars.len() > 100,
+            "La page 1 doit contenir plus de 100 caractères extraits"
+        );
+
+        // 1. Test Recherche Ctrl+F sur le texte incliné à +30° en diagonale ("Diagonal +30")
+        let mut search = SearchBarState::default();
+        search.query = "Diagonal +30".to_string();
+        search.execute_search(&layers);
+        assert_eq!(
+            search.matches.len(),
+            5,
+            "Doit trouver 'Diagonal +30' sur chacune des 5 pages"
+        );
+        assert!(
+            !search.matches[0].highlight_boxes.is_empty(),
+            "Les boîtes de surbrillance de l'occurrence diagonale doivent être calculées"
+        );
+
+        // 2. Test Recherche Ctrl+F sur le texte vertical à 90° ("Consommation RAM")
+        search.query = "Consommation RAM".to_string();
+        search.execute_search(&layers);
+        assert_eq!(
+            search.matches.len(),
+            5,
+            "Doit trouver le texte vertical 'Consommation RAM' sur les 5 pages"
+        );
+
+        // 3. Test Sélection de zone rectangulaire (Ctrl+C) dans le bandeau de titre (haut de page)
+        let selection_zone = PdfTopDownRect {
+            x_min: 40.0,
+            y_min: 30.0,
+            x_max: 550.0,
+            y_max: 115.0,
+            angle_deg: 0.0,
+        };
+        let (selected_text, boxes) = layers[0].select_in_rect(&selection_zone);
+        assert!(
+            selected_text.contains("SUPER LECTEUR PDF"),
+            "Le texte sélectionné dans le bandeau supérieur doit contenir le titre, reçu : '{}'",
+            selected_text
+        );
+        assert!(!boxes.is_empty());
     }
 }
 

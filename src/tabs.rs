@@ -1,5 +1,6 @@
 use crate::memory_manager::LruTextureCache;
 use crate::pdf_engine::{LoadedPdfDocument, PageDimensions, PdfEngine};
+use crate::text_search::{PageTextLayer, TextSelectionState};
 use crate::viewport::ViewportState;
 use anyhow::Result;
 use egui::Color32;
@@ -127,6 +128,8 @@ pub struct DocumentTab {
     pub title: String,
     pub page_dimensions: Vec<PageDimensions>,
     pub document: Option<LoadedPdfDocument<'static>>,
+    pub text_layers: Vec<PageTextLayer>,
+    pub text_selection: TextSelectionState,
     pub viewport: ViewportState,
     #[allow(dead_code)]
     pub is_modified: bool,
@@ -148,6 +151,8 @@ impl DocumentTab {
             title,
             page_dimensions,
             document: Some(doc),
+            text_layers: Vec::new(),
+            text_selection: TextSelectionState::default(),
             viewport: ViewportState::default(),
             is_modified: false,
             badge_color,
@@ -156,6 +161,17 @@ impl DocumentTab {
 
     pub fn page_count(&self) -> usize {
         self.page_dimensions.len()
+    }
+
+    /// Extrait à la demande la couche de texte natif des pages si elle n'est pas encore en cache
+    pub fn ensure_text_layers(&mut self, engine: &'static PdfEngine) {
+        if !self.text_layers.is_empty() {
+            return;
+        }
+        let _ = self.ensure_awake(engine);
+        if let Some(doc) = &self.document {
+            self.text_layers = doc.extract_all_pages_text_layers();
+        }
     }
 
     /// Indique si l'onglet est actuellement en hibernation mémoire (0 Mo de handle PDFium / textures)
