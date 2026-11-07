@@ -1,0 +1,14 @@
+[package]
+name = "super_pdf_reader"
+version = "0.1.0"
+edition = "2021"
+description = "Lecteur PDF ultra-performant et économe en RAM pour Windows (Style Arc, OCR Hybride, ISO 32000)"
+
+[dependencies]
+eframe = { version = "0.31", default-features = false, features = ["glow", "default_fonts"] }
+egui = "0.31"
+pdfium-render = { version = "0.8", features = ["thread_safe"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+lopdf = "0.34"
+rfd = "0.15"
+anyhow = "1.0"
