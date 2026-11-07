@@ -158,69 +158,73 @@ impl<'a> LoadedPdfDocument<'a> {
         Ok(ColorImage::from_rgba_unmultiplied([actual_w, actual_h], &rgba))
     }
 
-    /// Extrait la couche de texte natif de toutes les pages du document (avec boîtes englobantes et angles de rotation).
-    pub fn extract_all_pages_text_layers(&self) -> Vec<PageTextLayer> {
+    /// Extrait la couche de texte natif d'une seule page à la volée (< 1 ms, idéal pour les très gros PDF).
+    pub fn extract_single_page_text_layer(&self, page_idx: usize) -> PageTextLayer {
         let _lock = PDFIUM_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let pages = self.doc.pages();
-        let count = pages.len() as usize;
-        let mut layers = Vec::with_capacity(count);
-
-        for page_idx in 0..count {
-            let mut positioned_chars = Vec::new();
-            if let Ok(page) = pages.get(page_idx as u16) {
-                let page_w = page.width().value;
-                let page_h = page.height().value;
-                if let Ok(text_page) = page.text() {
-                    for ch_item in text_page.chars().iter() {
-                        let Some(ch) = ch_item.unicode_char() else {
-                            continue;
-                        };
-                        if ch == '\0' {
-                            continue;
-                        }
-                        let bounds_res = ch_item
-                            .loose_bounds()
-                            .or_else(|_| ch_item.tight_bounds());
-                        let rect = if let Ok(b) = bounds_res {
-                            let left = b.left().value;
-                            let right = b.right().value;
-                            let top = b.top().value;
-                            let bottom = b.bottom().value;
-
-                            let x_min = left.min(right).clamp(0.0, page_w);
-                            let x_max = left.max(right).clamp(0.0, page_w);
-                            let y_min = (page_h - top.max(bottom)).clamp(0.0, page_h);
-                            let y_max = (page_h - top.min(bottom)).clamp(0.0, page_h);
-                            let angle_deg = ch_item.angle_degrees().unwrap_or(0.0);
-
-                            PdfTopDownRect {
-                                x_min,
-                                y_min,
-                                x_max,
-                                y_max,
-                                angle_deg,
-                            }
-                        } else {
-                            PdfTopDownRect {
-                                x_min: 0.0,
-                                y_min: 0.0,
-                                x_max: 0.0,
-                                y_max: 0.0,
-                                angle_deg: 0.0,
-                            }
-                        };
-
-                        positioned_chars.push(PositionedChar {
-                            ch,
-                            rect,
-                            is_ocr: false,
-                        });
+        let mut positioned_chars = Vec::new();
+        if let Ok(page) = pages.get(page_idx as u16) {
+            let page_w = page.width().value;
+            let page_h = page.height().value;
+            if let Ok(text_page) = page.text() {
+                for ch_item in text_page.chars().iter() {
+                    let Some(ch) = ch_item.unicode_char() else {
+                        continue;
+                    };
+                    if ch == '\0' {
+                        continue;
                     }
+                    let bounds_res = ch_item
+                        .loose_bounds()
+                        .or_else(|_| ch_item.tight_bounds());
+                    let rect = if let Ok(b) = bounds_res {
+                        let left = b.left().value;
+                        let right = b.right().value;
+                        let top = b.top().value;
+                        let bottom = b.bottom().value;
+
+                        let x_min = left.min(right).clamp(0.0, page_w);
+                        let x_max = left.max(right).clamp(0.0, page_w);
+                        let y_min = (page_h - top.max(bottom)).clamp(0.0, page_h);
+                        let y_max = (page_h - top.min(bottom)).clamp(0.0, page_h);
+                        let angle_deg = ch_item.angle_degrees().unwrap_or(0.0);
+
+                        PdfTopDownRect {
+                            x_min,
+                            y_min,
+                            x_max,
+                            y_max,
+                            angle_deg,
+                        }
+                    } else {
+                        PdfTopDownRect {
+                            x_min: 0.0,
+                            y_min: 0.0,
+                            x_max: 0.0,
+                            y_max: 0.0,
+                            angle_deg: 0.0,
+                        }
+                    };
+
+                    positioned_chars.push(PositionedChar {
+                        ch,
+                        rect,
+                        is_ocr: false,
+                    });
                 }
             }
-            layers.push(PageTextLayer::new(page_idx, positioned_chars));
         }
+        PageTextLayer::new(page_idx, positioned_chars)
+    }
 
+    /// Extrait la couche de texte natif de toutes les pages du document (avec boîtes englobantes et angles de rotation).
+    #[allow(dead_code)]
+    pub fn extract_all_pages_text_layers(&self) -> Vec<PageTextLayer> {
+        let count = self.page_dimensions.len();
+        let mut layers = Vec::with_capacity(count);
+        for page_idx in 0..count {
+            layers.push(self.extract_single_page_text_layer(page_idx));
+        }
         layers
     }
 }

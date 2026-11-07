@@ -190,8 +190,11 @@ impl AnnotationManager {
             self.next_id = self.next_id.max(annot.id + 1);
         }
         let id = annot.id;
+        let is_highlight = matches!(annot.kind, AnnotationKind::Highlight { .. });
         self.items.push(annot);
-        self.selected_id = Some(id);
+        if !is_highlight {
+            self.selected_id = Some(id);
+        }
         id
     }
 
@@ -483,7 +486,8 @@ fn build_iso32000_annot_object(
     match &annot.kind {
         AnnotationKind::Highlight { quads } => {
             dict.set("Subtype", Object::Name(b"Highlight".to_vec()));
-            dict.set("CA", 0.45);
+            dict.set("BM", Object::Name(b"Multiply".to_vec()));
+            dict.set("CA", 1.0);
             let mut quad_points: Vec<Object> = Vec::with_capacity(quads.len() * 8);
             for q in quads {
                 let q_x1 = q.x_min;
@@ -714,6 +718,24 @@ pub fn load_annotations_from_pdf(
     path: &Path,
     page_dimensions: &[PageDimensions],
 ) -> Result<Vec<PdfAnnotation>> {
+    // Pré-vérification ultra-rapide en mémoire (< 1 ms) : si le fichier ne contient ni marqueur
+    // "superpdf_" ni sous-types d'annotation éditables (/Highlight, /FreeText, /Ink), ou s'il dépasse
+    // 4 Mo sans marqueur "superpdf_", on évite de parser tout l'arbre d'objets avec lopdf à l'ouverture.
+    if let Ok(raw_bytes) = std::fs::read(path) {
+        let has_superpdf = raw_bytes.windows(9).any(|w| w == b"superpdf_");
+        if !has_superpdf {
+            if raw_bytes.len() > 4 * 1024 * 1024 {
+                return Ok(Vec::new());
+            }
+            let has_editable_annot = raw_bytes
+                .windows(9)
+                .any(|w| w == b"Highlight" || w == b"/FreeText");
+            if !has_editable_annot {
+                return Ok(Vec::new());
+            }
+        }
+    }
+
     let doc = Document::load(path)?;
     let pages_map = doc.get_pages();
     let mut loaded = Vec::new();

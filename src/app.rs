@@ -2,7 +2,8 @@ use crate::annotations::{
     save_annotations_to_pdf, AnnotationKind, PdfAnnotation, ShapeKind, PALETTE_COLORS,
 };
 use crate::memory_manager::{
-    query_process_memory_bytes, LruTextureCache, PageTextureKey, DEFAULT_TEXTURE_BUDGET_BYTES,
+    query_process_memory_bytes, LruTextureCache, MultiplicativeHighlightQuad, PageTextureKey,
+    DEFAULT_TEXTURE_BUDGET_BYTES,
 };
 use crate::pdf_engine::{ensure_custom_sample_pdf, PdfEngine};
 use crate::tabs::{
@@ -30,6 +31,7 @@ pub enum InitialSidebarMode {
 #[derive(Debug, Clone, Default)]
 pub struct AutomationConfig {
     pub initial_pdf: PathBuf,
+    pub extra_pdfs: Vec<PathBuf>,
     pub initial_zoom: Option<f32>,
     pub initial_page: Option<usize>,
     pub initial_scroll_x: Option<f32>,
@@ -43,6 +45,7 @@ pub struct AutomationConfig {
     pub initial_match_index: Option<usize>,
     pub initial_select_rect: Option<PdfTopDownRect>,
     pub initial_select_stream: Option<(usize, usize)>,
+    pub initial_highlight_stream: Option<(usize, usize)>,
     pub demo_annotations: bool,
     pub save_annotated_output: Option<PathBuf>,
     pub screenshot_output: Option<PathBuf>,
@@ -164,6 +167,9 @@ impl SuperPdfApp {
             }
         } else {
             app.open_pdf_in_new_tab(&automation.initial_pdf);
+            for extra in &automation.extra_pdfs {
+                app.open_pdf_in_new_tab(extra);
+            }
         }
 
         if let Some(target_tab) = automation.active_tab_index {
@@ -180,6 +186,12 @@ impl SuperPdfApp {
             if let Some(z) = automation.initial_zoom {
                 tab.viewport.zoom = z;
                 tab.viewport.last_gesture_label = format!("Zoom initial {:.0}%", z * 100.0);
+            }
+            if let Some(p) = automation.initial_page {
+                let target_idx = p.saturating_sub(1);
+                let pages = tab.page_dimensions.clone();
+                tab.viewport
+                    .jump_to_page(target_idx, Vec2::new(1000.0, 800.0), &pages);
             }
             if let Some(sx) = automation.initial_scroll_x {
                 tab.viewport.scroll_offset.x = sx;
@@ -199,11 +211,24 @@ impl SuperPdfApp {
             app.search_bar.query = sq.clone();
             if let Some(tab) = app.tabs.get_mut(app.active_tab) {
                 tab.ensure_text_layers(app.engine);
+                if let Some(p) = automation.initial_page {
+                    tab.ensure_page_text_layer(p.saturating_sub(1), app.engine);
+                }
                 app.search_bar.execute_search(&tab.text_layers);
                 if let Some(m_idx) = automation.initial_match_index {
                     if !app.search_bar.matches.is_empty() {
                         app.search_bar.current_match_index =
                             m_idx.saturating_sub(1).min(app.search_bar.matches.len() - 1);
+                    }
+                } else if let Some(p) = automation.initial_page {
+                    let target_p = p.saturating_sub(1);
+                    if let Some(pos) = app
+                        .search_bar
+                        .matches
+                        .iter()
+                        .position(|m| m.page_index == target_p)
+                    {
+                        app.search_bar.current_match_index = pos;
                     }
                 }
             }
@@ -212,8 +237,8 @@ impl SuperPdfApp {
         // Sélection rectangulaire initiale (Alt + Glisser)
         if let Some(sel_rect) = automation.initial_select_rect {
             if let Some(tab) = app.tabs.get_mut(app.active_tab) {
-                tab.ensure_text_layers(app.engine);
                 let target_page = automation.initial_page.unwrap_or(1).saturating_sub(1);
+                tab.ensure_page_text_layer(target_page, app.engine);
                 if let Some(layer) = tab.text_layers.get(target_page) {
                     let (txt, boxes) = layer.select_in_rect(&sel_rect);
                     tab.text_selection.page_index = Some(target_page);
@@ -229,8 +254,8 @@ impl SuperPdfApp {
         // Sélection au fil des phrases initiale (Curseur I)
         if let Some((c_start, c_end)) = automation.initial_select_stream {
             if let Some(tab) = app.tabs.get_mut(app.active_tab) {
-                tab.ensure_text_layers(app.engine);
                 let target_page = automation.initial_page.unwrap_or(1).saturating_sub(1);
+                tab.ensure_page_text_layer(target_page, app.engine);
                 if let Some(layer) = tab.text_layers.get(target_page) {
                     let (txt, boxes) = layer.select_char_stream(c_start, c_end);
                     tab.text_selection.page_index = Some(target_page);
@@ -239,6 +264,28 @@ impl SuperPdfApp {
                     tab.text_selection.current_char_index = Some(c_end);
                     tab.text_selection.selected_text = txt;
                     tab.text_selection.highlight_boxes = boxes;
+                }
+            }
+        }
+
+        // Création d'un surlignage ISO 32000 (/Highlight /BM /Multiply) sur un flux de caractères
+        if let Some((h_start, h_end)) = automation.initial_highlight_stream {
+            if let Some(tab) = app.tabs.get_mut(app.active_tab) {
+                let target_page = automation.initial_page.unwrap_or(1).saturating_sub(1);
+                tab.ensure_page_text_layer(target_page, app.engine);
+                if let Some(layer) = tab.text_layers.get(target_page) {
+                    let (_, quads) = layer.select_char_stream(h_start, h_end);
+                    if let Some(first) = quads.first() {
+                        let union_rect = quads.iter().fold(*first, |acc, q| acc.union(q));
+                        tab.annotations.add_annotation(PdfAnnotation {
+                            id: 0,
+                            page_index: target_page,
+                            rect: union_rect,
+                            color_rgb: (255, 226, 52),
+                            kind: AnnotationKind::Highlight { quads },
+                        });
+                        tab.is_modified = true;
+                    }
                 }
             }
         }
@@ -903,7 +950,7 @@ impl SuperPdfApp {
 
         // Curseur I-Beam quand on survole du texte en mode Sélection ou Surligner
         if matches!(self.active_tool, ActiveTool::Select | ActiveTool::Highlight) {
-            tab.ensure_text_layers(self.engine);
+            tab.ensure_page_text_layer(page_index, self.engine);
             let over_annot = tab
                 .annotations
                 .items
@@ -924,7 +971,7 @@ impl SuperPdfApp {
         if matches!(self.active_tool, ActiveTool::Select | ActiveTool::Highlight) {
             // Double-clic sur un mot : sélectionne le mot entier !
             if double_clicked {
-                tab.ensure_text_layers(self.engine);
+                tab.ensure_page_text_layer(page_index, self.engine);
                 if let Some(layer) = tab.text_layers.get(page_index) {
                     if let Some((s, e, txt, boxes)) = layer.select_word_at_point(pt_x, pt_y) {
                         tab.text_selection.page_index = Some(page_index);
@@ -961,7 +1008,7 @@ impl SuperPdfApp {
                 // 1b. Sinon, démarrer une sélection de texte (Flux Curseur I par défaut, ou Rectangle si Alt maintenu)
                 tab.annotations.selected_id = None;
                 self.dragging_annotation_id = None;
-                tab.ensure_text_layers(self.engine);
+                tab.ensure_page_text_layer(page_index, self.engine);
                 tab.text_selection.page_index = Some(page_index);
                 tab.text_selection.drag_start_pt = Some((pt_x, pt_y));
                 tab.text_selection.drag_current_pt = Some((pt_x, pt_y));
@@ -1301,6 +1348,80 @@ impl eframe::App for SuperPdfApp {
                         // Fond blanc de la feuille
                         painter.rect_filled(page_rect, CornerRadius::same(2), Color32::WHITE);
 
+                        let page_dim = tab.page_dimensions[page_index];
+                        let inv_w = 1.0 / page_dim.width_pt.max(1.0);
+                        let inv_h = 1.0 / page_dim.height_pt.max(1.0);
+
+                        // Collecte de tous les surlignages multiplicatifs (/BM /Multiply) de la page
+                        // pour que l'écriture noire traverse le surligneur à 100 % en noir pur !
+                        let mut mult_highlights: Vec<MultiplicativeHighlightQuad> = Vec::new();
+                        for annot in tab
+                            .annotations
+                            .items
+                            .iter()
+                            .filter(|a| a.page_index == page_index)
+                        {
+                            if let AnnotationKind::Highlight { quads } = &annot.kind {
+                                for q in quads {
+                                    mult_highlights.push(MultiplicativeHighlightQuad {
+                                        norm_rect: [
+                                            (q.x_min - 1.0) * inv_w,
+                                            (q.y_min - 1.0) * inv_h,
+                                            (q.x_max + 1.0) * inv_w,
+                                            (q.y_max + 1.0) * inv_h,
+                                        ],
+                                        color_rgb: annot.color_rgb,
+                                    });
+                                }
+                            }
+                        }
+
+                        // Surlignage multiplicatif pour la sélection de texte active (Curseur I)
+                        if tab.text_selection.page_index == Some(page_index) {
+                            let sel_rgb = if self.active_tool == ActiveTool::Highlight {
+                                tab.annotations.active_color_rgb
+                            } else {
+                                (165, 212, 255)
+                            };
+                            for b in &tab.text_selection.highlight_boxes {
+                                mult_highlights.push(MultiplicativeHighlightQuad {
+                                    norm_rect: [
+                                        (b.x_min - 1.0) * inv_w,
+                                        (b.y_min - 1.0) * inv_h,
+                                        (b.x_max + 1.0) * inv_w,
+                                        (b.y_max + 1.0) * inv_h,
+                                    ],
+                                    color_rgb: sel_rgb,
+                                });
+                            }
+                        }
+
+                        // Surlignage multiplicatif pour les résultats de recherche `Ctrl+F`
+                        if self.search_bar.is_open && !self.search_bar.matches.is_empty() {
+                            for (m_idx, m) in self.search_bar.matches.iter().enumerate() {
+                                if m.page_index != page_index {
+                                    continue;
+                                }
+                                let is_active_match = m_idx == self.search_bar.current_match_index;
+                                let match_rgb = if is_active_match {
+                                    (255, 195, 75)
+                                } else {
+                                    (255, 238, 105)
+                                };
+                                for b in &m.highlight_boxes {
+                                    mult_highlights.push(MultiplicativeHighlightQuad {
+                                        norm_rect: [
+                                            (b.x_min - 1.5) * inv_w,
+                                            (b.y_min - 1.5) * inv_h,
+                                            (b.x_max + 1.5) * inv_w,
+                                            (b.y_max + 1.5) * inv_h,
+                                        ],
+                                        color_rgb: match_rgb,
+                                    });
+                                }
+                            }
+                        }
+
                         let key = PageTextureKey {
                             tab_id: tab.id,
                             page_index,
@@ -1309,21 +1430,27 @@ impl eframe::App for SuperPdfApp {
 
                         if !self.texture_cache.contains_key(&key) {
                             if let Some(doc) = &tab.document {
-                                let dim = tab.page_dimensions[page_index];
-                                let target_w =
-                                    (dim.width_pt * BASE_DPI_SCALE * bucket_zoom).round() as i32;
-                                let target_h =
-                                    (dim.height_pt * BASE_DPI_SCALE * bucket_zoom).round() as i32;
+                                let target_w = (page_dim.width_pt * BASE_DPI_SCALE * bucket_zoom)
+                                    .round() as i32;
+                                let target_h = (page_dim.height_pt * BASE_DPI_SCALE * bucket_zoom)
+                                    .round() as i32;
 
                                 if let Ok(color_img) =
                                     doc.render_page(page_index, target_w, target_h)
                                 {
-                                    self.texture_cache.insert_color_image(ctx, key, color_img);
+                                    self.texture_cache.insert_color_image(
+                                        ctx,
+                                        key,
+                                        color_img,
+                                        &mult_highlights,
+                                    );
                                 }
                             }
                         }
 
-                        if let Some(tex) = self.texture_cache.get(&key) {
+                        if let Some(tex) =
+                            self.texture_cache.get_with_highlights(&key, &mult_highlights)
+                        {
                             painter.image(
                                 tex.id(),
                                 page_rect,
@@ -1331,8 +1458,6 @@ impl eframe::App for SuperPdfApp {
                                 Color32::WHITE,
                             );
                         }
-
-                        let page_dim = tab.page_dimensions[page_index];
 
                         // --- 1. DESSIN DES ANNOTATIONS ISO 32000 SUR LA PAGE (JALON 5) ---
                         Self::paint_page_annotations(
@@ -1373,11 +1498,6 @@ impl eframe::App for SuperPdfApp {
                                     continue;
                                 }
                                 let is_active_match = m_idx == self.search_bar.current_match_index;
-                                let fill_col = if is_active_match {
-                                    Color32::from_rgba_unmultiplied(255, 130, 15, 135)
-                                } else {
-                                    Color32::from_rgba_unmultiplied(255, 225, 20, 105)
-                                };
                                 let stroke_col = if is_active_match {
                                     Color32::from_rgb(235, 75, 0)
                                 } else {
@@ -1386,7 +1506,7 @@ impl eframe::App for SuperPdfApp {
 
                                 for b in &m.highlight_boxes {
                                     let screen_b = b.to_screen_rect(page_rect, page_dim).expand(2.5);
-                                    painter.rect_filled(screen_b, CornerRadius::same(3), fill_col);
+                                    // Le fond est teinté par mélange multiplicatif (/BM /Multiply) : on ne trace que le contour !
                                     painter.rect_stroke(
                                         screen_b,
                                         CornerRadius::same(3),
@@ -1463,14 +1583,8 @@ impl eframe::App for SuperPdfApp {
                                 }
                             }
 
-                            for b in &tab.text_selection.highlight_boxes {
-                                let sb = b.to_screen_rect(page_rect, page_dim).expand(1.5);
-                                painter.rect_filled(
-                                    sb,
-                                    CornerRadius::same(2),
-                                    Color32::from_rgba_unmultiplied(55, 135, 255, 95),
-                                );
-                            }
+                            // Le fond des boîtes sélectionnées est teinté par mélange multiplicatif (/BM /Multiply),
+                            // ce qui laisse le texte noir 100 % net et lisible !
 
                             if tab.text_selection.has_selection() {
                                 if let Some(last_b) = tab.text_selection.highlight_boxes.last() {
@@ -1478,7 +1592,7 @@ impl eframe::App for SuperPdfApp {
                                     selection_toolbar_anchor = Some((
                                         Pos2::new(
                                             sb.min.x.max(canvas_rect.min.x + 16.0),
-                                            sb.max.y + 8.0,
+                                            (sb.max.y + 8.0).min(canvas_rect.max.y - 78.0),
                                         ),
                                         tab.text_selection.selected_text.clone(),
                                         tab.text_selection.selected_text.chars().count(),
@@ -1586,12 +1700,9 @@ impl SuperPdfApp {
             let stroke_col = annot.egui_color(240);
 
             match &annot.kind {
-                AnnotationKind::Highlight { quads } => {
-                    let fill_col = annot.egui_color(95);
-                    for q in quads {
-                        let sr = q.to_screen_rect(page_rect, page_dim).expand(1.5);
-                        painter.rect_filled(sr, CornerRadius::same(2), fill_col);
-                    }
+                AnnotationKind::Highlight { .. } => {
+                    // Rendu via mélange multiplicatif (/BM /Multiply) directement dans la texture de page :
+                    // l'encre noire du texte traverse le surligneur à 100 % en noir pur !
                 }
                 AnnotationKind::FreeText { text, font_size } => {
                     // Carte de texte visible directement sur la page (style Adobe Acrobat FreeText)
@@ -1946,14 +2057,14 @@ impl SuperPdfApp {
                             );
 
                             if ui
-                                .add_enabled(total > 0, egui::Button::new("↑").small())
+                                .add_enabled(total > 0, egui::Button::new("◀").small())
                                 .on_hover_text("Occurrence précédente (Shift+Entrée)")
                                 .clicked()
                             {
                                 step_dir = -1;
                             }
                             if ui
-                                .add_enabled(total > 0, egui::Button::new("↓").small())
+                                .add_enabled(total > 0, egui::Button::new("▶").small())
                                 .on_hover_text("Occurrence suivante (Entrée)")
                                 .clicked()
                             {

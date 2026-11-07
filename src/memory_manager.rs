@@ -1,9 +1,85 @@
-use egui::{ColorImage, Context, TextureHandle, TextureOptions};
+use egui::{Color32, ColorImage, Context, TextureHandle, TextureOptions};
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::hash::{Hash, Hasher};
 
 /// Budget par défaut du cache global de textures GPU/RAM : 48 Mo max pour l'ensemble des 15+ onglets
 pub const DEFAULT_TEXTURE_BUDGET_BYTES: usize = 48 * 1024 * 1024;
+
+/// Quad de surlignage multiplicatif (`/BM /Multiply`) permettant de colorer le fond blanc
+/// tout en laissant le texte noir traverser le surligneur à 100 % en noir pur.
+#[derive(Debug, Clone, Copy)]
+pub struct MultiplicativeHighlightQuad {
+    /// Rectangle normalisé dans la page `[x_min, y_min, x_max, y_max]` dans `0.0..=1.0`
+    pub norm_rect: [f32; 4],
+    pub color_rgb: (u8, u8, u8),
+}
+
+impl MultiplicativeHighlightQuad {
+    pub fn hash_slice(quads: &[Self]) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        quads.len().hash(&mut hasher);
+        for q in quads {
+            for c in q.norm_rect {
+                ((c * 10_000.0) as i32).hash(&mut hasher);
+            }
+            q.color_rgb.hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+}
+
+/// Applique un mélange multiplicatif (`/BM /Multiply` avec préservation d'encre noire) sur l'image de base.
+/// - Les pixels sombres d'écriture (`luminance < 75`) traversent intégralement le surligneur sans aucun voile jaune.
+/// - Les pixels clairs et blancs du papier prennent la teinte vive du surligneur (`pixel * couleur / 255`).
+pub fn apply_multiplicative_highlights(
+    base: &ColorImage,
+    quads: &[MultiplicativeHighlightQuad],
+) -> ColorImage {
+    if quads.is_empty() {
+        return base.clone();
+    }
+    let mut out = base.clone();
+    let w = out.width();
+    let h = out.height();
+    if w == 0 || h == 0 {
+        return out;
+    }
+
+    for q in quads {
+        let x0 = ((q.norm_rect[0].clamp(0.0, 1.0) * w as f32).floor() as usize).min(w);
+        let y0 = ((q.norm_rect[1].clamp(0.0, 1.0) * h as f32).floor() as usize).min(h);
+        let x1 = ((q.norm_rect[2].clamp(0.0, 1.0) * w as f32).ceil() as usize).min(w);
+        let y1 = ((q.norm_rect[3].clamp(0.0, 1.0) * h as f32).ceil() as usize).min(h);
+
+        let hr = q.color_rgb.0 as u16;
+        let hg = q.color_rgb.1 as u16;
+        let hb = q.color_rgb.2 as u16;
+
+        for y in y0..y1 {
+            let row_offset = y * w;
+            for x in x0..x1 {
+                let p = &mut out.pixels[row_offset + x];
+                let r = p.r() as u16;
+                let g = p.g() as u16;
+                let b = p.b() as u16;
+                // Luminance perceptuelle rapide (0..=255)
+                let lum = (r * 77 + g * 150 + b * 29) >> 8;
+                // Si le pixel appartient au coeur sombre d'une lettre (< 75), on le laisse 100 % noir intact !
+                if lum < 75 {
+                    continue;
+                }
+                // Mélange multiplicatif ISO 32000 (/BM /Multiply) : blanc (255) -> couleur surligneur, gris -> transition douce
+                let nr = ((r * hr) / 255) as u8;
+                let ng = ((g * hg) / 255) as u8;
+                let nb = ((b * hb) / 255) as u8;
+                *p = Color32::from_rgba_unmultiplied(nr, ng, nb, p.a());
+            }
+        }
+    }
+
+    out
+}
 
 /// Clé unique identifiant une page rendue à un palier de zoom donné pour un onglet
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -15,6 +91,8 @@ pub struct PageTextureKey {
 
 struct CachedTextureEntry {
     handle: Option<TextureHandle>,
+    base_image: Option<ColorImage>,
+    applied_highlights_hash: u64,
     byte_size: usize,
     last_access_tick: u64,
 }
@@ -60,12 +138,40 @@ impl LruTextureCache {
     }
 
     /// Vérifie si une texture est présente et met à jour son horodatage LRU
+    #[allow(dead_code)]
     pub fn get(&mut self, key: &PageTextureKey) -> Option<&TextureHandle> {
         self.access_clock += 1;
         let tick = self.access_clock;
         if let Some(entry) = self.entries.get_mut(key) {
             entry.last_access_tick = tick;
             self.total_hits += 1;
+            entry.handle.as_ref()
+        } else {
+            self.total_misses += 1;
+            None
+        }
+    }
+
+    /// Récupère la texture GPU en appliquant à la volée les surlignages multiplicatifs (`/BM /Multiply`)
+    /// sur l'image de base si la liste des surlignages de la page a changé (sans aucun re-rendu PDFium).
+    pub fn get_with_highlights(
+        &mut self,
+        key: &PageTextureKey,
+        highlights: &[MultiplicativeHighlightQuad],
+    ) -> Option<&TextureHandle> {
+        self.access_clock += 1;
+        let tick = self.access_clock;
+        if let Some(entry) = self.entries.get_mut(key) {
+            entry.last_access_tick = tick;
+            self.total_hits += 1;
+            let desired_hash = MultiplicativeHighlightQuad::hash_slice(highlights);
+            if entry.applied_highlights_hash != desired_hash {
+                if let (Some(base), Some(tex)) = (&entry.base_image, &mut entry.handle) {
+                    let composited = apply_multiplicative_highlights(base, highlights);
+                    tex.set(composited, TextureOptions::LINEAR);
+                    entry.applied_highlights_hash = desired_hash;
+                }
+            }
             entry.handle.as_ref()
         } else {
             self.total_misses += 1;
@@ -83,13 +189,17 @@ impl LruTextureCache {
         ctx: &Context,
         key: PageTextureKey,
         image: ColorImage,
+        highlights: &[MultiplicativeHighlightQuad],
     ) {
         let byte_size = image.width() * image.height() * 4;
         self.evict_until_fits(byte_size, Some(key.tab_id));
 
+        let applied_highlights_hash = MultiplicativeHighlightQuad::hash_slice(highlights);
+        let composited = apply_multiplicative_highlights(&image, highlights);
+
         let tex = ctx.load_texture(
             format!("superpdf_t{}_p{}_z{}", key.tab_id, key.page_index, key.zoom_bucket),
-            image,
+            composited,
             TextureOptions::LINEAR,
         );
 
@@ -98,6 +208,8 @@ impl LruTextureCache {
             key,
             CachedTextureEntry {
                 handle: Some(tex),
+                base_image: Some(image),
+                applied_highlights_hash,
                 byte_size,
                 last_access_tick: self.access_clock,
             },
@@ -116,6 +228,8 @@ impl LruTextureCache {
             key,
             CachedTextureEntry {
                 handle: None,
+                base_image: None,
+                applied_highlights_hash: 0,
                 byte_size,
                 last_access_tick: self.access_clock,
             },
@@ -313,5 +427,25 @@ mod tests {
             working_set
         );
         assert!(private_bytes > 1024 * 1024);
+    }
+
+    #[test]
+    fn test_multiplicative_highlight_preserves_black_text_pixels() {
+        // Image 4x1 : [Blanc papier, Noir pur écriture, Gris très sombre écriture, Blanc papier]
+        let mut base = ColorImage::new([4, 1], Color32::WHITE);
+        base.pixels[1] = Color32::from_rgb(0, 0, 0);
+        base.pixels[2] = Color32::from_rgb(25, 25, 25);
+
+        let quads = vec![MultiplicativeHighlightQuad {
+            norm_rect: [0.0, 0.0, 1.0, 1.0],
+            color_rgb: (255, 226, 52),
+        }];
+
+        let out = apply_multiplicative_highlights(&base, &quads);
+        // Le fond blanc devient jaune fluo vif
+        assert_eq!(out.pixels[0], Color32::from_rgb(255, 226, 52));
+        // L'écriture noire et sombre traverse le surligneur à 100 % en noir pur sans jaunir !
+        assert_eq!(out.pixels[1], Color32::from_rgb(0, 0, 0));
+        assert_eq!(out.pixels[2], Color32::from_rgb(25, 25, 25));
     }
 }

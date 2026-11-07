@@ -122,6 +122,24 @@ fn parse_args() -> AutomationConfig {
                     i += 1;
                 }
             }
+            "--highlight-stream" => {
+                if let Some(h_str) = args.get(i + 1) {
+                    let parts: Vec<usize> = h_str
+                        .split(',')
+                        .filter_map(|p| p.trim().parse::<usize>().ok())
+                        .collect();
+                    if parts.len() == 2 {
+                        cfg.initial_highlight_stream = Some((parts[0], parts[1]));
+                    }
+                    i += 1;
+                }
+            }
+            "--extra-pdf" => {
+                if let Some(ep) = args.get(i + 1) {
+                    cfg.extra_pdfs.push(PathBuf::from(ep));
+                    i += 1;
+                }
+            }
             "--demo-annotations" => {
                 cfg.demo_annotations = true;
             }

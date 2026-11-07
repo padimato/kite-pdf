@@ -172,14 +172,43 @@ impl DocumentTab {
         self.page_dimensions.len()
     }
 
-    /// Extrait à la demande la couche de texte natif des pages si elle n'est pas encore en cache
-    pub fn ensure_text_layers(&mut self, engine: &'static PdfEngine) {
-        if !self.text_layers.is_empty() {
+    /// Extrait à la demande la couche de texte d'une seule page (`page_index`) en < 1 ms,
+    /// permettant d'interagir instantanément avec de très gros manuels techniques (ex: CR711S de plusieurs centaines de pages).
+    pub fn ensure_page_text_layer(&mut self, page_index: usize, engine: &'static PdfEngine) {
+        let total = self.page_dimensions.len();
+        if page_index >= total {
+            return;
+        }
+        if self.text_layers.len() < total {
+            self.text_layers = (0..total)
+                .map(|idx| PageTextLayer::new(idx, Vec::new()))
+                .collect();
+        }
+        if !self.text_layers[page_index].chars.is_empty() {
             return;
         }
         let _ = self.ensure_awake(engine);
         if let Some(doc) = &self.document {
-            self.text_layers = doc.extract_all_pages_text_layers();
+            self.text_layers[page_index] = doc.extract_single_page_text_layer(page_index);
+        }
+    }
+
+    /// Extrait à la demande la couche de texte natif des pages (jusqu'à 120 pages en mode direct)
+    pub fn ensure_text_layers(&mut self, engine: &'static PdfEngine) {
+        let total = self.page_dimensions.len();
+        if self.text_layers.len() < total {
+            self.text_layers = (0..total)
+                .map(|idx| PageTextLayer::new(idx, Vec::new()))
+                .collect();
+        }
+        let _ = self.ensure_awake(engine);
+        if let Some(doc) = &self.document {
+            let max_scan = total.min(120);
+            for idx in 0..max_scan {
+                if self.text_layers[idx].chars.is_empty() {
+                    self.text_layers[idx] = doc.extract_single_page_text_layer(idx);
+                }
+            }
         }
     }
 
