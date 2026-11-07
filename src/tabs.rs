@@ -1,5 +1,6 @@
 use crate::annotations::{load_annotations_from_pdf, AnnotationManager};
 use crate::memory_manager::LruTextureCache;
+use crate::ocr_engine::{HybridOcrEngine, OcrSpeedMode, TabOcrState};
 use crate::pdf_engine::{LoadedPdfDocument, PageDimensions, PdfEngine};
 use crate::text_search::{PageTextLayer, TextSelectionState};
 use crate::viewport::ViewportState;
@@ -132,6 +133,7 @@ pub struct DocumentTab {
     pub text_layers: Vec<PageTextLayer>,
     pub text_selection: TextSelectionState,
     pub annotations: AnnotationManager,
+    pub ocr: TabOcrState,
     pub viewport: ViewportState,
     pub is_modified: bool,
     pub badge_color: Color32,
@@ -153,6 +155,9 @@ impl DocumentTab {
             }
             annotations.selected_id = None;
         }
+        let page_count = page_dimensions.len();
+        let mut ocr = TabOcrState::default();
+        ocr.ensure_initialized(page_count);
         Self {
             id,
             path,
@@ -162,6 +167,7 @@ impl DocumentTab {
             text_layers: Vec::new(),
             text_selection: TextSelectionState::default(),
             annotations,
+            ocr,
             viewport: ViewportState::default(),
             is_modified: false,
             badge_color,
@@ -170,6 +176,111 @@ impl DocumentTab {
 
     pub fn page_count(&self) -> usize {
         self.page_dimensions.len()
+    }
+
+    /// Scanne les objets `XObject Image` embarqués sur une page donnée (`page_index`) avec le moteur OCR Hybride Multi-Orientation.
+    /// Retourne le nombre de nouveaux caractères OCR reconnus dans les images de la page.
+    pub fn run_ocr_on_page(&mut self, page_index: usize, engine: &'static PdfEngine) -> usize {
+        let total = self.page_dimensions.len();
+        if page_index >= total {
+            return 0;
+        }
+        self.ensure_page_text_layer(page_index, engine);
+        self.ocr.ensure_initialized(total);
+        if self.ocr.page_scanned[page_index] {
+            return 0;
+        }
+
+        let _ = self.ensure_awake(engine);
+        let Some(doc) = &self.document else {
+            return 0;
+        };
+        let page_dim = self.page_dimensions[page_index];
+        let layer = &mut self.text_layers[page_index];
+
+        let (img_count, segments) =
+            HybridOcrEngine::scan_page_embedded_images(doc, page_index, page_dim, layer);
+
+        self.ocr.page_scanned[page_index] = true;
+        self.ocr.detected_images_count += img_count;
+
+        let added_chars: usize = segments.iter().map(|s| s.chars.len()).sum();
+        if added_chars > 0 {
+            self.ocr.recognized_ocr_chars_count += added_chars;
+            self.ocr.recognized_segments_count += segments.len();
+            self.ocr.has_unsaved_ocr = true;
+            self.is_modified = true;
+        }
+
+        self.ocr.status_summary = format!(
+            "OCR : {} img | {} seg. ({} car.)",
+            self.ocr.detected_images_count,
+            self.ocr.recognized_segments_count,
+            self.ocr.recognized_ocr_chars_count
+        );
+        added_chars
+    }
+
+    /// Phase 2 de l'Ordonnanceur OCR (Mode Éco Tâche de fond) :
+    /// Inspecte au maximum 1 page par tick autour de `visible_page` lorsque l'application est au repos,
+    /// garantissant 0 lag et le maintien des 60 FPS.
+    pub fn step_eco_ocr_background(
+        &mut self,
+        visible_page: usize,
+        engine: &'static PdfEngine,
+    ) -> usize {
+        let total = self.page_dimensions.len();
+        if total == 0 {
+            return 0;
+        }
+        self.ocr.ensure_initialized(total);
+
+        let candidates = [
+            Some(visible_page),
+            visible_page.checked_add(1).filter(|&p| p < total),
+            visible_page.checked_sub(1),
+        ];
+
+        for cand in candidates.into_iter().flatten() {
+            if !self.ocr.page_scanned[cand] {
+                if self.ocr.mode == OcrSpeedMode::InstantOpen {
+                    self.ocr.mode = OcrSpeedMode::EcoBackground;
+                }
+                return self.run_ocr_on_page(cand, engine);
+            }
+        }
+        0
+    }
+
+    /// Phase 3 de l'Ordonnanceur OCR (Mode Turbo déclenché par `Ctrl+F`) :
+    /// Scanne en priorité la page active et les pages voisines comportant des images embarquées
+    /// pour injecter immédiatement les textes des graphiques JPG (0°, +30°, -30°, +90°) dans `Ctrl+F`.
+    pub fn run_turbo_ocr_for_search(
+        &mut self,
+        focus_page: usize,
+        engine: &'static PdfEngine,
+    ) -> usize {
+        let total = self.page_dimensions.len();
+        if total == 0 {
+            return 0;
+        }
+        self.ocr.ensure_initialized(total);
+        self.ocr.mode = OcrSpeedMode::TurboSearch;
+
+        let mut total_added = 0;
+        // Scanner d'abord la page courante
+        if focus_page < total && !self.ocr.page_scanned[focus_page] {
+            total_added += self.run_ocr_on_page(focus_page, engine);
+        }
+
+        // Puis scanner une fenêtre de pages autour de `focus_page` (toutes les pages pour un PDF <= 16 pages)
+        let max_turbo_pages = total.min(16);
+        for idx in 0..max_turbo_pages {
+            if !self.ocr.page_scanned[idx] {
+                total_added += self.run_ocr_on_page(idx, engine);
+            }
+        }
+        total_added
     }
 
     /// Extrait à la demande la couche de texte d'une seule page (`page_index`) en < 1 ms,
@@ -244,6 +355,8 @@ pub enum PaletteCommand {
     ToggleSidebarPin,
     OpenFileDialog,
     SaveAnnotatedPdf,
+    RunHybridOcrTurbo,
+    OpenHybridWordJpgDemo,
     NewDemoTab,
     Open15TabsBenchmark,
     HibernateInactiveTabs,
@@ -327,10 +440,22 @@ impl CommandPaletteState {
             });
         }
 
-        // 2. Commandes Annotations ISO 32000, Mémoire & Onglets
+        // 2. Commandes OCR Hybride Multi-Angles, Annotations ISO 32000, Mémoire & Onglets
+        all.push(PaletteEntry {
+            category: "OCR Hybride",
+            label: "Scanner les graphiques JPG embarqués (Mode Turbo Multi-Angles 0°..360°)".to_string(),
+            shortcut: "OCR Turbo",
+            command: PaletteCommand::RunHybridOcrTurbo,
+        });
+        all.push(PaletteEntry {
+            category: "OCR Hybride",
+            label: "Ouvrir le PDF Hybride Word + Graphique JPG Multi-Orientations (Jalon 6)".to_string(),
+            shortcut: "Démo OCR",
+            command: PaletteCommand::OpenHybridWordJpgDemo,
+        });
         all.push(PaletteEntry {
             category: "Annotations",
-            label: "Enregistrer le PDF avec les annotations standard ISO 32000 (Compatible Adobe Acrobat)".to_string(),
+            label: "Enregistrer le PDF avec les annotations ISO 32000 & Couche Texte OCR (Tr 3)".to_string(),
             shortcut: "Ctrl+S",
             command: PaletteCommand::SaveAnnotatedPdf,
         });

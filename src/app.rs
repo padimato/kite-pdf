@@ -1,10 +1,11 @@
 use crate::annotations::{
-    save_annotations_to_pdf, AnnotationKind, PdfAnnotation, ShapeKind, PALETTE_COLORS,
+    save_annotations_and_ocr_to_pdf, AnnotationKind, PdfAnnotation, ShapeKind, PALETTE_COLORS,
 };
 use crate::memory_manager::{
     query_process_memory_bytes, LruTextureCache, MultiplicativeHighlightQuad, PageTextureKey,
     DEFAULT_TEXTURE_BUDGET_BYTES,
 };
+use crate::ocr_engine::ensure_hybrid_word_jpg_pdf;
 use crate::pdf_engine::{ensure_custom_sample_pdf, PdfEngine};
 use crate::tabs::{
     ActiveTool, CommandPaletteState, DocumentTab, PaletteCommand, SidebarState, SIDEBAR_WIDTH,
@@ -47,6 +48,8 @@ pub struct AutomationConfig {
     pub initial_select_stream: Option<(usize, usize)>,
     pub initial_highlight_stream: Option<(usize, usize)>,
     pub demo_annotations: bool,
+    pub hybrid_ocr_demo: bool,
+    pub ocr_turbo: bool,
     pub save_annotated_output: Option<PathBuf>,
     pub screenshot_output: Option<PathBuf>,
 }
@@ -161,7 +164,14 @@ impl SuperPdfApp {
             fps_smoothed: 60.0,
         };
 
-        if let Some(count) = automation.demo_tabs_count {
+        if automation.hybrid_ocr_demo {
+            let hybrid_path = PathBuf::from("test_pdfs/hybrid_word_jpg_ocr.pdf");
+            let _ = ensure_hybrid_word_jpg_pdf(&hybrid_path);
+            app.open_pdf_in_new_tab(&hybrid_path);
+            for extra in &automation.extra_pdfs {
+                app.open_pdf_in_new_tab(extra);
+            }
+        } else if let Some(count) = automation.demo_tabs_count {
             for _ in 0..count.max(1) {
                 app.spawn_next_demo_tab();
             }
@@ -206,14 +216,22 @@ impl SuperPdfApp {
             app.command_palette.query = q.clone();
         }
 
+        if automation.ocr_turbo {
+            if let Some(tab) = app.tabs.get_mut(app.active_tab) {
+                let target_p = automation.initial_page.unwrap_or(1).saturating_sub(1);
+                tab.run_turbo_ocr_for_search(target_p, app.engine);
+            }
+        }
+
         if let Some(sq) = &automation.initial_search_query {
             app.search_bar.open();
             app.search_bar.query = sq.clone();
             if let Some(tab) = app.tabs.get_mut(app.active_tab) {
+                let target_p = automation.initial_page.unwrap_or(1).saturating_sub(1);
                 tab.ensure_text_layers(app.engine);
-                if let Some(p) = automation.initial_page {
-                    tab.ensure_page_text_layer(p.saturating_sub(1), app.engine);
-                }
+                tab.ensure_page_text_layer(target_p, app.engine);
+                // Phase 3 : Mode Turbo OCR automatique sur Ctrl+F pour trouver aussi les textes des graphiques JPG
+                tab.run_turbo_ocr_for_search(target_p, app.engine);
                 app.search_bar.execute_search(&tab.text_layers);
                 if let Some(m_idx) = automation.initial_match_index {
                     if !app.search_bar.matches.is_empty() {
@@ -296,16 +314,21 @@ impl SuperPdfApp {
                 let target_page = automation.initial_page.unwrap_or(1).saturating_sub(1);
                 tab.annotations.populate_demo_showcase(target_page);
                 tab.is_modified = true;
+            }
+        }
 
-                if let Some(save_path) = &automation.save_annotated_output {
-                    let _ = save_annotations_to_pdf(
-                        &tab.path,
-                        save_path,
-                        &tab.annotations.items,
-                        &tab.page_dimensions,
-                    );
-                    tab.annotations.saved_feedback_frames = 120;
-                }
+        // Sauvegarde du PDF (Annotations ISO 32000 + Couche Texte OCR invisible `3 Tr`) si demandée par CLI
+        if let Some(save_path) = &automation.save_annotated_output {
+            if let Some(tab) = app.tabs.get_mut(app.active_tab) {
+                let _ = save_annotations_and_ocr_to_pdf(
+                    &tab.path,
+                    save_path,
+                    &tab.annotations.items,
+                    &tab.text_layers,
+                    &tab.page_dimensions,
+                );
+                tab.annotations.saved_feedback_frames = 120;
+                tab.ocr.has_unsaved_ocr = false;
             }
         }
 
@@ -413,16 +436,17 @@ impl SuperPdfApp {
         ((zoom * 20.0).round() as u32).max(1)
     }
 
-    /// Enregistre les annotations de l'onglet actif directement dans le fichier PDF selon la norme ISO 32000 (`Ctrl+S`)
+    /// Enregistre les annotations ISO 32000 ET la couche de texte OCR invisible (`3 Tr` + `Tm`) dans le PDF (`Ctrl+S`)
     pub fn save_active_tab_annotations(&mut self) {
         if let Some(tab) = self.tabs.get_mut(self.active_tab) {
             // Relâcher temporairement le handle PDFium sur Windows pour écrire dans le fichier en place
             let tab_id = tab.id;
             tab.hibernate(&mut self.texture_cache);
-            let res = save_annotations_to_pdf(
+            let res = save_annotations_and_ocr_to_pdf(
                 &tab.path,
                 &tab.path,
                 &tab.annotations.items,
+                &tab.text_layers,
                 &tab.page_dimensions,
             );
             let _ = tab.ensure_awake(self.engine);
@@ -430,6 +454,7 @@ impl SuperPdfApp {
             match res {
                 Ok(()) => {
                     tab.is_modified = false;
+                    tab.ocr.has_unsaved_ocr = false;
                     tab.annotations.saved_feedback_frames = 120;
                     self.error_message = None;
                 }
@@ -486,6 +511,20 @@ impl SuperPdfApp {
             }
             PaletteCommand::SaveAnnotatedPdf => {
                 self.save_active_tab_annotations();
+            }
+            PaletteCommand::RunHybridOcrTurbo => {
+                if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                    let p = tab.viewport.current_page_index(viewport_size, &tab.page_dimensions);
+                    tab.run_turbo_ocr_for_search(p, self.engine);
+                    if self.search_bar.is_open {
+                        self.search_bar.execute_search(&tab.text_layers);
+                    }
+                }
+            }
+            PaletteCommand::OpenHybridWordJpgDemo => {
+                let hybrid_path = PathBuf::from("test_pdfs/hybrid_word_jpg_ocr.pdf");
+                let _ = ensure_hybrid_word_jpg_pdf(&hybrid_path);
+                self.open_pdf_in_new_tab(&hybrid_path);
             }
             PaletteCommand::PopulateDemoAnnotations => {
                 if let Some(tab) = self.tabs.get_mut(self.active_tab) {
@@ -861,7 +900,11 @@ impl SuperPdfApp {
         if trigger_search_open {
             self.search_bar.open();
             if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                let p = tab
+                    .viewport
+                    .current_page_index(viewport_size, &tab.page_dimensions);
                 tab.ensure_text_layers(self.engine);
+                tab.run_turbo_ocr_for_search(p, self.engine);
             }
         }
 
@@ -1284,6 +1327,18 @@ impl eframe::App for SuperPdfApp {
                     } else if self.active_tool == ActiveTool::Pan {
                         ctx.set_cursor_icon(egui::CursorIcon::Grab);
                     }
+                    // Phase 2 : Ordonnanceur OCR Mode Éco Tâche de fond au repos (1 page / tick sans bloquer les 60 FPS)
+                    if tab.viewport.inertia_velocity.length_sq() < 0.1
+                        && (self.frame_count == 2 || self.frame_count % 6 == 0)
+                    {
+                        let vis_p = tab
+                            .viewport
+                            .current_page_index(canvas_rect.size(), &tab.page_dimensions);
+                        let added = tab.step_eco_ocr_background(vis_p, self.engine);
+                        if added > 0 && self.search_bar.is_open && !self.search_bar.query.trim().is_empty() {
+                            self.search_bar.execute_search(&tab.text_layers);
+                        }
+                    }
                 }
 
                 let visible_pages_info: Vec<(usize, Rect)> =
@@ -1521,31 +1576,20 @@ impl eframe::App for SuperPdfApp {
                                 if is_active_match {
                                     if let Some(first_b) = m.highlight_boxes.first() {
                                         let screen_b = first_b.to_screen_rect(page_rect, page_dim);
-                                        let badge_rect = Rect::from_min_size(
-                                            Pos2::new(
-                                                screen_b.min.x,
-                                                (screen_b.min.y - 24.0).max(page_rect.min.y + 4.0),
-                                            ),
-                                            Vec2::new(
-                                                if m.angle_deg.abs() > 1.0 {
-                                                    195.0
-                                                } else {
-                                                    130.0
-                                                },
-                                                20.0,
-                                            ),
-                                        );
-                                        painter.rect_filled(
-                                            badge_rect,
-                                            CornerRadius::same(5),
-                                            Color32::from_rgb(225, 75, 15),
-                                        );
+                                        let ocr_prefix = if m.is_ocr { "OCR JPG " } else { "" };
                                         let label = if m.angle_deg.abs() > 1.0 {
                                             format!(
-                                                "🔎 #{}/{} (Orienté {:+.0}°)",
+                                                "🔎 {}#{}/{} (Orienté {:+.0}°)",
+                                                ocr_prefix,
                                                 m_idx + 1,
                                                 self.search_bar.matches.len(),
                                                 m.angle_deg
+                                            )
+                                        } else if m.is_ocr {
+                                            format!(
+                                                "🔎 OCR JPG #{}/{} (0°)",
+                                                m_idx + 1,
+                                                self.search_bar.matches.len()
                                             )
                                         } else {
                                             format!(
@@ -1554,6 +1598,23 @@ impl eframe::App for SuperPdfApp {
                                                 self.search_bar.matches.len()
                                             )
                                         };
+                                        let badge_w = (label.chars().count() as f32 * 6.8).max(140.0);
+                                        let badge_rect = Rect::from_min_size(
+                                            Pos2::new(
+                                                screen_b.min.x,
+                                                (screen_b.min.y - 24.0).max(page_rect.min.y + 4.0),
+                                            ),
+                                            Vec2::new(badge_w, 20.0),
+                                        );
+                                        painter.rect_filled(
+                                            badge_rect,
+                                            CornerRadius::same(5),
+                                            if m.is_ocr {
+                                                Color32::from_rgb(195, 45, 115)
+                                            } else {
+                                                Color32::from_rgb(225, 75, 15)
+                                            },
+                                        );
                                         painter.text(
                                             badge_rect.center(),
                                             Align2::CENTER_CENTER,
@@ -2089,7 +2150,12 @@ impl SuperPdfApp {
 
         if run_search {
             if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                let vis_p = tab
+                    .viewport
+                    .current_page_index(canvas_rect.size(), &tab.page_dimensions);
                 tab.ensure_text_layers(self.engine);
+                // Phase 3 : Mode Turbo OCR déclenché automatiquement lors d'une recherche `Ctrl+F`
+                tab.run_turbo_ocr_for_search(vis_p, self.engine);
                 self.search_bar.execute_search(&tab.text_layers);
             }
             self.scroll_to_current_search_match(canvas_rect.size());
@@ -2501,6 +2567,7 @@ impl SuperPdfApp {
                                     .corner_radius(CornerRadius::same(5))
                                     .inner_margin(Margin::symmetric(6, 3))
                                     .show(ui, |ui| {
+                                        let ocr_tag = if m.is_ocr { " [OCR JPG]" } else { "" };
                                         let angle_tag = if m.angle_deg.abs() > 1.0 {
                                             format!(" [↗{:+.0}°]", m.angle_deg)
                                         } else {
@@ -2508,8 +2575,9 @@ impl SuperPdfApp {
                                         };
                                         let btn = egui::Button::new(
                                             egui::RichText::new(format!(
-                                                "P.{}{} : {}",
+                                                "P.{}{}{} : {}",
                                                 m.page_index + 1,
+                                                ocr_tag,
                                                 angle_tag,
                                                 m.snippet
                                             ))
@@ -2572,6 +2640,20 @@ impl SuperPdfApp {
                     .size(10.5)
                     .color(Color32::from_rgb(160, 175, 200)),
                 );
+
+                if let Some(tab) = self.tabs.get(self.active_tab) {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "👁 {} ({})",
+                                tab.ocr.status_summary,
+                                tab.ocr.mode.badge_label()
+                            ))
+                            .size(10.0)
+                            .color(Color32::from_rgb(245, 175, 220)),
+                        );
+                    });
+                }
 
                 let bar_w = SIDEBAR_WIDTH - 24.0;
                 let (bar_rect, _) =
@@ -2764,7 +2846,9 @@ impl SuperPdfApp {
                             );
                             ui.separator();
                             let saved_tag = if tab.annotations.saved_feedback_frames > 0 {
-                                "✅ ISO 32000 Enregistré"
+                                "✅ ISO 32000 + Tr3 Enregistré"
+                            } else if tab.ocr.recognized_ocr_chars_count > 0 {
+                                "⚡ OCR JPG Actif"
                             } else {
                                 ""
                             };

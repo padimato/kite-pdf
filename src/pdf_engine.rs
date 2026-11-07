@@ -187,7 +187,12 @@ impl<'a> LoadedPdfDocument<'a> {
                         let x_max = left.max(right).clamp(0.0, page_w);
                         let y_min = (page_h - top.max(bottom)).clamp(0.0, page_h);
                         let y_max = (page_h - top.min(bottom)).clamp(0.0, page_h);
-                        let angle_deg = ch_item.angle_degrees().unwrap_or(0.0);
+                        let raw_angle = ch_item.angle_degrees().unwrap_or(0.0);
+                        let angle_deg = if raw_angle > 180.0 {
+                            raw_angle - 360.0
+                        } else {
+                            raw_angle
+                        };
 
                         PdfTopDownRect {
                             x_min,
@@ -215,6 +220,115 @@ impl<'a> LoadedPdfDocument<'a> {
             }
         }
         PageTextLayer::new(page_idx, positioned_chars)
+    }
+
+    /// Inspecte tous les objets graphiques d'une page PDF via PDFium pour détecter les images matricielles
+    /// embarquées (`XObject /Subtype /Image`, ex: graphiques JPG insérés dans un rapport Word ou schémas techniques)
+    /// et retourner leurs coordonnées exactes en points PDF top-down ainsi que leurs dimensions en pixels.
+    #[allow(dead_code)]
+    pub fn list_page_image_regions(&self, page_idx: usize) -> Vec<(PdfTopDownRect, usize, usize)> {
+        let _lock = PDFIUM_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let mut regions = Vec::new();
+        let Ok(page) = self.doc.pages().get(page_idx as u16) else {
+            return regions;
+        };
+        let page_w = page.width().value;
+        let page_h = page.height().value;
+
+        for obj in page.objects().iter() {
+            if let Some(img_obj) = obj.as_image_object() {
+                if let Ok(bounds) = obj.bounds() {
+                    let left = bounds.left().value;
+                    let right = bounds.right().value;
+                    let top = bounds.top().value;
+                    let bottom = bounds.bottom().value;
+
+                    let x_min = left.min(right).clamp(0.0, page_w);
+                    let x_max = left.max(right).clamp(0.0, page_w);
+                    let y_min = (page_h - top.max(bottom)).clamp(0.0, page_h);
+                    let y_max = (page_h - top.min(bottom)).clamp(0.0, page_h);
+
+                    let px_w = img_obj
+                        .width()
+                        .map(|w| w as usize)
+                        .unwrap_or_else(|_| (x_max - x_min).round() as usize);
+                    let px_h = img_obj
+                        .height()
+                        .map(|h| h as usize)
+                        .unwrap_or_else(|_| (y_max - y_min).round() as usize);
+
+                    if (x_max - x_min) >= 12.0 && (y_max - y_min) >= 12.0 {
+                        regions.push((
+                            PdfTopDownRect {
+                                x_min,
+                                y_min,
+                                x_max,
+                                y_max,
+                                angle_deg: 0.0,
+                            },
+                            px_w,
+                            px_h,
+                        ));
+                    }
+                }
+            }
+        }
+        regions
+    }
+
+    /// Extrait directement le bitmap natif (`ColorImage`) de chaque objet `XObject /Subtype /Image` de la page,
+    /// sans ré-échantillonnage de page entière (ultra-rapide et 100 % fidèle aux pixels d'origine du JPG/PNG).
+    pub fn extract_page_embedded_image_bitmaps(
+        &self,
+        page_idx: usize,
+    ) -> Vec<(PdfTopDownRect, ColorImage)> {
+        let _lock = PDFIUM_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let mut results = Vec::new();
+        let Ok(page) = self.doc.pages().get(page_idx as u16) else {
+            return results;
+        };
+        let page_w = page.width().value;
+        let page_h = page.height().value;
+
+        for obj in page.objects().iter() {
+            if let Some(img_obj) = obj.as_image_object() {
+                let Ok(bounds) = obj.bounds() else {
+                    continue;
+                };
+                let left = bounds.left().value;
+                let right = bounds.right().value;
+                let top = bounds.top().value;
+                let bottom = bounds.bottom().value;
+
+                let x_min = left.min(right).clamp(0.0, page_w);
+                let x_max = left.max(right).clamp(0.0, page_w);
+                let y_min = (page_h - top.max(bottom)).clamp(0.0, page_h);
+                let y_max = (page_h - top.min(bottom)).clamp(0.0, page_h);
+
+                if (x_max - x_min) < 20.0 || (y_max - y_min) < 20.0 {
+                    continue;
+                }
+
+                let rect_pt = PdfTopDownRect {
+                    x_min,
+                    y_min,
+                    x_max,
+                    y_max,
+                    angle_deg: 0.0,
+                };
+
+                if let Ok(bitmap) = img_obj.get_raw_bitmap() {
+                    let rgba = bitmap.as_rgba_bytes();
+                    let w = bitmap.width() as usize;
+                    let h = bitmap.height() as usize;
+                    if w >= 16 && h >= 16 {
+                        let color_img = ColorImage::from_rgba_unmultiplied([w, h], &rgba);
+                        results.push((rect_pt, color_img));
+                    }
+                }
+            }
+        }
+        results
     }
 
     /// Extrait la couche de texte natif de toutes les pages du document (avec boîtes englobantes et angles de rotation).

@@ -1,5 +1,6 @@
+use crate::ocr_engine::append_invisible_ocr_layer_to_doc;
 use crate::pdf_engine::PageDimensions;
-use crate::text_search::PdfTopDownRect;
+use crate::text_search::{PageTextLayer, PdfTopDownRect};
 use anyhow::{Context, Result};
 use egui::Color32;
 use lopdf::content::{Content, Operation};
@@ -373,10 +374,23 @@ impl AnnotationManager {
 /// Chaque annotation est écrite comme un dictionnaire `/Annot` standard dans le tableau `/Annots` de la page,
 /// accompagnée de son flux d'apparence `/AP` (`Form XObject`), garantissant qu'Adobe Acrobat ou tout autre lecteur
 /// puisse afficher ET modifier/déplacer/éditer les blocs de texte, surlignages et dessins.
+#[allow(dead_code)]
 pub fn save_annotations_to_pdf(
     source_path: &Path,
     dest_path: &Path,
     annotations: &[PdfAnnotation],
+    page_dimensions: &[PageDimensions],
+) -> Result<()> {
+    save_annotations_and_ocr_to_pdf(source_path, dest_path, annotations, &[], page_dimensions)
+}
+
+/// Enregistre à la fois les annotations standard ISO 32000 (`/Annots` + `/AP`) ET la couche de texte OCR
+/// invisible normalisée (`3 Tr` + matrice orientée `Tm`) directement dans le fichier PDF (`Ctrl+S`).
+pub fn save_annotations_and_ocr_to_pdf(
+    source_path: &Path,
+    dest_path: &Path,
+    annotations: &[PdfAnnotation],
+    text_layers: &[PageTextLayer],
     page_dimensions: &[PageDimensions],
 ) -> Result<()> {
     let mut doc = Document::load(source_path).with_context(|| {
@@ -441,6 +455,11 @@ pub fn save_annotations_to_pdf(
                 page_dict.set("Annots", Object::Array(annot_refs));
             }
         }
+    }
+
+    // Injection de la couche de texte OCR invisible normalisée (`3 Tr` + `Tm`) pour les images embarquées scannées
+    if !text_layers.is_empty() {
+        let _ = append_invisible_ocr_layer_to_doc(&mut doc, &pages_map, text_layers, page_dimensions);
     }
 
     doc.save(dest_path).with_context(|| {

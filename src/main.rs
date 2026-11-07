@@ -1,6 +1,7 @@
 mod annotations;
 mod app;
 mod memory_manager;
+mod ocr_engine;
 mod pdf_engine;
 mod tabs;
 mod text_search;
@@ -143,6 +144,12 @@ fn parse_args() -> AutomationConfig {
             "--demo-annotations" => {
                 cfg.demo_annotations = true;
             }
+            "--hybrid-ocr-demo" => {
+                cfg.hybrid_ocr_demo = true;
+            }
+            "--ocr-turbo" => {
+                cfg.ocr_turbo = true;
+            }
             "--save-annotated" => {
                 if let Some(out_path) = args.get(i + 1) {
                     cfg.save_annotated_output = Some(PathBuf::from(out_path));
@@ -186,7 +193,7 @@ fn main() -> eframe::Result<()> {
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Super Lecteur PDF — Jalon 5 (Sélection Curseur I & Annotations ISO 32000 Compatibles Acrobat)")
+            .with_title("Super Lecteur PDF — Jalon 6 (OCR Hybride 3 Vitesses Multi-Angles & Graphiques JPG + Persistance Tr 3)")
             .with_inner_size([1280.0, 820.0])
             .with_min_inner_size([640.0, 400.0]),
         ..Default::default()
