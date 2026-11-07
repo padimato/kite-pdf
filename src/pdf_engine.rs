@@ -139,9 +139,13 @@ impl<'a> LoadedPdfDocument<'a> {
     }
 }
 
-/// Génère un fichier PDF de démonstration multi-pages riche (texte, grilles techniques,
-/// éléments orientés en diagonale, graphiques vectoriels) pour tester le lecteur et le trackpad.
-pub fn ensure_sample_pdf(path: &Path) -> Result<()> {
+/// Génère un fichier PDF de démonstration personnalisé (titre, sous-titre, palette de couleur, nombre de pages).
+pub fn ensure_custom_sample_pdf(
+    path: &Path,
+    doc_title: &str,
+    accent_rgb: (f32, f32, f32),
+    total_pages: usize,
+) -> Result<()> {
     if path.exists() {
         return Ok(());
     }
@@ -179,7 +183,6 @@ pub fn ensure_sample_pdf(path: &Path) -> Result<()> {
         },
     });
 
-    let total_pages = 5;
     let mut page_ids = Vec::with_capacity(total_pages);
 
     for page_num in 1..=total_pages {
@@ -187,11 +190,10 @@ pub fn ensure_sample_pdf(path: &Path) -> Result<()> {
 
         // Bandeau supérieur coloré dans la page PDF
         ops.push(Operation::new("q", vec![]));
-        match page_num % 3 {
-            1 => ops.push(Operation::new("rg", vec![0.10.into(), 0.24.into(), 0.48.into()])),
-            2 => ops.push(Operation::new("rg", vec![0.12.into(), 0.42.into(), 0.34.into()])),
-            _ => ops.push(Operation::new("rg", vec![0.42.into(), 0.16.into(), 0.38.into()])),
-        }
+        ops.push(Operation::new(
+            "rg",
+            vec![accent_rgb.0.into(), accent_rgb.1.into(), accent_rgb.2.into()],
+        ));
         ops.push(Operation::new(
             "re",
             vec![36.into(), 730.into(), 523.into(), 76.into()],
@@ -202,44 +204,47 @@ pub fn ensure_sample_pdf(path: &Path) -> Result<()> {
         // Titre dans le bandeau
         ops.push(Operation::new("BT", vec![]));
         ops.push(Operation::new("rg", vec![1.0.into(), 1.0.into(), 1.0.into()]));
-        ops.push(Operation::new("Tf", vec!["F2".into(), 20.into()]));
+        ops.push(Operation::new("Tf", vec!["F2".into(), 18.into()]));
         ops.push(Operation::new("Td", vec![52.into(), 774.into()]));
         ops.push(Operation::new(
             "Tj",
             vec![Object::string_literal(format!(
-                "SUPER LECTEUR PDF - JALON 1 (PAGE {}/{})",
-                page_num, total_pages
+                "{} - PAGE {}/{}",
+                doc_title, page_num, total_pages
             ))],
         ));
         ops.push(Operation::new("ET", vec![]));
 
         ops.push(Operation::new("BT", vec![]));
-        ops.push(Operation::new("rg", vec![0.85.into(), 0.92.into(), 1.0.into()]));
+        ops.push(Operation::new("rg", vec![0.88.into(), 0.94.into(), 1.0.into()]));
         ops.push(Operation::new("Tf", vec!["F1".into(), 11.into()]));
         ops.push(Operation::new("Td", vec![52.into(), 748.into()]));
         ops.push(Operation::new(
             "Tj",
             vec![Object::string_literal(
-                "Moteur Rust + PDFium + Rendu GPU 60 FPS + Support Trackpad Windows Precision",
+                "Moteur Rust + PDFium + Sidebar Arc + Raccourcis & Trackpad Windows Precision",
             )],
         ));
         ops.push(Operation::new("ET", vec![]));
 
         // Corps de texte explicatif
         let lines = [
-            format!("Section {}.1 - Validation du moteur de rendu vectoriel PDFium", page_num),
-            "Ce document de reference est genere automatiquement pour valider le Jalon 1 :".to_string(),
-            "  * Rendu haute precision des polices, vecteurs et graphiques techniques.".to_string(),
-            "  * Defilement fluide 2 doigts au Trackpad Windows (Vertical + Horizontal).".to_string(),
-            "  * Zoom progressif centre sur le pointeur (Pinch-to-Zoom 2 doigts ou Ctrl+Scroll).".to_string(),
-            "  * Panoramique libre a 1 doigt en maintenant la barre d'espace (Space + Glisser).".to_string(),
+            format!("Document : {} (Section {}.1)", doc_title, page_num),
+            "Architecture Jalon 2 - Interface Arc Browser & Multi-Onglets :".to_string(),
+            "  * Barre laterale gauche epinglable (Ctrl+B) ou auto-masquee au survol du bord gauche.".to_string(),
             "  * Zero barre superieure : 100% de la hauteur d'ecran dediee au document PDF.".to_string(),
+            "  * Palette de commandes rapide (Ctrl+K) pour chercher un onglet, une page ou un outil.".to_string(),
+            "  * Navigation Trackpad 2D (smooth_scroll_delta) et Pinch-to-Zoom centre sur le pointeur.".to_string(),
+            "  * Etat de zoom et de defilement conserve independamment pour chaque onglet ouvert.".to_string(),
         ];
 
         for (i, line) in lines.iter().enumerate() {
             ops.push(Operation::new("BT", vec![]));
             if i == 0 {
-                ops.push(Operation::new("rg", vec![0.10.into(), 0.20.into(), 0.40.into()]));
+                ops.push(Operation::new(
+                    "rg",
+                    vec![accent_rgb.0.into(), accent_rgb.1.into(), accent_rgb.2.into()],
+                ));
                 ops.push(Operation::new("Tf", vec!["F2".into(), 14.into()]));
             } else {
                 ops.push(Operation::new("rg", vec![0.15.into(), 0.18.into(), 0.22.into()]));
@@ -278,7 +283,10 @@ pub fn ensure_sample_pdf(path: &Path) -> Result<()> {
 
         // Courbe de performance en couleur
         ops.push(Operation::new("w", vec![2.5.into()]));
-        ops.push(Operation::new("RG", vec![0.12.into(), 0.55.into(), 0.90.into()]));
+        ops.push(Operation::new(
+            "RG",
+            vec![accent_rgb.0.into(), accent_rgb.1.into(), accent_rgb.2.into()],
+        ));
         ops.push(Operation::new("m", vec![90.into(), 300.into()]));
         ops.push(Operation::new("l", vec![170.into(), 345.into()]));
         ops.push(Operation::new("l", vec![250.into(), 330.into()]));
@@ -340,8 +348,8 @@ pub fn ensure_sample_pdf(path: &Path) -> Result<()> {
         ops.push(Operation::new(
             "Tj",
             vec![Object::string_literal(format!(
-                "[BENCHMARK PAGE {}] Format A4 (595x842 pt) | Trackpad 2D Scroll & Pinch-Zoom Ready",
-                page_num
+                "[{} - PAGE {}] Format A4 (595x842 pt) | Trackpad 2D Scroll & Arc Sidebar",
+                doc_title, page_num
             ))],
         ));
         ops.push(Operation::new("ET", vec![]));
@@ -374,6 +382,11 @@ pub fn ensure_sample_pdf(path: &Path) -> Result<()> {
     doc.compress();
     doc.save(path)?;
     Ok(())
+}
+
+/// Génère le fichier PDF de démonstration par défaut.
+pub fn ensure_sample_pdf(path: &Path) -> Result<()> {
+    ensure_custom_sample_pdf(path, "SUPER LECTEUR PDF", (0.10, 0.24, 0.48), 5)
 }
 
 #[cfg(test)]
