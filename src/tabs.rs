@@ -1,12 +1,15 @@
-use crate::pdf_engine::LoadedPdfDocument;
+use crate::memory_manager::LruTextureCache;
+use crate::pdf_engine::{LoadedPdfDocument, PageDimensions, PdfEngine};
 use crate::viewport::ViewportState;
+use anyhow::Result;
 use egui::Color32;
+use std::path::PathBuf;
 
-pub const SIDEBAR_WIDTH: f32 = 264.0;
+pub const SIDEBAR_WIDTH: f32 = 268.0;
 pub const HOVER_TRIGGER_EDGE_PX: f32 = 18.0;
 pub const HOVER_KEEP_OPEN_PX: f32 = SIDEBAR_WIDTH + 18.0;
 
-/// Outils disponibles dans la grille supérieure de la Sidebar Arc (et activables à 1 touche)
+/// Outils disponibles dans la grille supérieure de la barre latérale (et activables à 1 touche)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActiveTool {
     Select,
@@ -47,13 +50,13 @@ impl ActiveTool {
     }
 }
 
-/// État de la barre latérale gauche inspirée d'Arc Browser
+/// État de la barre latérale gauche escamotable
 #[derive(Debug, Clone)]
 pub struct SidebarState {
-    /// Si vrai, la sidebar est épinglée à gauche et décale le canevas PDF.
-    /// Si faux, le PDF prend 100% de la largeur et la sidebar glisse en surimpression au survol du bord gauche.
+    /// Si vrai, la barre latérale est épinglée à gauche et décale le canevas PDF.
+    /// Si faux, le PDF prend 100% de la largeur et la barre glisse en surimpression au survol du bord gauche.
     pub pinned: bool,
-    /// Indique si la sidebar auto-masquée est actuellement déployée par survol du trackpad
+    /// Indique si la barre latérale auto-masquée est actuellement déployée par survol du trackpad
     pub hover_revealed: bool,
     /// Progression d'animation fluide entre 0.0 (masquée) et 1.0 (déployée)
     pub anim_progress: f32,
@@ -94,7 +97,7 @@ impl SidebarState {
         }
     }
 
-    /// Indique si la sidebar doit être visible (épinglée ou déployée au survol)
+    /// Indique si la barre latérale doit être visible (épinglée ou déployée au survol)
     pub fn is_expanded(&self) -> bool {
         self.pinned || self.hover_revealed
     }
@@ -115,10 +118,15 @@ impl SidebarState {
     }
 }
 
-/// Représente un onglet PDF ouvert dans la barre verticale Arc
+/// Représente un onglet PDF avec support d'hibernation mémoire automatique.
+/// Lorsqu'un onglet est en arrière-plan (`document == None`), son handle C++ PDFium et ses bitmaps
+/// sont intégralement libérés de la RAM ; seules ses métadonnées légères (~200 octets) et sa position de lecture sont conservées.
 pub struct DocumentTab {
     pub id: u64,
-    pub document: LoadedPdfDocument<'static>,
+    pub path: PathBuf,
+    pub title: String,
+    pub page_dimensions: Vec<PageDimensions>,
+    pub document: Option<LoadedPdfDocument<'static>>,
     pub viewport: ViewportState,
     #[allow(dead_code)]
     pub is_modified: bool,
@@ -126,8 +134,52 @@ pub struct DocumentTab {
 }
 
 impl DocumentTab {
+    pub fn new_active(
+        id: u64,
+        doc: LoadedPdfDocument<'static>,
+        badge_color: Color32,
+    ) -> Self {
+        let path = doc.path.clone();
+        let title = doc.title.clone();
+        let page_dimensions = doc.page_dimensions.clone();
+        Self {
+            id,
+            path,
+            title,
+            page_dimensions,
+            document: Some(doc),
+            viewport: ViewportState::default(),
+            is_modified: false,
+            badge_color,
+        }
+    }
+
     pub fn page_count(&self) -> usize {
-        self.document.page_dimensions.len()
+        self.page_dimensions.len()
+    }
+
+    /// Indique si l'onglet est actuellement en hibernation mémoire (0 Mo de handle PDFium / textures)
+    pub fn is_hibernated(&self) -> bool {
+        self.document.is_none()
+    }
+
+    /// Met l'onglet en hibernation : libère le handle C++ PDFium et évince ses textures du cache LRU
+    pub fn hibernate(&mut self, cache: &mut LruTextureCache) -> usize {
+        {
+            let _lock = PdfEngine::lock_guard();
+            self.document = None;
+        }
+        cache.evict_tab(self.id)
+    }
+
+    /// Réveille l'onglet instantanément s'il était hiberné en rechargeant le document PDFium à la volée
+    pub fn ensure_awake(&mut self, engine: &'static PdfEngine) -> Result<()> {
+        if self.document.is_none() {
+            let doc = engine.load_document(&self.path)?;
+            self.page_dimensions = doc.page_dimensions.clone();
+            self.document = Some(doc);
+        }
+        Ok(())
     }
 }
 
@@ -138,6 +190,8 @@ pub enum PaletteCommand {
     ToggleSidebarPin,
     OpenFileDialog,
     NewDemoTab,
+    Open15TabsBenchmark,
+    HibernateInactiveTabs,
     CloseActiveTab,
     SelectTool(ActiveTool),
     FitToWidth,
@@ -187,32 +241,48 @@ impl CommandPaletteState {
     /// Construit et filtre la liste des commandes en fonction de `self.query`
     pub fn filtered_entries(
         &self,
-        tabs_info: &[(usize, String, usize)],
+        tabs_info: &[(usize, String, usize, bool)],
         active_tab_page_count: usize,
     ) -> Vec<PaletteEntry> {
-        let mut all = Vec::with_capacity(24);
+        let mut all = Vec::with_capacity(32);
 
         // 1. Onglets ouverts
-        for (idx, title, pages) in tabs_info {
+        for (idx, title, pages, hibernated) in tabs_info {
             let shortcut = match idx {
                 0 => "Ctrl+1",
                 1 => "Ctrl+2",
                 2 => "Ctrl+3",
                 3 => "Ctrl+4",
                 4 => "Ctrl+5",
+                5 => "Ctrl+6",
+                6 => "Ctrl+7",
+                7 => "Ctrl+8",
                 _ => "Ctrl+Tab",
             };
+            let state_tag = if *hibernated { " [Hiberné 0 Mo]" } else { " [Actif]" };
             all.push(PaletteEntry {
                 category: "Onglet",
-                label: format!("Basculer vers : {} ({} pages)", title, pages),
+                label: format!("#{} : {} ({} p.){}", idx + 1, title, pages, state_tag),
                 shortcut,
                 command: PaletteCommand::SwitchTab(*idx),
             });
         }
 
-        // 2. Commandes d'interface & Navigation
+        // 2. Commandes Mémoire & Onglets
         all.push(PaletteEntry {
-            category: "Interface Arc",
+            category: "Mémoire",
+            label: "Ouvrir 15 PDF en simultané (Stress-Test Virtualisation & Hibernation)".to_string(),
+            shortcut: "15 PDF",
+            command: PaletteCommand::Open15TabsBenchmark,
+        });
+        all.push(PaletteEntry {
+            category: "Mémoire",
+            label: "Purger le cache de textures & Hiberner tous les onglets inactifs".to_string(),
+            shortcut: "Purge RAM",
+            command: PaletteCommand::HibernateInactiveTabs,
+        });
+        all.push(PaletteEntry {
+            category: "Interface",
             label: "Épingler / Masquer la barre latérale gauche (Mode Plein Écran 100%)".to_string(),
             shortcut: "Ctrl+B",
             command: PaletteCommand::ToggleSidebarPin,
@@ -293,6 +363,8 @@ impl CommandPaletteState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pdf_engine::ensure_custom_sample_pdf;
+    use egui::Vec2;
 
     #[test]
     fn test_sidebar_autohide_trackpad_hover_hysteresis() {
@@ -300,25 +372,20 @@ mod tests {
         assert!(sidebar.pinned);
         assert!(sidebar.is_expanded());
 
-        // Passage en mode auto-masqué (Ctrl+B)
         sidebar.toggle_pinned();
         assert!(!sidebar.pinned);
         assert!(!sidebar.is_expanded());
 
-        // Curseur au centre de l'écran : reste masquée
         sidebar.update_hover_hysteresis(Some(500.0));
         assert!(!sidebar.is_expanded());
 
-        // Curseur glisse au trackpad vers le bord gauche (x = 8 px <= 18 px) : déploiement !
         sidebar.update_hover_hysteresis(Some(8.0));
         assert!(sidebar.hover_revealed);
         assert!(sidebar.is_expanded());
 
-        // Curseur navigue à l'intérieur de la sidebar (x = 180 px <= 282 px) : reste ouverte grâce à l'hystérésis
         sidebar.update_hover_hysteresis(Some(180.0));
         assert!(sidebar.is_expanded());
 
-        // Curseur retourne sur le PDF (x = 340 px > 282 px) : se replie automatiquement
         sidebar.update_hover_hysteresis(Some(340.0));
         assert!(!sidebar.hover_revealed);
         assert!(!sidebar.is_expanded());
@@ -330,8 +397,8 @@ mod tests {
         palette.open();
 
         let tabs = vec![
-            (0, "Architecture_Rust.pdf".to_string(), 5),
-            (1, "Spécification_ISO_32000.pdf".to_string(), 8),
+            (0, "Architecture_Rust.pdf".to_string(), 5, false),
+            (1, "Spécification_ISO_32000.pdf".to_string(), 8, true),
         ];
 
         palette.query = "iso".to_string();
@@ -346,5 +413,48 @@ mod tests {
             tool_results[0].command,
             PaletteCommand::SelectTool(ActiveTool::Highlight)
         );
+    }
+
+    #[test]
+    fn test_15_pdf_tabs_simultaneous_hibernation_and_instant_wakeup() {
+        let engine = PdfEngine::instance();
+        let mut cache = LruTextureCache::default();
+        let mut tabs: Vec<DocumentTab> = Vec::with_capacity(15);
+
+        // Ouverture de 15 fichiers PDF distincts en simultané
+        for i in 1..=15 {
+            let path = PathBuf::from(format!("test_pdfs/bench_15_tab_{:02}.pdf", i));
+            ensure_custom_sample_pdf(
+                &path,
+                &format!("DOCUMENT BENCHMARK #{:02}", i),
+                (0.15, 0.30, 0.55),
+                6,
+            )
+            .expect("Doit générer le PDF");
+
+            let doc = engine.load_document(&path).expect("Doit charger le PDF");
+            let mut tab = DocumentTab::new_active(i as u64, doc, Color32::WHITE);
+            tab.viewport.zoom = 1.0 + (i as f32) * 0.05;
+            tab.viewport.scroll_offset = Vec2::new(10.0 * i as f32, 40.0 * i as f32);
+
+            // Hiberner tous les onglets précédents, seul le dernier ouvert reste actif
+            for prev in tabs.iter_mut() {
+                prev.hibernate(&mut cache);
+            }
+            tabs.push(tab);
+        }
+
+        assert_eq!(tabs.len(), 15);
+        let active_count = tabs.iter().filter(|t| !t.is_hibernated()).count();
+        let hibernated_count = tabs.iter().filter(|t| t.is_hibernated()).count();
+        assert_eq!(active_count, 1, "Seul l'onglet actif doit garder un handle PDFium en RAM");
+        assert_eq!(hibernated_count, 14, "Les 14 onglets en arrière-plan doivent être hibernés");
+
+        // Bascule sur l'onglet #7 (index 6) : réveil instantané et vérification de la conservation du zoom/scroll
+        tabs[14].hibernate(&mut cache);
+        tabs[6].ensure_awake(engine).expect("Doit réveiller l'onglet #7");
+        assert!(!tabs[6].is_hibernated());
+        assert!((tabs[6].viewport.zoom - 1.35).abs() < 1e-4);
+        assert!((tabs[6].viewport.scroll_offset.y - 280.0).abs() < 1e-4);
     }
 }

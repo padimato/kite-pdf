@@ -4,6 +4,10 @@ use lopdf::content::{Content, Operation};
 use lopdf::{dictionary, Document, Object, Stream};
 use pdfium_render::prelude::*;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+
+static PDFIUM_SINGLETON: OnceLock<PdfEngine> = OnceLock::new();
+static PDFIUM_GUARD: Mutex<()> = Mutex::new(());
 
 /// Dimensions d'une page PDF en points (1 pt = 1/72 pouce)
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -28,6 +32,10 @@ pub struct PdfEngine {
     pdfium: Pdfium,
 }
 
+// PDFium est protégé par PDFIUM_GUARD pour la sécurité inter-threads dans les tests parallèles
+unsafe impl Send for PdfEngine {}
+unsafe impl Sync for PdfEngine {}
+
 pub struct LoadedPdfDocument<'a> {
     #[allow(dead_code)]
     pub path: PathBuf,
@@ -37,9 +45,18 @@ pub struct LoadedPdfDocument<'a> {
 }
 
 impl PdfEngine {
-    /// Initialise le moteur PDFium en cherchant `pdfium.dll` dans le dossier courant,
-    /// le dossier de l'exécutable ou le système.
-    pub fn new() -> Result<Self> {
+    pub fn lock_guard() -> std::sync::MutexGuard<'static, ()> {
+        PDFIUM_GUARD.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Retourne l'instance singleton globale de `PdfEngine` (garantit que `FPDF_InitLibrary` n'est appelé qu'une seule fois
+    /// par processus et que `FPDF_DestroyLibrary` n'est jamais appelé prématurément pendant un test parallèle).
+    pub fn instance() -> &'static PdfEngine {
+        PDFIUM_SINGLETON
+            .get_or_init(|| Self::new_internal().expect("Impossible d'initialiser pdfium.dll"))
+    }
+
+    fn new_internal() -> Result<Self> {
         let bindings = Self::bind_pdfium()?;
         Ok(Self {
             pdfium: Pdfium::new(bindings),
@@ -69,6 +86,7 @@ impl PdfEngine {
 
     /// Charge un document PDF depuis le disque et extrait uniquement les métadonnées légères des pages.
     pub fn load_document<'a>(&'a self, path: &Path) -> Result<LoadedPdfDocument<'a>> {
+        let _lock = PDFIUM_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let doc = self
             .pdfium
             .load_pdf_from_file(path, None)
@@ -111,6 +129,7 @@ impl<'a> LoadedPdfDocument<'a> {
 
     /// Effectue le rendu matriciel haute qualité d'une page donnée à la taille cible en pixels.
     pub fn render_page(&self, page_index: usize, target_width_px: i32, target_height_px: i32) -> Result<ColorImage> {
+        let _lock = PDFIUM_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let page = self
             .doc
             .pages()
@@ -222,7 +241,7 @@ pub fn ensure_custom_sample_pdf(
         ops.push(Operation::new(
             "Tj",
             vec![Object::string_literal(
-                "Moteur Rust + PDFium + Sidebar Arc + Raccourcis & Trackpad Windows Precision",
+                "Moteur Rust + PDFium + Virtualisation RAM 15+ PDF + Trackpad Windows Precision",
             )],
         ));
         ops.push(Operation::new("ET", vec![]));
@@ -230,12 +249,12 @@ pub fn ensure_custom_sample_pdf(
         // Corps de texte explicatif
         let lines = [
             format!("Document : {} (Section {}.1)", doc_title, page_num),
-            "Architecture Jalon 2 - Interface Arc Browser & Multi-Onglets :".to_string(),
+            "Architecture Super Lecteur PDF - Haute Performance & Econome en RAM :".to_string(),
             "  * Barre laterale gauche epinglable (Ctrl+B) ou auto-masquee au survol du bord gauche.".to_string(),
             "  * Zero barre superieure : 100% de la hauteur d'ecran dediee au document PDF.".to_string(),
-            "  * Palette de commandes rapide (Ctrl+K) pour chercher un onglet, une page ou un outil.".to_string(),
+            "  * Cache de textures GPU LRU plafonne (48 Mo) + Hibernation des onglets inactifs (0 Mo).".to_string(),
             "  * Navigation Trackpad 2D (smooth_scroll_delta) et Pinch-to-Zoom centre sur le pointeur.".to_string(),
-            "  * Etat de zoom et de defilement conserve independamment pour chaque onglet ouvert.".to_string(),
+            "  * Ouverture simultanee de 15+ fichiers PDF sans saturation de la memoire vive.".to_string(),
         ];
 
         for (i, line) in lines.iter().enumerate() {
@@ -348,7 +367,7 @@ pub fn ensure_custom_sample_pdf(
         ops.push(Operation::new(
             "Tj",
             vec![Object::string_literal(format!(
-                "[{} - PAGE {}] Format A4 (595x842 pt) | Trackpad 2D Scroll & Arc Sidebar",
+                "[{} - PAGE {}] Format A4 (595x842 pt) | Trackpad 2D Scroll & Virtualisation LRU",
                 doc_title, page_num
             ))],
         ));
@@ -398,7 +417,7 @@ mod tests {
         let sample_path = PathBuf::from("test_pdfs/unit_test_sample.pdf");
         ensure_sample_pdf(&sample_path).expect("Doit créer le PDF de test");
 
-        let engine = PdfEngine::new().expect("Doit initialiser pdfium.dll");
+        let engine = PdfEngine::instance();
         let doc = engine
             .load_document(&sample_path)
             .expect("Doit charger le PDF de test");

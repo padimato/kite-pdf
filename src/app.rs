@@ -1,17 +1,19 @@
+use crate::memory_manager::{
+    query_process_memory_bytes, LruTextureCache, PageTextureKey, DEFAULT_TEXTURE_BUDGET_BYTES,
+};
 use crate::pdf_engine::{ensure_custom_sample_pdf, PdfEngine};
 use crate::tabs::{
     ActiveTool, CommandPaletteState, DocumentTab, PaletteCommand, SidebarState, SIDEBAR_WIDTH,
 };
-use crate::viewport::{ViewportState, BASE_DPI_SCALE};
+use crate::viewport::BASE_DPI_SCALE;
 use egui::{
     Align2, Color32, Context, CornerRadius, FontId, Key, Margin, Order, Pos2, Rect, Sense, Stroke,
-    StrokeKind, TextureHandle, TextureOptions, Vec2, ViewportCommand,
+    StrokeKind, Vec2, ViewportCommand,
 };
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-/// Mode initial de la sidebar pour les tests automatisés QA
+/// Mode initial de la barre latérale pour les tests automatisés QA
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum InitialSidebarMode {
     #[default]
@@ -36,31 +38,25 @@ pub struct AutomationConfig {
     pub screenshot_output: Option<PathBuf>,
 }
 
-/// Clé de cache pour une texture de page rendue : (id_onglet, index_page, niveau_zoom_quantifié)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct PageTextureKey {
-    tab_id: u64,
-    page_index: usize,
-    zoom_bucket: u32,
-}
-
 pub struct SuperPdfApp {
     /// Moteur PDFium alloué sur le tas pour stabilité d'adresse
     engine: &'static PdfEngine,
-    /// Liste des onglets PDF ouverts dans la barre verticale Arc
+    /// Liste des onglets PDF ouverts dans la barre verticale (avec support d'hibernation)
     pub tabs: Vec<DocumentTab>,
     /// Index de l'onglet actuellement affiché
     pub active_tab: usize,
     /// Prochain identifiant unique d'onglet
     next_tab_id: u64,
-    /// État de la barre latérale gauche style Arc Browser
+    /// État de la barre latérale gauche escamotable
     pub sidebar: SidebarState,
     /// Outil actif (Sélection, Main, Surligneur, Texte, Dessin, Formes, Note, Mesure)
     pub active_tool: ActiveTool,
     /// État de la palette de commandes flottante (`Ctrl+K`)
     pub command_palette: CommandPaletteState,
-    /// Cache de textures GPU pour les pages visibles
-    texture_cache: HashMap<PageTextureKey, TextureHandle>,
+    /// Gestionnaire de cache de textures GPU LRU à budget mémoire plafonné (48 Mo max)
+    pub texture_cache: LruTextureCache,
+    /// Consommation RAM réelle du processus Windows (Working Set en octets)
+    pub process_working_set_bytes: usize,
     /// Dernière erreur éventuelle à afficher
     error_message: Option<String>,
     /// Compteur de frames pour le mode capture d'écran automatisée
@@ -83,21 +79,27 @@ const TAB_BADGE_COLORS: [(Color32, (f32, f32, f32)); 6] = [
     (Color32::from_rgb(80, 185, 225), (0.10, 0.36, 0.46)),
 ];
 
-const DEMO_TAB_SPECS: [(&str, &str, usize); 6] = [
-    ("01_Architecture_Rust_GPU.pdf", "ARCHITECTURE RUST & GPU", 5),
-    ("02_Rapport_Graphiques_OCR.pdf", "RAPPORT GRAPHIQUES & OCR", 7),
-    ("03_Norme_ISO_32000_Annotations.pdf", "NORME ISO 32000 ANNOTATIONS", 9),
-    ("04_Analyse_Capteurs_ISEN.pdf", "ANALYSE CAPTEURS ISEN", 4),
-    ("05_Benchmark_RAM_15_Onglets.pdf", "BENCHMARK RAM 15 ONGLETS", 6),
-    ("06_Notes_Reunion_Projet.pdf", "NOTES REUNION PROJET", 3),
+const DEMO_TAB_SPECS: [(&str, &str, usize); 15] = [
+    ("01_Architecture_Rust_GPU.pdf", "ARCHITECTURE RUST & GPU", 6),
+    ("02_Rapport_Graphiques_OCR.pdf", "RAPPORT GRAPHIQUES & OCR", 8),
+    ("03_Norme_ISO_32000_Annotations.pdf", "NORME ISO 32000 ANNOTATIONS", 10),
+    ("04_Analyse_Capteurs_ISEN.pdf", "ANALYSE CAPTEURS ISEN", 5),
+    ("05_Benchmark_RAM_15_Onglets.pdf", "BENCHMARK RAM 15 ONGLETS", 7),
+    ("06_Notes_Reunion_Projet.pdf", "NOTES REUNION PROJET", 4),
+    ("07_Schema_Electronique_PCB.pdf", "SCHEMA ELECTRONIQUE PCB", 6),
+    ("08_Publication_Traitement_Signal.pdf", "TRAITEMENT DU SIGNAL", 9),
+    ("09_Datasheet_Microcontroleur.pdf", "DATASHEET STM32 / ARM", 12),
+    ("10_Cahier_Charges_Systeme.pdf", "CAHIER DES CHARGES SYSTEME", 5),
+    ("11_Mesures_Thermiques_Labo.pdf", "MESURES THERMIQUES LABO", 6),
+    ("12_Protocole_Reseau_Temps_Reel.pdf", "PROTOCOLE TEMPS REEL", 8),
+    ("13_Algorithmes_Vision_ONNX.pdf", "ALGORITHMES VISION ONNX", 7),
+    ("14_Synthese_Budget_Materiel.pdf", "SYNTHESE BUDGET MATERIEL", 4),
+    ("15_Manuel_Validation_Qualite.pdf", "MANUEL VALIDATION QUALITE", 6),
 ];
 
 impl SuperPdfApp {
     pub fn new(_cc: &eframe::CreationContext<'_>, automation: AutomationConfig) -> Self {
-        let engine_box = Box::new(
-            PdfEngine::new().expect("Échec d'initialisation de PDFium (pdfium.dll manquant)"),
-        );
-        let engine: &'static PdfEngine = Box::leak(engine_box);
+        let engine = PdfEngine::instance();
 
         let mut sidebar = SidebarState::default();
         match automation.sidebar_mode {
@@ -118,6 +120,8 @@ impl SuperPdfApp {
             }
         }
 
+        let (ws_bytes, _) = query_process_memory_bytes();
+
         let mut app = Self {
             engine,
             tabs: Vec::new(),
@@ -126,7 +130,8 @@ impl SuperPdfApp {
             sidebar,
             active_tool: automation.initial_tool.unwrap_or(ActiveTool::Select),
             command_palette: CommandPaletteState::default(),
-            texture_cache: HashMap::new(),
+            texture_cache: LruTextureCache::new(DEFAULT_TEXTURE_BUDGET_BYTES),
+            process_working_set_bytes: ws_bytes,
             error_message: None,
             frame_count: 0,
             screenshot_requested: false,
@@ -145,8 +150,13 @@ impl SuperPdfApp {
 
         if let Some(target_tab) = automation.active_tab_index {
             if !app.tabs.is_empty() {
-                app.active_tab = target_tab.saturating_sub(1).min(app.tabs.len() - 1);
+                let idx = target_tab.saturating_sub(1).min(app.tabs.len() - 1);
+                app.switch_to_tab(idx);
             }
+        } else if !app.tabs.is_empty() {
+            // S'assurer que tous les onglets sauf l'onglet actif sont hibernés
+            let current = app.active_tab;
+            app.switch_to_tab(current);
         }
 
         if let Some(tab) = app.tabs.get_mut(app.active_tab) {
@@ -167,25 +177,48 @@ impl SuperPdfApp {
             app.command_palette.query = q.clone();
         }
 
+        let (ws_after, _) = query_process_memory_bytes();
+        app.process_working_set_bytes = ws_after;
+
         app
     }
 
-    /// Ouvre un fichier PDF dans un nouvel onglet et bascule dessus
+    /// Bascule vers l'onglet `target_index`, réveille son document PDFium et met en hibernation
+    /// les onglets en arrière-plan afin de maintenir une empreinte RAM minimale même avec 15+ PDF ouverts.
+    pub fn switch_to_tab(&mut self, target_index: usize) {
+        if target_index >= self.tabs.len() {
+            return;
+        }
+        for (i, tab) in self.tabs.iter_mut().enumerate() {
+            if i != target_index {
+                tab.hibernate(&mut self.texture_cache);
+            }
+        }
+        if let Some(active) = self.tabs.get_mut(target_index) {
+            if let Err(err) = active.ensure_awake(self.engine) {
+                self.error_message = Some(format!("{:#}", err));
+            } else {
+                self.error_message = None;
+            }
+        }
+        self.active_tab = target_index;
+    }
+
+    /// Ouvre un fichier PDF dans un nouvel onglet, hiberne les précédents et bascule dessus
     pub fn open_pdf_in_new_tab(&mut self, path: &Path) {
         let color_idx = self.tabs.len() % TAB_BADGE_COLORS.len();
         let (badge_color, _) = TAB_BADGE_COLORS[color_idx];
+
+        // Hiberner les onglets existants avant d'ouvrir le nouveau
+        for existing in &mut self.tabs {
+            existing.hibernate(&mut self.texture_cache);
+        }
 
         match self.engine.load_document(path) {
             Ok(doc) => {
                 let id = self.next_tab_id;
                 self.next_tab_id += 1;
-                self.tabs.push(DocumentTab {
-                    id,
-                    document: doc,
-                    viewport: ViewportState::default(),
-                    is_modified: false,
-                    badge_color,
-                });
+                self.tabs.push(DocumentTab::new_active(id, doc, badge_color));
                 self.active_tab = self.tabs.len() - 1;
                 self.error_message = None;
             }
@@ -210,32 +243,39 @@ impl SuperPdfApp {
         self.open_pdf_in_new_tab(&path);
     }
 
-    /// Ferme un onglet par son index
+    /// Ferme un onglet par son index et libère immédiatement ses ressources
     pub fn close_tab(&mut self, index: usize) {
         if index >= self.tabs.len() {
             return;
         }
         let removed = self.tabs.remove(index);
-        self.texture_cache.retain(|k, _| k.tab_id != removed.id);
+        self.texture_cache.evict_tab(removed.id);
 
         if self.tabs.is_empty() {
             self.active_tab = 0;
-        } else if self.active_tab >= self.tabs.len() {
-            self.active_tab = self.tabs.len() - 1;
-        } else if index < self.active_tab {
-            self.active_tab = self.active_tab.saturating_sub(1);
+        } else {
+            let next_active = if self.active_tab >= self.tabs.len() {
+                self.tabs.len() - 1
+            } else if index < self.active_tab {
+                self.active_tab.saturating_sub(1)
+            } else {
+                self.active_tab
+            };
+            self.switch_to_tab(next_active);
         }
     }
 
     pub fn next_tab(&mut self) {
         if !self.tabs.is_empty() {
-            self.active_tab = (self.active_tab + 1) % self.tabs.len();
+            let next = (self.active_tab + 1) % self.tabs.len();
+            self.switch_to_tab(next);
         }
     }
 
     pub fn prev_tab(&mut self) {
         if !self.tabs.is_empty() {
-            self.active_tab = (self.active_tab + self.tabs.len() - 1) % self.tabs.len();
+            let prev = (self.active_tab + self.tabs.len() - 1) % self.tabs.len();
+            self.switch_to_tab(prev);
         }
     }
 
@@ -248,9 +288,7 @@ impl SuperPdfApp {
     fn execute_palette_command(&mut self, cmd: PaletteCommand, viewport_size: Vec2) {
         match cmd {
             PaletteCommand::SwitchTab(idx) => {
-                if idx < self.tabs.len() {
-                    self.active_tab = idx;
-                }
+                self.switch_to_tab(idx);
             }
             PaletteCommand::ToggleSidebarPin => {
                 self.sidebar.toggle_pinned();
@@ -266,6 +304,21 @@ impl SuperPdfApp {
             PaletteCommand::NewDemoTab => {
                 self.spawn_next_demo_tab();
             }
+            PaletteCommand::Open15TabsBenchmark => {
+                while self.tabs.len() < 15 {
+                    self.spawn_next_demo_tab();
+                }
+                self.switch_to_tab(self.active_tab);
+            }
+            PaletteCommand::HibernateInactiveTabs => {
+                let current = self.active_tab;
+                for (i, tab) in self.tabs.iter_mut().enumerate() {
+                    if i != current {
+                        tab.hibernate(&mut self.texture_cache);
+                    }
+                }
+                self.texture_cache.clear();
+            }
             PaletteCommand::CloseActiveTab => {
                 if !self.tabs.is_empty() {
                     let idx = self.active_tab;
@@ -278,13 +331,13 @@ impl SuperPdfApp {
             PaletteCommand::FitToWidth => {
                 if let Some(tab) = self.tabs.get_mut(self.active_tab) {
                     tab.viewport
-                        .fit_to_width(viewport_size, &tab.document.page_dimensions);
+                        .fit_to_width(viewport_size, &tab.page_dimensions);
                 }
             }
             PaletteCommand::FitToPage => {
                 if let Some(tab) = self.tabs.get_mut(self.active_tab) {
                     tab.viewport
-                        .fit_to_page(viewport_size, &tab.document.page_dimensions);
+                        .fit_to_page(viewport_size, &tab.page_dimensions);
                 }
             }
             PaletteCommand::ZoomReset100 => {
@@ -292,20 +345,20 @@ impl SuperPdfApp {
                     tab.viewport.zoom = 1.0;
                     tab.viewport.scroll_offset.x = 0.0;
                     tab.viewport
-                        .clamp_scroll(viewport_size, &tab.document.page_dimensions);
+                        .clamp_scroll(viewport_size, &tab.page_dimensions);
                     tab.viewport.last_gesture_label = "Zoom 100%".to_string();
                 }
             }
             PaletteCommand::JumpToPage(page_idx) => {
                 if let Some(tab) = self.tabs.get_mut(self.active_tab) {
                     tab.viewport
-                        .jump_to_page(page_idx, viewport_size, &tab.document.page_dimensions);
+                        .jump_to_page(page_idx, viewport_size, &tab.page_dimensions);
                 }
             }
         }
     }
 
-    /// Gère l'ensemble des entrées Trackpad Windows Precision, Survol Sidebar Arc et Raccourcis Clavier
+    /// Gère l'ensemble des entrées Trackpad Windows Precision, Survol Barre Latérale et Raccourcis Clavier
     fn handle_inputs(&mut self, ctx: &Context, canvas_rect: Rect) {
         let viewport_size = canvas_rect.size();
 
@@ -316,14 +369,14 @@ impl SuperPdfApp {
                     tab.viewport.jump_to_page(
                         target_page.saturating_sub(1),
                         viewport_size,
-                        &tab.document.page_dimensions,
+                        &tab.page_dimensions,
                     );
                 }
                 if self.automation.initial_scroll_x.is_some()
                     || self.automation.initial_scroll_y.is_some()
                 {
                     tab.viewport
-                        .clamp_scroll(viewport_size, &tab.document.page_dimensions);
+                        .clamp_scroll(viewport_size, &tab.page_dimensions);
                 }
             }
         }
@@ -351,7 +404,7 @@ impl SuperPdfApp {
                 }
             }
 
-            // 2. Détection du survol du bord gauche au Trackpad pour la Sidebar Arc (sauf si forcée en mode test)
+            // 2. Détection du survol du bord gauche au Trackpad (sauf si forcée en mode test)
             if self.automation.sidebar_mode != InitialSidebarMode::AutoHideHover {
                 let pointer_x = input.pointer.hover_pos().map(|p| p.x);
                 self.sidebar.update_hover_hysteresis(pointer_x);
@@ -360,7 +413,7 @@ impl SuperPdfApp {
             let ctrl = input.modifiers.ctrl || input.modifiers.command;
             let shift = input.modifiers.shift;
 
-            // 3. Raccourcis globaux (Palette Ctrl+K / Ctrl+P, Sidebar Ctrl+B, Onglets Ctrl+Tab / Ctrl+W / Ctrl+T / Ctrl+1..9)
+            // 3. Raccourcis globaux
             if ctrl && (input.key_pressed(Key::K) || input.key_pressed(Key::P)) {
                 self.command_palette.toggle();
             }
@@ -384,7 +437,6 @@ impl SuperPdfApp {
                 tab_cycle_dir = if shift { -1 } else { 1 };
             }
 
-            // Ctrl+1..8 pour accès direct aux onglets (Ctrl+9 = Ajuster largeur, Ctrl+0 = Ajuster page)
             let num_keys = [
                 (Key::Num1, 0),
                 (Key::Num2, 1),
@@ -409,12 +461,11 @@ impl SuperPdfApp {
                 }
             }
 
-            // Si la palette Ctrl+K est ouverte, les flèches et touches d'outils sont réservées à la palette
             if self.command_palette.is_open {
                 return;
             }
 
-            // 4. Raccourcis d'outils à 1 touche (hors modificateur Ctrl)
+            // 4. Raccourcis d'outils à 1 touche
             if !ctrl {
                 if input.key_pressed(Key::V) {
                     self.active_tool = ActiveTool::Select;
@@ -437,9 +488,8 @@ impl SuperPdfApp {
             let Some(tab) = self.tabs.get_mut(self.active_tab) else {
                 return;
             };
-            let pages = &tab.document.page_dimensions;
+            let pages = &tab.page_dimensions;
 
-            // Ignorer le scroll du PDF si le pointeur survole la sidebar Arc déployée
             let pointer_pos = input.pointer.hover_pos();
             let pointer_over_sidebar = self.sidebar.is_expanded()
                 && pointer_pos.map(|p| p.x <= SIDEBAR_WIDTH).unwrap_or(false);
@@ -591,18 +641,23 @@ impl eframe::App for SuperPdfApp {
             self.fps_smoothed = self.fps_smoothed * 0.88 + instant_fps * 0.12;
         }
 
+        // Rafraîchissement périodique de la télémétrie RAM Windows toutes les 15 frames (ou au démarrage)
+        if self.frame_count <= 3 || self.frame_count % 15 == 0 {
+            let (ws_bytes, _) = query_process_memory_bytes();
+            self.process_working_set_bytes = ws_bytes;
+        }
+
         if self.sidebar.step_animation(dt.max(0.016)) {
             ctx.request_repaint();
         }
 
-        // Thème sombre Arc
         let mut visuals = egui::Visuals::dark();
         visuals.panel_fill = Color32::from_rgb(18, 20, 26);
         ctx.set_visuals(visuals);
 
-        // Si la sidebar est épinglée, elle occupe un SidePanel gauche fixe de 264 px
+        // Si la barre latérale est épinglée, elle occupe un SidePanel gauche fixe
         if self.sidebar.pinned {
-            egui::SidePanel::left("arc_sidebar_pinned")
+            egui::SidePanel::left("superpdf_sidebar_pinned")
                 .exact_width(SIDEBAR_WIDTH)
                 .resizable(false)
                 .frame(
@@ -624,7 +679,11 @@ impl eframe::App for SuperPdfApp {
 
                 self.handle_inputs(ctx, canvas_rect);
 
-                if let Some(tab) = self.tabs.get(self.active_tab) {
+                // S'assurer que l'onglet actif est bien réveillé
+                if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                    if tab.is_hibernated() {
+                        let _ = tab.ensure_awake(self.engine);
+                    }
                     if tab.viewport.is_panning {
                         ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
                     } else if self.active_tool == ActiveTool::Pan {
@@ -643,15 +702,20 @@ impl eframe::App for SuperPdfApp {
                         Color32::from_rgb(255, 110, 110),
                     );
                 } else if let Some(tab) = self.tabs.get(self.active_tab) {
-                    let doc = &tab.document;
                     let viewport_size = canvas_rect.size();
-                    let (layouts, _, total_h) = tab.viewport.compute_layout(&doc.page_dimensions);
+                    let (layouts, _, total_h) = tab.viewport.compute_layout(&tab.page_dimensions);
                     let bucket = Self::zoom_bucket(tab.viewport.zoom);
                     let bucket_zoom = (bucket as f32) / 20.0;
 
+                    // Si le zoom est stabilisé, on nettoie les anciens paliers de zoom pour économiser la VRAM/RAM
+                    if tab.viewport.inertia_velocity.length_sq() < 0.1 {
+                        self.texture_cache.prune_stale_zoom_buckets(tab.id, bucket);
+                    }
+
                     for layout in &layouts {
                         let page_rect = tab.viewport.page_screen_rect(layout, canvas_rect);
-                        let expanded_canvas = canvas_rect.expand(200.0);
+                        // Marge de pré-chargement réduite à 140px pour ne charger que les pages strictement visibles
+                        let expanded_canvas = canvas_rect.expand(140.0);
                         if !expanded_canvas.intersects(page_rect) {
                             continue;
                         }
@@ -674,21 +738,18 @@ impl eframe::App for SuperPdfApp {
                         };
 
                         if !self.texture_cache.contains_key(&key) {
-                            let dim = doc.page_dimensions[layout.page_index];
-                            let target_w =
-                                (dim.width_pt * BASE_DPI_SCALE * bucket_zoom).round() as i32;
-                            let target_h =
-                                (dim.height_pt * BASE_DPI_SCALE * bucket_zoom).round() as i32;
+                            if let Some(doc) = &tab.document {
+                                let dim = tab.page_dimensions[layout.page_index];
+                                let target_w =
+                                    (dim.width_pt * BASE_DPI_SCALE * bucket_zoom).round() as i32;
+                                let target_h =
+                                    (dim.height_pt * BASE_DPI_SCALE * bucket_zoom).round() as i32;
 
-                            if let Ok(color_img) =
-                                doc.render_page(layout.page_index, target_w, target_h)
-                            {
-                                let tex = ctx.load_texture(
-                                    format!("pdf_t{}_p{}_z{}", tab.id, layout.page_index, bucket),
-                                    color_img,
-                                    TextureOptions::LINEAR,
-                                );
-                                self.texture_cache.insert(key, tex);
+                                if let Ok(color_img) =
+                                    doc.render_page(layout.page_index, target_w, target_h)
+                                {
+                                    self.texture_cache.insert_color_image(ctx, key, color_img);
+                                }
                             }
                         }
 
@@ -741,8 +802,7 @@ impl eframe::App for SuperPdfApp {
                     );
                 }
 
-                // Si la sidebar est en mode Auto-Hide (100% plein écran), on dessine la lisière réactive gauche
-                // et la sidebar flottante si elle est déployée au survol
+                // Si la barre latérale est en mode Auto-Hide (100% plein écran), on dessine la lisière réactive gauche
                 if !self.sidebar.pinned {
                     self.render_autohide_sidebar_overlay(ctx, canvas_rect);
                 }
@@ -770,24 +830,24 @@ impl eframe::App for SuperPdfApp {
 }
 
 impl SuperPdfApp {
-    /// Dessine le contenu complet de la Sidebar gauche style Arc Browser
+    /// Dessine le contenu complet de la barre latérale gauche
     fn render_sidebar_contents(&mut self, ui: &mut egui::Ui) {
         let mut pending_cmd: Option<PaletteCommand> = None;
         let mut tab_to_close: Option<usize> = None;
         let mut tab_to_select: Option<usize> = None;
 
-        ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+        ui.spacing_mut().item_spacing = Vec2::new(6.0, 5.0);
 
-        // 1. En-tête de la Sidebar Arc
+        // 1. En-tête de la barre latérale
         egui::Frame::NONE
-            .inner_margin(Margin::symmetric(12, 10))
+            .inner_margin(Margin::symmetric(12, 8))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new("⚡ ARC PDF")
+                        egui::RichText::new("⚡ SUPER PDF")
                             .strong()
                             .size(14.0)
-                            .color(Color32::from_rgb(130, 180, 255)),
+                            .color(Color32::from_rgb(130, 185, 255)),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let pin_label = if self.sidebar.pinned {
@@ -813,9 +873,9 @@ impl SuperPdfApp {
                     });
                 });
 
-                ui.add_space(6.0);
+                ui.add_space(4.0);
 
-                // Barre de déclenchement rapide Ctrl+K style Arc
+                // Barre de déclenchement rapide Ctrl+K
                 let search_btn = egui::Button::new(
                     egui::RichText::new("🔍 Rechercher onglet, outil, page... (Ctrl+K)")
                         .size(11.5)
@@ -823,22 +883,22 @@ impl SuperPdfApp {
                 )
                 .fill(Color32::from_rgb(33, 38, 50))
                 .corner_radius(CornerRadius::same(8))
-                .min_size(Vec2::new(SIDEBAR_WIDTH - 26.0, 28.0));
+                .min_size(Vec2::new(SIDEBAR_WIDTH - 26.0, 26.0));
 
                 if ui.add(search_btn).clicked() {
                     self.command_palette.open();
                 }
 
-                ui.add_space(8.0);
+                ui.add_space(6.0);
 
-                // 2. Grille d'outils compacts façon Arc / Adobe Acrobat (2 lignes x 4 colonnes)
+                // 2. Grille d'outils compacts (2 lignes x 4 colonnes)
                 ui.label(
                     egui::RichText::new("OUTILS RAPIDES (1 TOUCHE)")
                         .size(10.0)
                         .strong()
                         .color(Color32::from_rgb(120, 132, 158)),
                 );
-                egui::Grid::new("arc_tools_grid")
+                egui::Grid::new("superpdf_tools_grid")
                     .num_columns(4)
                     .spacing([5.0, 5.0])
                     .show(ui, |ui| {
@@ -863,7 +923,7 @@ impl SuperPdfApp {
                             )
                             .fill(fill)
                             .corner_radius(CornerRadius::same(7))
-                            .min_size(Vec2::new(54.0, 36.0));
+                            .min_size(Vec2::new(55.0, 34.0));
 
                             if ui
                                 .add(btn)
@@ -878,26 +938,38 @@ impl SuperPdfApp {
                         }
                     });
 
-                ui.add_space(8.0);
+                ui.add_space(6.0);
 
                 // 3. En-tête de la liste verticale des onglets
+                let hibernated_count = self.tabs.iter().filter(|t| t.is_hibernated()).count();
                 ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new(format!("ONGLETS OUVERTS ({})", self.tabs.len()))
-                            .size(10.5)
-                            .strong()
-                            .color(Color32::from_rgb(120, 132, 158)),
+                        egui::RichText::new(format!(
+                            "ONGLETS ({} | {} 💤)",
+                            self.tabs.len(),
+                            hibernated_count
+                        ))
+                        .size(10.5)
+                        .strong()
+                        .color(Color32::from_rgb(120, 132, 158)),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
-                            .small_button("➕ Démo")
+                            .small_button("⚡ 15 PDF")
+                            .on_hover_text("Ouvrir 15 PDF en simultané avec hibernation automatique")
+                            .clicked()
+                        {
+                            pending_cmd = Some(PaletteCommand::Open15TabsBenchmark);
+                        }
+                        if ui
+                            .small_button("➕")
                             .on_hover_text("Ouvrir un nouvel onglet de démonstration (Ctrl+T)")
                             .clicked()
                         {
                             pending_cmd = Some(PaletteCommand::NewDemoTab);
                         }
                         if ui
-                            .small_button("📂 Ouvrir")
+                            .small_button("📂")
                             .on_hover_text("Ouvrir un fichier PDF (Ctrl+O)")
                             .clicked()
                         {
@@ -910,73 +982,84 @@ impl SuperPdfApp {
         ui.separator();
 
         // 4. Liste déroulante verticale des onglets (compatible scroll 2 doigts Trackpad)
-        let available_h = (ui.available_height() - 108.0).max(120.0);
+        let available_h = (ui.available_height() - 155.0).max(120.0);
         egui::ScrollArea::vertical()
             .max_height(available_h)
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                ui.spacing_mut().item_spacing.y = 5.0;
+                ui.spacing_mut().item_spacing.y = 4.0;
                 for (idx, tab) in self.tabs.iter().enumerate() {
                     let is_active = idx == self.active_tab;
+                    let is_hib = tab.is_hibernated();
                     let bg_fill = if is_active {
                         Color32::from_rgb(40, 48, 68)
                     } else {
                         Color32::from_rgb(27, 31, 41)
                     };
                     let stroke = if is_active {
-                        Stroke::new(1.0_f32, tab.badge_color)
+                        Stroke::new(1.2_f32, tab.badge_color)
                     } else {
                         Stroke::new(1.0_f32, Color32::from_rgb(36, 41, 54))
                     };
 
                     egui::Frame::NONE
-                        .inner_margin(Margin::symmetric(10, 6))
+                        .inner_margin(Margin::symmetric(8, 5))
                         .outer_margin(Margin::symmetric(8, 0))
                         .fill(bg_fill)
                         .stroke(stroke)
-                        .corner_radius(CornerRadius::same(8))
+                        .corner_radius(CornerRadius::same(7))
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
-                                // Pastille de couleur de l'onglet + numéro
                                 let badge_text = format!("#{}", idx + 1);
                                 ui.colored_label(tab.badge_color, badge_text);
 
                                 let current_p = tab.viewport.current_page_index(
                                     Vec2::new(900.0, 800.0),
-                                    &tab.document.page_dimensions,
+                                    &tab.page_dimensions,
                                 ) + 1;
                                 let total_p = tab.page_count();
 
-                                let short_title = if tab.document.title.chars().count() > 24 {
-                                    let s: String = tab.document.title.chars().take(22).collect();
+                                let short_title = if tab.title.chars().count() > 22 {
+                                    let s: String = tab.title.chars().take(20).collect();
                                     format!("{}...", s)
                                 } else {
-                                    tab.document.title.clone()
+                                    tab.title.clone()
+                                };
+
+                                let ram_state = if is_hib {
+                                    "💤 0 Mo"
+                                } else {
+                                    "⚡ Actif"
                                 };
 
                                 let title_btn = egui::Button::new(
                                     egui::RichText::new(format!(
-                                        "{}\np.{}/{} • {:.0}%",
+                                        "{}\np.{}/{} • {:.0}% • {}",
                                         short_title,
                                         current_p,
                                         total_p,
-                                        tab.viewport.zoom * 100.0
+                                        tab.viewport.zoom * 100.0,
+                                        ram_state
                                     ))
-                                    .size(11.5)
+                                    .size(11.0)
                                     .color(if is_active {
                                         Color32::WHITE
                                     } else {
-                                        Color32::from_rgb(190, 198, 215)
+                                        Color32::from_rgb(185, 194, 212)
                                     }),
                                 )
                                 .frame(false);
 
                                 if ui
-                                    .add_sized([154.0, 30.0], title_btn)
+                                    .add_sized([154.0, 28.0], title_btn)
                                     .on_hover_text(format!(
-                                        "{} (Ctrl+{})",
-                                        tab.document.title,
-                                        idx + 1
+                                        "{} — {}",
+                                        tab.title,
+                                        if is_hib {
+                                            "Hiberné en arrière-plan (0 Mo de bitmap/PDFium, réveil instantané au clic)"
+                                        } else {
+                                            "Onglet actif en mémoire"
+                                        }
                                     ))
                                     .clicked()
                                 {
@@ -1002,12 +1085,65 @@ impl SuperPdfApp {
 
         ui.separator();
 
-        // 5. Pied de la Sidebar Arc : contrôles rapides de Page & Zoom
+        // 5. Jauge Mémoire Temps Réel (Jalon 3 : Virtualisation LRU & Hibernation) + Contrôles Page/Zoom
         egui::Frame::NONE
-            .inner_margin(Margin::symmetric(10, 6))
+            .inner_margin(Margin::symmetric(10, 5))
             .show(ui, |ui| {
+                let ram_mb = self.process_working_set_bytes as f32 / (1024.0 * 1024.0);
+                let cache_mb = self.texture_cache.allocated_bytes as f32 / (1024.0 * 1024.0);
+                let budget_mb = self.texture_cache.max_budget_bytes as f32 / (1024.0 * 1024.0);
+                let cache_ratio = (cache_mb / budget_mb).clamp(0.0, 1.0);
+
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("🧠 RAM Processus : {:.1} Mo", ram_mb))
+                            .size(11.0)
+                            .strong()
+                            .color(Color32::from_rgb(125, 225, 165)),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .small_button("💤 Purger")
+                            .on_hover_text("Vider le cache de textures et hiberner les onglets inactifs")
+                            .clicked()
+                        {
+                            pending_cmd = Some(PaletteCommand::HibernateInactiveTabs);
+                        }
+                    });
+                });
+
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Cache LRU : {:.1}/{:.0} Mo ({} p. | {} évic.)",
+                        cache_mb,
+                        budget_mb,
+                        self.texture_cache.len(),
+                        self.texture_cache.total_evictions
+                    ))
+                    .size(10.5)
+                    .color(Color32::from_rgb(160, 175, 200)),
+                );
+
+                // Barre de progression visuelle du budget LRU
+                let bar_w = SIDEBAR_WIDTH - 24.0;
+                let (bar_rect, _) =
+                    ui.allocate_exact_size(Vec2::new(bar_w, 5.0), Sense::hover());
+                ui.painter().rect_filled(
+                    bar_rect,
+                    CornerRadius::same(2),
+                    Color32::from_rgb(35, 40, 54),
+                );
+                let fill_w = (bar_w * cache_ratio).max(3.0);
+                ui.painter().rect_filled(
+                    Rect::from_min_size(bar_rect.min, Vec2::new(fill_w, 5.0)),
+                    CornerRadius::same(2),
+                    Color32::from_rgb(72, 165, 245),
+                );
+
+                ui.add_space(3.0);
+
                 if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-                    let pages = tab.document.page_dimensions.clone();
+                    let pages = tab.page_dimensions.clone();
                     let page_count = pages.len();
                     let est_vp = Vec2::new(1000.0, 800.0);
                     let current_page = tab.viewport.current_page_index(est_vp, &pages) + 1;
@@ -1023,7 +1159,7 @@ impl SuperPdfApp {
                         ui.label(
                             egui::RichText::new(format!("Page {} / {}", current_page, page_count))
                                 .strong()
-                                .size(12.0)
+                                .size(11.5)
                                 .color(Color32::WHITE),
                         );
                         if ui
@@ -1048,7 +1184,7 @@ impl SuperPdfApp {
                             ui.label(
                                 egui::RichText::new(format!("{:.0}%", tab.viewport.zoom * 100.0))
                                     .monospace()
-                                    .size(11.5)
+                                    .size(11.0)
                                     .color(Color32::from_rgb(130, 220, 170)),
                             );
                             if ui.small_button("➖").clicked() {
@@ -1074,7 +1210,7 @@ impl SuperPdfApp {
             });
 
         if let Some(idx) = tab_to_select {
-            self.active_tab = idx;
+            self.switch_to_tab(idx);
         }
         if let Some(idx) = tab_to_close {
             self.close_tab(idx);
@@ -1084,14 +1220,13 @@ impl SuperPdfApp {
         }
     }
 
-    /// Dessine la lisière gauche réactive et la Sidebar flottante en surimpression lorsque `sidebar.pinned == false`
+    /// Dessine la lisière gauche réactive et la barre latérale flottante en surimpression lorsque `sidebar.pinned == false`
     fn render_autohide_sidebar_overlay(&mut self, ctx: &Context, canvas_rect: Rect) {
         let painter = ctx.layer_painter(egui::LayerId::new(
             Order::Foreground,
-            egui::Id::new("arc_edge_indicator"),
+            egui::Id::new("superpdf_edge_indicator"),
         ));
 
-        // Fine lisière lumineuse sur le bord gauche pour indiquer la zone de survol Trackpad
         let edge_strip = Rect::from_min_size(canvas_rect.min, Vec2::new(4.0, canvas_rect.height()));
         painter.rect_filled(
             edge_strip,
@@ -1099,14 +1234,13 @@ impl SuperPdfApp {
             Color32::from_rgba_unmultiplied(80, 145, 255, 110),
         );
 
-        // Si masquée, afficher un discret badge en haut à gauche permettant aussi d'ouvrir au clic
         if self.sidebar.anim_progress < 0.05 {
-            egui::Area::new(egui::Id::new("arc_collapsed_trigger_pill"))
+            egui::Area::new(egui::Id::new("superpdf_collapsed_trigger_pill"))
                 .fixed_pos(Pos2::new(10.0, 12.0))
                 .order(Order::Foreground)
                 .show(ctx, |ui| {
                     let btn = egui::Button::new(
-                        egui::RichText::new("▶ Arc (Survol / Ctrl+B)")
+                        egui::RichText::new("▶ Barre latérale (Survol / Ctrl+B)")
                             .size(11.0)
                             .color(Color32::from_rgb(190, 210, 250)),
                     )
@@ -1121,14 +1255,13 @@ impl SuperPdfApp {
             return;
         }
 
-        // Sidebar flottante animée en surimpression
         let x_offset = -SIDEBAR_WIDTH * (1.0 - self.sidebar.anim_progress);
         let overlay_rect = Rect::from_min_size(
             Pos2::new(x_offset, 8.0),
             Vec2::new(SIDEBAR_WIDTH, canvas_rect.height() - 16.0),
         );
 
-        egui::Area::new(egui::Id::new("arc_floating_sidebar_overlay"))
+        egui::Area::new(egui::Id::new("superpdf_floating_sidebar_overlay"))
             .fixed_pos(overlay_rect.min)
             .order(Order::Foreground)
             .show(ctx, |ui| {
@@ -1144,41 +1277,37 @@ impl SuperPdfApp {
             });
     }
 
-    /// Dessine la pilule d'état flottante en bas à droite (affiche l'outil actif, la page, le zoom et le FPS)
+    /// Dessine la pilule d'état flottante en bas à droite
     fn render_status_pill(&mut self, ui: &mut egui::Ui, canvas_rect: Rect) {
         let Some(tab) = self.tabs.get(self.active_tab) else {
             return;
         };
-        let pages = &tab.document.page_dimensions;
+        let pages = &tab.page_dimensions;
         let viewport_size = canvas_rect.size();
         let current_page = tab.viewport.current_page_index(viewport_size, pages) + 1;
         let page_count = pages.len();
         let (tool_icon, tool_name, tool_key) = self.active_tool.icon_and_label();
-        let mode_label = if self.sidebar.pinned {
-            "Sidebar Épinglée"
-        } else if self.sidebar.hover_revealed {
-            "Sidebar Survol (Auto-Hide)"
-        } else {
-            "Plein Écran 100% (Auto-Hide)"
-        };
+        let hibernated_count = self.tabs.iter().filter(|t| t.is_hibernated()).count();
+        let ram_mb = self.process_working_set_bytes as f32 / (1024.0 * 1024.0);
+        let cache_mb = self.texture_cache.allocated_bytes as f32 / (1024.0 * 1024.0);
 
         let pill_pos = Pos2::new(
-            (canvas_rect.max.x - 590.0).max(canvas_rect.min.x + 12.0),
+            (canvas_rect.max.x - 670.0).max(canvas_rect.min.x + 12.0),
             canvas_rect.max.y - 40.0,
         );
 
-        egui::Area::new(egui::Id::new("status_pill_jalon2"))
+        egui::Area::new(egui::Id::new("status_pill_jalon3"))
             .fixed_pos(pill_pos)
             .order(Order::Foreground)
             .show(ui.ctx(), |ui| {
                 egui::Frame::NONE
-                    .fill(Color32::from_rgba_unmultiplied(22, 26, 36, 230))
+                    .fill(Color32::from_rgba_unmultiplied(22, 26, 36, 235))
                     .stroke(Stroke::new(1.0_f32, Color32::from_rgb(56, 66, 88)))
                     .corner_radius(CornerRadius::same(16))
                     .inner_margin(Margin::symmetric(12, 5))
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 8.0;
+                            ui.spacing_mut().item_spacing.x = 7.0;
                             ui.colored_label(
                                 Color32::from_rgb(130, 185, 255),
                                 format!("{} {} ({})", tool_icon, tool_name, tool_key),
@@ -1186,9 +1315,10 @@ impl SuperPdfApp {
                             ui.separator();
                             ui.label(
                                 egui::RichText::new(format!(
-                                    "Onglet {}/{} • Page {}/{} • {:.0}%",
+                                    "Onglet {}/{} ({} 💤) • Page {}/{} • {:.0}%",
                                     self.active_tab + 1,
                                     self.tabs.len(),
+                                    hibernated_count,
                                     current_page,
                                     page_count,
                                     tab.viewport.zoom * 100.0
@@ -1200,24 +1330,24 @@ impl SuperPdfApp {
                             ui.separator();
                             ui.label(
                                 egui::RichText::new(format!(
-                                    "{} | ⚡ {:.0} FPS",
-                                    mode_label, self.fps_smoothed
+                                    "🧠 RAM {:.1} Mo (Cache {:.1} Mo) | ⚡ {:.0} FPS",
+                                    ram_mb, cache_mb, self.fps_smoothed
                                 ))
                                 .size(11.0)
-                                .color(Color32::from_rgb(155, 168, 190)),
+                                .color(Color32::from_rgb(130, 225, 175)),
                             );
                         });
                     });
             });
     }
 
-    /// Dessine la Palette de Commandes rapide (`Ctrl+K` / `Ctrl+P`) inspirée d'Arc Browser
+    /// Dessine la Palette de Commandes rapide (`Ctrl+K` / `Ctrl+P`)
     fn render_command_palette(&mut self, ctx: &Context, canvas_rect: Rect) {
-        let tabs_info: Vec<(usize, String, usize)> = self
+        let tabs_info: Vec<(usize, String, usize, bool)> = self
             .tabs
             .iter()
             .enumerate()
-            .map(|(i, t)| (i, t.document.title.clone(), t.page_count()))
+            .map(|(i, t)| (i, t.title.clone(), t.page_count(), t.is_hibernated()))
             .collect();
         let active_pages = self
             .tabs
@@ -1252,7 +1382,6 @@ impl SuperPdfApp {
             }
         });
 
-        // Voile sombre semi-transparent derrière la palette
         let backdrop_painter = ctx.layer_painter(egui::LayerId::new(
             Order::Foreground,
             egui::Id::new("palette_backdrop"),
@@ -1263,13 +1392,13 @@ impl SuperPdfApp {
             Color32::from_rgba_unmultiplied(8, 10, 15, 150),
         );
 
-        let palette_w = 540.0;
+        let palette_w = 560.0;
         let palette_pos = Pos2::new(
             ctx.screen_rect().center().x - palette_w * 0.5,
             (ctx.screen_rect().min.y + 85.0).max(24.0),
         );
 
-        egui::Area::new(egui::Id::new("arc_command_palette_modal"))
+        egui::Area::new(egui::Id::new("superpdf_command_palette_modal"))
             .fixed_pos(palette_pos)
             .order(Order::Tooltip)
             .show(ctx, |ui| {
@@ -1283,7 +1412,7 @@ impl SuperPdfApp {
 
                         ui.horizontal(|ui| {
                             ui.label(
-                                egui::RichText::new("⌘ PALETTE DE COMMANDES ARC")
+                                egui::RichText::new("⌘ PALETTE DE COMMANDES SUPER PDF")
                                     .strong()
                                     .size(12.0)
                                     .color(Color32::from_rgb(130, 180, 255)),

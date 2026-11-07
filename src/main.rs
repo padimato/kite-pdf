@@ -1,4 +1,5 @@
 mod app;
+mod memory_manager;
 mod pdf_engine;
 mod tabs;
 mod viewport;
@@ -113,7 +114,7 @@ fn main() -> eframe::Result<()> {
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Super Lecteur PDF — Jalon 2 (Interface Arc Browser, Multi-Onglets & Palette Ctrl+K)")
+            .with_title("Super Lecteur PDF — Haute Performance & Virtualisation RAM (15+ Onglets)")
             .with_inner_size([1280.0, 820.0])
             .with_min_inner_size([640.0, 400.0]),
         ..Default::default()
