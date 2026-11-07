@@ -35,39 +35,43 @@ Pour accélérer le développement tout en garantissant des performances natives
 - **Cache Global LRU à budget mémoire plafonné** : un gestionnaire centralisé (`TextureCache`) partage un quota de RAM/VRAM strict (ex: 250 Mo max au total pour l'ensemble des 15 onglets).
 - **Hibernation automatique des onglets inactifs** : dès qu'un onglet passe en arrière-plan, ses textures haute résolution sont évincées en priorité ; seuls son état de navigation (page courante, facteur de zoom, scroll) et son index de recherche léger restent en RAM.
 
-### 3.2. Interface Utilisateur "Zéro Perte Verticale" (Style Arc Browser)
-- **Suppression de la barre supérieure** : aucune barre d'onglets ou de ruban en haut de l'écran. Le document PDF occupe **100 % de la hauteur** de la fenêtre.
-- **Sidebar Latérale Gauche (Arc-style)** :
-  - **Épinglée ou Auto- escamotable (`Ctrl+S` ou survol du bord gauche)** : en mode masqué, le PDF occupe 100 % de la largeur et 100 % de la hauteur.
-  - **Zone haute de la Sidebar** : barre d'outils compacte en grille d'icônes (Sélection, Surligneur, Texte libre, Dessin/Encre, Formes, Recherche, OCR).
-  - **Zone centrale de la Sidebar** : liste verticale des **onglets PDF ouverts** (15+ visibles d'un coup d'œil sans troncature des titres, avec indicateur de modification `*` et bouton de fermeture).
+### 3.2. Interface Utilisateur "Zéro Perte Verticale" (Style Arc Browser Complet)
+- **Suppression totale de la barre supérieure** : aucune barre d'onglets ou de ruban en haut de l'écran. Le document PDF occupe **100 % de la hauteur** de la fenêtre.
+- **Sidebar Latérale Gauche (Style Arc Complet)** :
+  - **Deux modes instantanés** : **Épinglée** (visible à gauche) ou **Auto-masquée** (le PDF prend 100 % de la largeur et 100 % de la hauteur ; la barre glisse en surimpression avec une animation fluide dès que la souris approche du bord gauche de l'écran ou via le raccourci `Ctrl+B`).
+  - **Zone haute de la Sidebar** : barre d'outils compacte en grille d'icônes (Sélection, Surligneur, Texte libre, Dessin/Encre, Formes/Flèches, Notes, Signatures/Mesure, Recherche, Statut OCR).
+  - **Zone centrale de la Sidebar** : liste verticale des **onglets PDF ouverts** (15+ visibles d'un coup d'œil sans troncature des titres, avec indicateur d'état OCR/modification `*` et bouton de fermeture).
   - **Zone basse / Tiroir contextuel** : miniature des pages, table des matières (signets PDF), ou liste des résultats de recherche (`Ctrl+F`).
-- **Palette de commandes flottante (`Ctrl+K` / `Ctrl+P`)** : barre de commande centrale éphémère (façon Arc / VS Code) pour changer d'onglet, sauter à une page, lancer un outil ou exécuter l'OCR.
+- **Palette de commandes flottante (`Ctrl+K` / `Ctrl+P`)** : barre de commande centrale éphémère (façon Arc / VS Code) pour changer d'onglet, sauter à une page, lancer un outil ou exécuter une action.
 
-### 3.3. OCR "Malin" (Hybride Texte Natif + Images Embarquées & Multi-Angles)
+### 3.3. OCR "Malin" à 3 Vitesses (Hybride Texte Natif + Images Embarquées & Multi-Angles)
 Le problème classique des lecteurs PDF : lorsqu'un fichier Word contenant un graphique en `.jpg`/`.png` est exporté en PDF, la page possède déjà du texte natif. Les outils OCR classiques ignorent donc la page ou écrasent tout le document.
 
-**Notre pipeline "Smart Hybrid OCR" :**
-1. **Analyse structurelle de la page** :
-   - Extraction de la couche de texte natif existante (via `pdfium`) avec ses boîtes englobantes exactes.
-   - Inspection des objets graphiques de la page (`FPDFPage_CountObjects` / `FPDF_PAGEOBJ_IMAGE`) pour isoler chaque image matricielle intégrée (ex: un graphique JPG inséré dans un rapport Word) ainsi que les zones vectorielles dépourvues de texte.
-2. **Détection de texte orienté (360° / Diagonale / Vertical)** :
-   - Application d'un détecteur **DBNet orienté** (via ONNX Runtime) uniquement sur les images extraites (ou sur la page entière s'il s'agit d'un scan).
-   - Détection sous forme de **boîtes englobantes orientées (Polygones / Rotated Bounding Boxes $(x, y, w, h, \theta)$)**.
-   - Découpage et redressement géométrique (*Perspective Warp* / rotation inverse d'angle $-\theta$) de chaque segment de texte détecté (même à 45°, 90° ou à l'envers).
-   - Passage dans le classifieur d'orientation ($0^\circ / 180^\circ$) puis dans le modèle de reconnaissance (CRNN / SVTR multilingue FR/EN).
-3. **Fusion dans l'Index de Recherche (`Ctrl+F`) & Injection PDF** :
-   - **Recherche unifiée immédiate** : l'index `Ctrl+F` interroge simultanément le texte natif et le texte OCRisé des images embarquées, et surligne la zone exacte (même inclinée) sur le graphique !
-   - **Sauvegarde optionnelle dans le PDF** : possibilité d'injecter le texte reconnu dans le fichier PDF sous forme de texte invisible normalisé (`Text Rendering Mode = 3`, avec matrice de transformation `Tm` incluant la rotation $\theta$), permettant à n'importe quel autre lecteur PDF de trouver ces mots via `Ctrl+F`.
+**Notre architecture "Smart Hybrid OCR" avec Ordonnanceur Adaptatif (3 vitesses) :**
+1. **Phase 1 — Ouverture Instantanée (0 ms de blocage)** :
+   - À l'ouverture d'un ou de 15 PDF, l'affichage des pages et l'extraction du texte natif sont immédiats.
+   - Le lecteur vérifie si les images embarquées possèdent déjà une couche texte OCR enregistrée lors d'une session précédente : si oui, aucun recalcul n'est nécessaire !
+2. **Phase 2 — Mode "Éco / Tâche de fond" (Basse Priorité)** :
+   - Dès que l'application est au repos, un worker asynchrone basse priorité (bridé pour consommer un minimum de CPU/RAM et ne jamais ralentir le PC) inspecte les pages de l'onglet actif (en commençant par la page visible et ses voisines).
+   - Il isole uniquement les objets `XObject Image` intégrés (ex: graphiques JPG dans un PDF Word) dépourvus de couche texte sous-jacente, et les passe au moteur OCR orienté en arrière-plan.
+3. **Phase 3 — Mode "Turbo" à l'activation du `Ctrl+F`** :
+   - Dès que l'utilisateur lance `Ctrl+F`, les occurrences du texte natif et des pages déjà OCRisées s'affichent **à la milliseconde**.
+   - Simultanément, si des images du document n'ont pas encore été scannées, l'ordonnanceur bascule en **Mode Turbo** (parallélisation maximale des workers / accélération matérielle tout en isolant strictement le thread UI pour garantir 0 lag à l'écran) afin de scanner tout le reste du document à pleine vitesse et d'ajouter les résultats en temps réel dans la liste `Ctrl+F`.
+4. **Détection de texte orienté (360° / Diagonale / Vertical) & Modèle Linguistique** :
+   - Détecteur **DBNet orienté** (boîtes polygonales $(x, y, w, h, \theta)$) + redressement géométrique (*Perspective Warp*) + classifieur d'angle ($0^\circ / 180^\circ$) + reconnaissance **PP-OCRv4 Latin** (ultra-rapide, couvrant nativement Français, Anglais, langues européennes à alphabet latin, chiffres et unités scientifiques/techniques d'axes de graphes).
+   - Architecture modulaire permettant d'ajouter des packs de langues supplémentaires (ex: langues asiatiques/cyrilliques) uniquement si nécessaire sans alourdir le modèle par défaut.
+5. **Phase 4 — Sauvegarde Définitive dans le PDF (`Ctrl+S`)** :
+   - Lors de l'enregistrement du PDF, les textes reconnus dans les graphiques/images sont écrits directement dans le PDF sous forme de couche texte standard invisible (`Text Rendering Mode = 3`, avec matrice de transformation `Tm` orientée à l'angle $\theta$) et marqués comme traités.
+   - **Avantage clé** : à la prochaine ouverture du PDF (chez toi ou chez un tiers sur Adobe Acrobat), le `Ctrl+F` trouvera instantanément les mots des graphiques sans jamais avoir à relancer l'OCR !
 
-### 3.4. Outils d'Annotation Standardisés (Compatibilité Adobe Acrobat)
+### 3.4. Outils d'Annotation Standardisés (Compatibilité Adobe Acrobat — ISO 32000)
 Toutes les annotations respectent la norme **ISO 32000-1 / 32000-2 (§12.5)** afin d'être modifiables nativement dans Adobe Acrobat, Foxit, macOS Preview ou PDF-XChange :
-- **Surlignage de texte (`/Subtype /Highlight`)** : attaché aux coordonnées `/QuadPoints` du texte sélectionné (couleur et opacité configurables).
-- **Surlignage libre & Dessin à main levée (`/Subtype /Ink`)** : tracés vectoriels fluides stockés dans `/InkList` avec lissage de courbe de Bézier.
-- **Ajout de bloc de texte (`/Subtype /FreeText`)** : boîte de texte éditable avec police, taille, couleur (`DefaultAppearance /DA`) et flux d'apparence (`/AP`). Un utilisateur sur Adobe Acrobat peut double-cliquer dessus pour modifier le texte ou déplacer le bloc.
-- **Notes & Commentaires (`/Subtype /Text`)** : post-it / bulles de commentaire.
-- **Formes géométriques (`/Square`, `/Circle`, `/Line`)** : encadrés, flèches et traits pour annoter des schémas.
-- **Édition / Suppression d'annotations existantes** : sélection au clic de n'importe quelle annotation (créée dans notre lecteur ou dans Adobe Acrobat) pour la déplacer, la redimensionner, modifier son texte/couleur ou la supprimer, avec historique `Ctrl+Z` / `Ctrl+Y`.
+1. **Surlignage de texte (`/Subtype /Highlight`) & Surlignage libre** : attaché aux coordonnées `/QuadPoints` du texte sélectionné (ou tracé libre au marqueur translucent).
+2. **Ajout de bloc de texte visible (`/Subtype /FreeText`)** : boîte de texte directement affichée et éditable sur la page avec police, taille, couleur (`DefaultAppearance /DA`) et flux d'apparence (`/AP`). Un utilisateur sur Adobe Acrobat peut double-cliquer dessus pour modifier le texte ou déplacer le bloc.
+3. **Dessin à main levée, Flèches & Formes (`/Ink`, `/Line`, `/Square`, `/Circle`)** : tracés vectoriels fluides stockés dans `/InkList`, flèches d'annotation de schémas et rectangles/cercles.
+4. **Notes & Commentaires en info-bulle (`/Subtype /Text`)** : icône de note (Sticky Note) ouvrant une bulle de commentaire pliable/dépliable.
+5. **Signatures, Tampons & Outil de Mesure (`/Stamp`, `/Ink`, `/Line` + `/Measure`)** : apposition rapide de signature/tampon et règle de mesure de distance/cote sur les plans et graphiques.
+6. **Édition / Suppression universelle** : sélection au clic de n'importe quelle annotation (créée dans notre lecteur ou dans Adobe Acrobat) pour la déplacer, la redimensionner, modifier son texte/couleur ou la supprimer, avec historique `Ctrl+Z` / `Ctrl+Y`.
 
 ### 3.5. Raccourcis Clavier
 - **Navigation** : `Flèches` / `J`/`K` (défilement), `Espace` / `Shift+Espace` (page suivante/précédente), `Ctrl+Molette` ou `Ctrl++`/`Ctrl+-` (zoom), `Ctrl+0` (ajuster à la page).
@@ -106,19 +110,24 @@ Chaque jalon sera développé, testé et **validé avec toi** avant de passer au
 
 ### Jalon 5 : Outils d'Annotation Standard ISO 32000 (Adobe Acrobat Compatible)
 - Création, affichage interactif, déplacement et modification d'annotations :
-  - Surlignage de texte (`Highlight` avec `/QuadPoints`).
-  - Bloc de texte éditable (`FreeText`).
-  - Dessin / Surlignage libre (`Ink` avec `/InkList`).
-  - Formes (`Square`, `Line`/Flèche) et Notes (`Text`).
-- Sauvegarde incrémentale ou complète dans le PDF respectant la norme ISO 32000 (`/Annots` + `/AP`).
+  - Surlignage de texte (`Highlight` avec `/QuadPoints`) et surlignage libre.
+  - Bloc de texte directement visible et éditable (`FreeText`).
+  - Dessin à main levée (`Ink` avec `/InkList`), flèches et formes (`Line`, `Square`, `Circle`).
+  - Notes / Commentaires en info-bulle (`Text` / Sticky Notes).
+  - Signatures / Tampons (`Stamp`) et outil de mesure de cotes sur graphiques/plans.
+- Sauvegarde dans le PDF respectant la norme ISO 32000 (`/Annots` + `/AP`).
 - Pile d'annulation `Ctrl+Z` / `Ctrl+Y`.
 - **Critère de validation** : un bloc de texte ou surlignage créé dans notre lecteur est directement modifiable/déplaçable dans Adobe Acrobat (et inversement).
 
-### Jalon 6 : OCR Hybride Intelligent & Multi-Orientation (Textes en diagonale & Graphiques JPG)
+### Jalon 6 : OCR Hybride à 3 Vitesses & Multi-Orientation (Textes en diagonale & Graphiques JPG)
 - Détection automatique des objets `XObject Image` intégrés dans les pages PDF (ex: graphiques JPG dans un PDF issu de Word) et des pages scannées.
-- Intégration du pipeline **ONNX Runtime (`ort`) + PaddleOCR orienté** (détection polygonale DBNet + redressement d'angle $0^\circ\text{--}360^\circ$ + reconnaissance).
-- Fusion transparente des résultats OCR orientés dans l'index de recherche `Ctrl+F` (avec surlignage orienté sur les graphiques) et option d'écriture d'une couche texte invisible (`Tr 3`) dans le PDF.
-- **Critère de validation** : sur un PDF contenant du texte Word + un graphique en image `.jpg` avec des titres d'axes verticaux ou en diagonale, `Ctrl+F` trouve et surligne les textes du graphique aussi bien que le texte Word.
+- Intégration du pipeline **ONNX Runtime (`ort`) + PaddleOCR orienté (PP-OCRv4 Latin FR/EN + symboles)** : détection polygonale DBNet + redressement d'angle $0^\circ\text{--}360^\circ$ + reconnaissance.
+- **Ordonnanceur OCR à 3 vitesses** :
+  1. **Ouverture instantanée** (zéro blocage, lecture du cache/couche existante).
+  2. **Tâche de fond Éco** (basse priorité sur l'onglet actif pour ne jamais ralentir le PC).
+  3. **Mode Turbo sur `Ctrl+F`** (scan haute vitesse multi-threadé du document complet sans lag de l'UI, avec résultats affichés au fil de l'eau).
+- **Persistance dans le PDF (`Ctrl+S`)** : injection d'une couche texte invisible normalisée (`Tr 3` orientée) dans le PDF afin que le scan n'ait plus jamais besoin d'être refait aux ouvertures suivantes.
+- **Critère de validation** : sur un PDF contenant du texte Word + un graphique en image `.jpg` avec des titres d'axes verticaux ou en diagonale, `Ctrl+F` trouve et surligne les textes du graphique, et après sauvegarde (`Ctrl+S`), ces textes sont immédiatement cherchables dès l'ouverture (y compris dans un autre lecteur PDF).
 
 ### Jalon 7 : Finitions, Persistance de Session & Packaging Windows
 - Restauration automatique de la session (les 15 onglets ouverts, positions de lecture et états de la sidebar au redémarrage).
