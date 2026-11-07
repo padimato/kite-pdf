@@ -73,11 +73,22 @@ Toutes les annotations respectent la norme **ISO 32000-1 / 32000-2 (§12.5)** af
 5. **Signatures, Tampons & Outil de Mesure (`/Stamp`, `/Ink`, `/Line` + `/Measure`)** : apposition rapide de signature/tampon et règle de mesure de distance/cote sur les plans et graphiques.
 6. **Édition / Suppression universelle** : sélection au clic de n'importe quelle annotation (créée dans notre lecteur ou dans Adobe Acrobat) pour la déplacer, la redimensionner, modifier son texte/couleur ou la supprimer, avec historique `Ctrl+Z` / `Ctrl+Y`.
 
-### 3.5. Raccourcis Clavier
-- **Navigation** : `Flèches` / `J`/`K` (défilement), `Espace` / `Shift+Espace` (page suivante/précédente), `Ctrl+Molette` ou `Ctrl++`/`Ctrl+-` (zoom), `Ctrl+0` (ajuster à la page).
-- **Onglets & UI** : `Ctrl+S` ou `Alt+S` (afficher/masquer la sidebar Arc), `Ctrl+Tab` / `Ctrl+Shift+Tab` (onglet suivant/précédent), `Ctrl+W` (fermer l'onglet), `Ctrl+O` (ouvrir), `Ctrl+K` (palette de commandes).
+### 3.5. Ergonomie Trackpad Windows (Precision Touchpad) & Raccourcis Clavier
+- **Compatibilité Trackpad Native (Windows Precision Touchpad)** :
+  - **Défilement fluide 2 doigts (Vertical & Horizontal)** : prise en charge native des deltas continus au pixel près (`smooth_scroll_delta.x` et `smooth_scroll_delta.y`) pour naviguer dans les pages et se déplacer latéralement lorsqu'on est zoomé, sans saccades par crans.
+  - **Pinch-to-Zoom à 2 doigts** : zoom progressif centré sur la position du pointeur via `zoom_delta()` (compatible pincement 2 doigts sur trackpad Windows et `Ctrl + glissement 2 doigts`).
+  - **Panoramique au clic/glisser (Outil Main ou Espace + glisser à 1 doigt)** : déplacement libre sur la page au trackpad d'un seul doigt lorsque la barre d'espace est maintenue.
+  - **Survol du bord gauche au trackpad** : détection douce avec hystérésis pour déployer/replier la sidebar Arc sans déclenchement intempestif.
+- **Navigation clavier** : `Flèches` / `J`/`K` (défilement), `Espace` / `Shift+Espace` (page suivante/précédente), `Ctrl+Molette` ou `Ctrl++`/`Ctrl+-` (zoom), `Ctrl+0` (ajuster à la page), `Ctrl+9` (ajuster à la largeur).
+- **Onglets & UI** : `Ctrl+B` (afficher/masquer la sidebar Arc), `Ctrl+Tab` / `Ctrl+Shift+Tab` (onglet suivant/précédent), `Ctrl+W` (fermer l'onglet), `Ctrl+O` (ouvrir), `Ctrl+K` (palette de commandes).
 - **Outils rapides (1 touche hors saisie texte)** : `V` (Sélection), `H` (Surligner texte), `M` (Surligneur libre), `T` (Ajouter texte `FreeText`), `D` (Dessin `Ink`), `R` (Rectangle), `Suppr` (Supprimer l'annotation sélectionnée).
 - **Recherche & Fichier** : `Ctrl+F` (Recherche hybride Natif + OCR), `Ctrl+S` (Enregistrer le PDF avec annotations standard).
+
+### 3.6. Protocole de Validation par Sous-Agent QA & Preuves Visuelles
+Pour chaque jalon :
+1. **Tests automatisés & fonctionnels** : tests unitaires et d'intégration Cargo (`cargo test`), incluant la simulation d'événements Trackpad (scroll 2D, pinch-to-zoom) et clavier.
+2. **Sous-Agent QA indépendant** : un sous-agent dédié est invoqué à la fin de chaque jalon pour inspecter, compiler, exécuter l'application en conditions réelles et vérifier de manière objective tous les critères d'acceptation.
+3. **Captures d'écran systématiques** : chaque fonctionnalité visuelle est validée par une ou plusieurs captures d'écran réelles de l'application en cours d'exécution (et/ou export de frame GPU), intégrées au rapport de validation présenté à l'utilisateur.
 
 ---
 
