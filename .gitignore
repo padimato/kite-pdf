@@ -1,0 +1,19 @@
+# Rust / Cargo
+/target/
+**/*.rs.bk
+*.pdb
+
+# Binaires externes & Modèles ONNX lourds (téléchargés ou en cache)
+/assets/models/*.onnx
+pdfium.dll
+*.dll.lib
+
+# Fichiers de test locaux
+/test_pdfs/
+*.tmp.pdf
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
