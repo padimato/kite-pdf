@@ -16,6 +16,30 @@ pub struct MultiplicativeHighlightQuad {
 }
 
 impl MultiplicativeHighlightQuad {
+    /// Exprime ces surlignages dans le repère d'une tuile (`region` en coordonnées normalisées de page).
+    pub fn remap_to_region(quads: &[Self], region: [f32; 4]) -> Vec<Self> {
+        let width = (region[2] - region[0]).max(1e-6);
+        let height = (region[3] - region[1]).max(1e-6);
+        quads
+            .iter()
+            .filter(|q| {
+                q.norm_rect[0] < region[2]
+                    && q.norm_rect[2] > region[0]
+                    && q.norm_rect[1] < region[3]
+                    && q.norm_rect[3] > region[1]
+            })
+            .map(|q| Self {
+                norm_rect: [
+                    (q.norm_rect[0] - region[0]) / width,
+                    (q.norm_rect[1] - region[1]) / height,
+                    (q.norm_rect[2] - region[0]) / width,
+                    (q.norm_rect[3] - region[1]) / height,
+                ],
+                color_rgb: q.color_rgb,
+            })
+            .collect()
+    }
+
     pub fn hash_slice(quads: &[Self]) -> u64 {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         quads.len().hash(&mut hasher);
@@ -87,6 +111,8 @@ pub struct PageTextureKey {
     pub tab_id: u64,
     pub page_index: usize,
     pub zoom_bucket: u32,
+    /// `None` : la page entière. `Some((colonne, ligne))` : une tuile de la grille haute résolution.
+    pub tile: Option<(u32, u32)>,
 }
 
 struct CachedTextureEntry {
@@ -198,7 +224,10 @@ impl LruTextureCache {
         let composited = apply_multiplicative_highlights(&image, highlights);
 
         let tex = ctx.load_texture(
-            format!("superpdf_t{}_p{}_z{}", key.tab_id, key.page_index, key.zoom_bucket),
+            format!(
+                "superpdf_t{}_p{}_z{}_{:?}",
+                key.tab_id, key.page_index, key.zoom_bucket, key.tile
+            ),
             composited,
             TextureOptions::LINEAR,
         );
@@ -285,12 +314,23 @@ impl LruTextureCache {
         freed_bytes
     }
 
-    /// Nettoie les paliers de zoom obsolètes d'un onglet pour ne garder que le palier de zoom courant
-    pub fn prune_stale_zoom_buckets(&mut self, tab_id: u64, active_zoom_bucket: u32) {
+    /// Ne garde pour cet onglet que la page entière au palier `page_bucket` et les tuiles au palier `tile_bucket`.
+    pub fn prune_stale_zoom_buckets(
+        &mut self,
+        tab_id: u64,
+        page_bucket: u32,
+        tile_bucket: Option<u32>,
+    ) {
         let stale_keys: Vec<PageTextureKey> = self
             .entries
             .keys()
-            .filter(|k| k.tab_id == tab_id && k.zoom_bucket != active_zoom_bucket)
+            .filter(|k| {
+                k.tab_id == tab_id
+                    && match k.tile {
+                        None => k.zoom_bucket != page_bucket,
+                        Some(_) => Some(k.zoom_bucket) != tile_bucket,
+                    }
+            })
             .copied()
             .collect();
 
@@ -300,6 +340,20 @@ impl LruTextureCache {
                 self.total_evictions += 1;
             }
         }
+    }
+
+    /// Palier de zoom déjà en cache le plus proche pour cette page (affiché en attendant le rendu exact).
+    pub fn closest_cached_key(
+        &self,
+        tab_id: u64,
+        page_index: usize,
+        zoom_bucket: u32,
+    ) -> Option<PageTextureKey> {
+        self.entries
+            .keys()
+            .filter(|k| k.tab_id == tab_id && k.page_index == page_index && k.tile.is_none())
+            .min_by_key(|k| k.zoom_bucket.abs_diff(zoom_bucket))
+            .copied()
     }
 
     /// Purge intégralement le cache de textures
@@ -365,6 +419,7 @@ mod tests {
                     tab_id: 1,
                     page_index: p,
                     zoom_bucket: 20,
+                    tile: None,
                 },
                 page_size,
             );
@@ -382,12 +437,14 @@ mod tests {
         assert!(!cache.contains_key(&PageTextureKey {
             tab_id: 1,
             page_index: 0,
-            zoom_bucket: 20
+            zoom_bucket: 20,
+            tile: None,
         }));
         assert!(cache.contains_key(&PageTextureKey {
             tab_id: 1,
             page_index: 5,
-            zoom_bucket: 20
+            zoom_bucket: 20,
+            tile: None,
         }));
     }
 
@@ -399,6 +456,7 @@ mod tests {
                 tab_id: 10,
                 page_index: 0,
                 zoom_bucket: 20,
+                    tile: None,
             },
             4_000_000,
         );
@@ -407,6 +465,7 @@ mod tests {
                 tab_id: 20,
                 page_index: 0,
                 zoom_bucket: 20,
+                    tile: None,
             },
             4_000_000,
         );

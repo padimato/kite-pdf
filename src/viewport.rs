@@ -2,7 +2,7 @@ use crate::pdf_engine::PageDimensions;
 use egui::{Pos2, Rect, Vec2};
 
 pub const MIN_ZOOM: f32 = 0.25;
-pub const MAX_ZOOM: f32 = 5.0;
+pub const MAX_ZOOM: f32 = 32.0;
 pub const PAGE_GAP_PX: f32 = 18.0;
 /// Facteur de conversion Points PDF (72 DPI) -> Pixels écran à zoom 100% (96 DPI = 1.3333)
 pub const BASE_DPI_SCALE: f32 = 96.0 / 72.0;

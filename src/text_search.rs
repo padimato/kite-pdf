@@ -391,6 +391,27 @@ impl SearchBarState {
         self.focus_requested = false;
     }
 
+    /// Relance la recherche quand de nouvelles pages arrivent, sans perdre l'occurrence courante.
+    pub fn refresh_keeping_current(&mut self, pages_text: &[PageTextLayer]) {
+        let anchor = self
+            .matches
+            .get(self.current_match_index)
+            .and_then(|m| m.highlight_boxes.first().map(|b| (m.page_index, b.x_min, b.y_min)));
+        self.execute_search(pages_text);
+        if let Some((page, x, y)) = anchor {
+            self.current_match_index = self
+                .matches
+                .iter()
+                .position(|m| {
+                    m.page_index == page
+                        && m.highlight_boxes
+                            .first()
+                            .is_some_and(|b| (b.x_min - x).abs() < 0.5 && (b.y_min - y).abs() < 0.5)
+                })
+                .unwrap_or(0);
+        }
+    }
+
     pub fn execute_search(&mut self, pages_text: &[PageTextLayer]) {
         self.last_executed_query = self.query.clone();
         self.matches.clear();

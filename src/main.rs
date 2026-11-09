@@ -6,6 +6,7 @@ mod pdf_engine;
 mod tabs;
 mod text_search;
 mod viewport;
+mod worker;
 
 use app::{AutomationConfig, InitialSidebarMode, SuperPdfApp};
 use pdf_engine::ensure_sample_pdf;
@@ -26,6 +27,12 @@ fn parse_args() -> AutomationConfig {
             "--screenshot" => {
                 if let Some(p) = args.get(i + 1) {
                     cfg.screenshot_output = Some(PathBuf::from(p));
+                    i += 1;
+                }
+            }
+            "--screenshot-delay-ms" => {
+                if let Some(ms) = args.get(i + 1).and_then(|s| s.parse::<u64>().ok()) {
+                    cfg.screenshot_delay_ms = ms;
                     i += 1;
                 }
             }
@@ -182,7 +189,20 @@ fn parse_args() -> AutomationConfig {
     cfg
 }
 
+/// Écrit toute panique dans `super_pdf_crash.log` (dossier temporaire) : une fenêtre qui disparaît laisse ainsi une trace.
+fn install_crash_log() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        let report = format!("{info}\n{backtrace}\n");
+        let log_path = std::env::temp_dir().join("super_pdf_crash.log");
+        let _ = std::fs::write(log_path, report);
+        default_hook(info);
+    }));
+}
+
 fn main() -> eframe::Result<()> {
+    install_crash_log();
     let cfg = parse_args();
 
     if cfg.demo_tabs_count.is_none() && cfg.initial_pdf == PathBuf::from("test_pdfs/demo_jalon1.pdf")
@@ -193,7 +213,7 @@ fn main() -> eframe::Result<()> {
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Super Lecteur PDF — Jalon 6 (OCR Hybride 3 Vitesses Multi-Angles & Graphiques JPG + Persistance Tr 3)")
+            .with_title("Super Lecteur PDF")
             .with_inner_size([1280.0, 820.0])
             .with_min_inner_size([640.0, 400.0]),
         ..Default::default()

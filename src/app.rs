@@ -1,23 +1,133 @@
 use crate::annotations::{
-    save_annotations_and_ocr_to_pdf, AnnotationKind, PdfAnnotation, ShapeKind, PALETTE_COLORS,
+    line_ending_outline, line_stop_point, save_annotations_and_ocr_to_pdf, unit_direction,
+    AnnotHandle, AnnotationKind, LineEnding, PdfAnnotation, ShapeKind, ARROW_LINE_WIDTH,
+    FREETEXT_DEFAULT_FILL, PALETTE_COLORS,
 };
 use crate::memory_manager::{
     query_process_memory_bytes, LruTextureCache, MultiplicativeHighlightQuad, PageTextureKey,
     DEFAULT_TEXTURE_BUDGET_BYTES,
 };
 use crate::ocr_engine::ensure_hybrid_word_jpg_pdf;
-use crate::pdf_engine::{ensure_custom_sample_pdf, PdfEngine};
+use crate::pdf_engine::{ensure_custom_sample_pdf, PdfEngine, TileRegion};
 use crate::tabs::{
     ActiveTool, CommandPaletteState, DocumentTab, PaletteCommand, SidebarState, SIDEBAR_WIDTH,
 };
 use crate::text_search::{PdfTopDownRect, SearchBarState, SelectionGestureMode};
 use crate::viewport::BASE_DPI_SCALE;
+use crate::worker::{BackgroundWorkers, RenderJob, WorkerEvent};
 use egui::{
     Align2, Color32, Context, CornerRadius, FontId, Key, Margin, Order, Pos2, Rect, Sense, Stroke,
     StrokeKind, Vec2, ViewportCommand,
 };
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// Fenêtre glissante du compteur d'images : assez longue pour qu'un gel reste visible.
+const FRAME_STATS_WINDOW: Duration = Duration::from_secs(3);
+/// Délai minimal entre deux recherches relancées par l'arrivée de nouvelles pages.
+const SEARCH_REFRESH_INTERVAL: Duration = Duration::from_millis(150);
+/// Part du budget de textures utilisable par les pages visibles et préchargées.
+const VISIBLE_TEXTURE_BUDGET_RATIO: f32 = 0.7;
+/// Précision du palier de zoom : assez fine pour que le rendu tombe pixel pour pixel sur l'écran.
+const ZOOM_BUCKETS_PER_UNIT: f32 = 1000.0;
+/// Délai sans changement de zoom avant de recalculer les pages à la nouvelle résolution.
+const ZOOM_SETTLE_DELAY: Duration = Duration::from_millis(120);
+/// Au-delà de cette taille (pixels écran), une page passe en rendu par tuiles.
+const TILING_THRESHOLD_PIXELS: f32 = 2_600_000.0;
+/// Taille de l'image de fond d'une page rendue par tuiles, affichée en attendant les tuiles.
+const TILED_BASE_PIXELS: f32 = 1_200_000.0;
+const TILE_SIZE_PX: i32 = 512;
+/// Part du cache que les tuiles peuvent occuper ; au-delà, la marge de préchargement est retirée.
+const TILE_BUDGET_RATIO: f32 = 0.85;
+/// Rayon de saisie des poignées d'annotation, en pixels écran.
+const HANDLE_GRAB_RADIUS_PX: f32 = 9.0;
+/// Délai pendant lequel un nouveau tracé complète le dessin précédent (signature en plusieurs traits).
+const INK_STROKE_GROUPING: Duration = Duration::from_millis(2500);
+
+type Rgb = (u8, u8, u8);
+
+const FREETEXT_FILL_CHOICES: [(&str, Rgb); 8] = [
+    ("Blanc", (255, 255, 255)),
+    ("Crème", FREETEXT_DEFAULT_FILL),
+    ("Gris clair", (232, 234, 238)),
+    ("Jaune pâle", (255, 243, 176)),
+    ("Bleu pâle", (205, 228, 252)),
+    ("Vert pâle", (205, 240, 220)),
+    ("Rouge pâle", (250, 212, 212)),
+    ("Violet pâle", (232, 214, 250)),
+];
+
+const FREETEXT_BORDER_CHOICES: [(&str, Rgb); 7] = [
+    ("Noir", (0, 0, 0)),
+    ("Gris", (140, 146, 158)),
+    PALETTE_COLORS[0],
+    PALETTE_COLORS[1],
+    PALETTE_COLORS[2],
+    PALETTE_COLORS[3],
+    PALETTE_COLORS[4],
+];
+
+/// Hauteur du liseré coloré en tête d'une bulle de note, en points PDF.
+const NOTE_HEADER_HEIGHT_PT: f32 = 5.0;
+const NOTE_FONT_SIZE_PT: f32 = 10.5;
+const INLINE_TEXT_COLOR: Color32 = Color32::from_rgb(20, 24, 34);
+
+/// Ligne de choix « Aucun + nuancier ». Retourne le nouveau choix quand l'utilisateur en fait un.
+fn color_choice_row(
+    ui: &mut egui::Ui,
+    title: &str,
+    current: Option<Rgb>,
+    choices: &[(&str, Rgb)],
+) -> Option<Option<Rgb>> {
+    let mut picked = None;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 3.0;
+        ui.label(egui::RichText::new(title).size(10.5));
+        if ui.selectable_label(current.is_none(), "Aucun").clicked() {
+            picked = Some(None);
+        }
+        for (name, rgb) in choices {
+            let swatch = egui::Button::new(
+                egui::RichText::new(if current == Some(*rgb) { "✔" } else { " " })
+                    .size(10.0)
+                    .color(Color32::from_rgb(90, 96, 110)),
+            )
+            .fill(Color32::from_rgb(rgb.0, rgb.1, rgb.2))
+            .min_size(Vec2::new(17.0, 16.0));
+            if ui.add(swatch).on_hover_text(*name).clicked() {
+                picked = Some(Some(*rgb));
+            }
+        }
+    });
+    picked
+}
+
+/// Tuile à afficher pour une page
+struct PageTile {
+    page_index: usize,
+    key: PageTextureKey,
+    region: TileRegion,
+    full_size_px: (f32, f32),
+    distance_to_center: f32,
+    is_visible: bool,
+}
+
+/// Geste en cours sur une annotation
+struct AnnotationDrag {
+    id: u64,
+    handle: AnnotHandle,
+    grab_pt: (f32, f32),
+    original: PdfAnnotation,
+    has_moved: bool,
+}
+
+/// Menu contextuel ouvert sur une flèche
+struct LineContextMenu {
+    annotation_id: u64,
+    position: Pos2,
+    opened_on_frame: u64,
+}
 
 /// Mode initial de la barre latérale pour les tests automatisés QA
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -52,6 +162,8 @@ pub struct AutomationConfig {
     pub ocr_turbo: bool,
     pub save_annotated_output: Option<PathBuf>,
     pub screenshot_output: Option<PathBuf>,
+    /// Délai avant la capture (permet à un script QA d'envoyer des événements à la fenêtre)
+    pub screenshot_delay_ms: u64,
 }
 
 pub struct SuperPdfApp {
@@ -75,9 +187,22 @@ pub struct SuperPdfApp {
     pub texture_cache: LruTextureCache,
     /// Consommation RAM réelle du processus Windows (Working Set en octets)
     pub process_working_set_bytes: usize,
-    /// Indique si un glisser de déplacement d'annotation est en cours
-    dragging_annotation_id: Option<u64>,
-    last_drag_pt: Option<(f32, f32)>,
+    /// Déplacement ou redimensionnement d'annotation en cours
+    annotation_drag: Option<AnnotationDrag>,
+    /// Bloc FreeText en cours d'édition directement sur la page
+    editing_freetext_id: Option<u64>,
+    freetext_focus_pending: bool,
+    /// Dernier style choisi : les blocs suivants le reprennent (`None` tant que rien n'a été choisi)
+    freetext_style: Option<(Option<Rgb>, Option<Rgb>)>,
+    /// Un champ de saisie avait le focus à l'image précédente : seules ces images bloquent les raccourcis à une touche
+    /// (`wants_keyboard_input` serait aussi vrai pour un simple bouton atteint avec Tab).
+    text_field_focused_prev: bool,
+    text_field_focused_now: bool,
+    /// Le bouton qui a créé le bloc est encore enfoncé : son relâchement ne doit pas fermer l'éditeur
+    freetext_awaiting_opening_release: bool,
+    line_context_menu: Option<LineContextMenu>,
+    /// Dernier dessin créé et instant de sa fin, pour regrouper les traits d'une signature
+    last_ink_stroke: Option<(u64, Instant)>,
     /// Dernière erreur éventuelle à afficher
     error_message: Option<String>,
     /// Compteur de frames pour le mode capture d'écran automatisée
@@ -88,7 +213,21 @@ pub struct SuperPdfApp {
     automation: AutomationConfig,
     /// Mesure du temps de frame / FPS
     last_frame_instant: Instant,
-    fps_smoothed: f32,
+    /// Durées des images de la fenêtre glissante, avec leur horodatage
+    recent_frames: VecDeque<(Instant, f32)>,
+    /// Threads de rendu, de texte et d'OCR
+    workers: BackgroundWorkers,
+    /// Pages dont le rendu a échoué : on ne les redemande pas à chaque image
+    failed_renders: HashSet<PageTextureKey>,
+    /// De nouvelles pages sont arrivées depuis la dernière recherche
+    search_refresh_pending: bool,
+    last_search_refresh: Instant,
+    app_started: Instant,
+    /// Zoom réel (échelle Windows incluse) à la résolution duquel les pages sont rendues
+    render_zoom: f32,
+    /// Dernier zoom observé et instant de son changement, pour attendre la fin d'un geste
+    observed_zoom: f32,
+    observed_zoom_changed_at: Instant,
 }
 
 const TAB_BADGE_COLORS: [(Color32, (f32, f32, f32)); 6] = [
@@ -119,7 +258,7 @@ const DEMO_TAB_SPECS: [(&str, &str, usize); 15] = [
 ];
 
 impl SuperPdfApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>, automation: AutomationConfig) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, automation: AutomationConfig) -> Self {
         let engine = PdfEngine::instance();
 
         let mut sidebar = SidebarState::default();
@@ -154,14 +293,29 @@ impl SuperPdfApp {
             search_bar: SearchBarState::default(),
             texture_cache: LruTextureCache::new(DEFAULT_TEXTURE_BUDGET_BYTES),
             process_working_set_bytes: ws_bytes,
-            dragging_annotation_id: None,
-            last_drag_pt: None,
+            annotation_drag: None,
+            editing_freetext_id: None,
+            freetext_focus_pending: false,
+            freetext_style: None,
+            text_field_focused_prev: false,
+            text_field_focused_now: false,
+            freetext_awaiting_opening_release: false,
+            line_context_menu: None,
+            last_ink_stroke: None,
             error_message: None,
             frame_count: 0,
             screenshot_requested: false,
             automation: automation.clone(),
             last_frame_instant: Instant::now(),
-            fps_smoothed: 60.0,
+            recent_frames: VecDeque::new(),
+            workers: BackgroundWorkers::spawn(cc.egui_ctx.clone(), engine),
+            failed_renders: HashSet::new(),
+            search_refresh_pending: false,
+            last_search_refresh: Instant::now(),
+            app_started: Instant::now(),
+            render_zoom: 0.0,
+            observed_zoom: 0.0,
+            observed_zoom_changed_at: Instant::now(),
         };
 
         if automation.hybrid_ocr_demo {
@@ -345,6 +499,7 @@ impl SuperPdfApp {
         for (i, tab) in self.tabs.iter_mut().enumerate() {
             if i != target_index {
                 tab.hibernate(&mut self.texture_cache);
+                self.workers.forget_tab(tab.id);
             }
         }
         if let Some(active) = self.tabs.get_mut(target_index) {
@@ -354,11 +509,13 @@ impl SuperPdfApp {
                 self.error_message = None;
             }
             if self.search_bar.is_open && !self.search_bar.query.trim().is_empty() {
-                active.ensure_text_layers(self.engine);
+                active.request_all_text(&self.workers);
+                active.start_turbo_ocr();
                 self.search_bar.execute_search(&active.text_layers);
             }
         }
         self.active_tab = target_index;
+        self.render_zoom = 0.0;
     }
 
     pub fn open_pdf_in_new_tab(&mut self, path: &Path) {
@@ -367,6 +524,7 @@ impl SuperPdfApp {
 
         for existing in &mut self.tabs {
             existing.hibernate(&mut self.texture_cache);
+            self.workers.forget_tab(existing.id);
         }
 
         match self.engine.load_document(path) {
@@ -376,6 +534,7 @@ impl SuperPdfApp {
                 self.tabs.push(DocumentTab::new_active(id, doc, badge_color));
                 self.active_tab = self.tabs.len() - 1;
                 self.error_message = None;
+                self.render_zoom = 0.0;
             }
             Err(err) => {
                 self.error_message = Some(format!("{:#}", err));
@@ -403,6 +562,7 @@ impl SuperPdfApp {
         }
         let removed = self.tabs.remove(index);
         self.texture_cache.evict_tab(removed.id);
+        self.workers.forget_tab(removed.id);
 
         if self.tabs.is_empty() {
             self.active_tab = 0;
@@ -433,7 +593,7 @@ impl SuperPdfApp {
     }
 
     fn zoom_bucket(zoom: f32) -> u32 {
-        ((zoom * 20.0).round() as u32).max(1)
+        ((zoom * ZOOM_BUCKETS_PER_UNIT).round() as u32).max(1)
     }
 
     /// Enregistre les annotations ISO 32000 ET la couche de texte OCR invisible (`3 Tr` + `Tm`) dans le PDF (`Ctrl+S`)
@@ -451,6 +611,7 @@ impl SuperPdfApp {
             );
             let _ = tab.ensure_awake(self.engine);
             self.texture_cache.evict_tab(tab_id);
+            self.workers.forget_tab(tab_id);
             match res {
                 Ok(()) => {
                     tab.is_modified = false;
@@ -515,10 +676,8 @@ impl SuperPdfApp {
             PaletteCommand::RunHybridOcrTurbo => {
                 if let Some(tab) = self.tabs.get_mut(self.active_tab) {
                     let p = tab.viewport.current_page_index(viewport_size, &tab.page_dimensions);
-                    tab.run_turbo_ocr_for_search(p, self.engine);
-                    if self.search_bar.is_open {
-                        self.search_bar.execute_search(&tab.text_layers);
-                    }
+                    tab.start_turbo_ocr();
+                    tab.pump_ocr(p, &self.workers);
                 }
             }
             PaletteCommand::OpenHybridWordJpgDemo => {
@@ -562,6 +721,7 @@ impl SuperPdfApp {
                 for (i, tab) in self.tabs.iter_mut().enumerate() {
                     if i != current {
                         tab.hibernate(&mut self.texture_cache);
+                        self.workers.forget_tab(tab.id);
                     }
                 }
                 self.texture_cache.clear();
@@ -636,7 +796,7 @@ impl SuperPdfApp {
         let mut tab_cycle_dir: i32 = 0;
         let mut trigger_search_open = false;
         let mut copy_selected_text = false;
-        let text_input_focused = ctx.wants_keyboard_input();
+        let text_input_focused = self.text_field_focused_prev;
 
         ctx.input(|input| {
             // 1. Capture d'écran GPU automatisée
@@ -702,7 +862,9 @@ impl SuperPdfApp {
                 self.command_palette.toggle();
             }
             if input.key_pressed(Key::Escape) {
-                if self.command_palette.is_open {
+                if self.editing_freetext_id.is_some() || self.line_context_menu.is_some() {
+                    // Géré par l'éditeur en place et le menu contextuel.
+                } else if self.command_palette.is_open {
                     self.command_palette.close();
                 } else if self.search_bar.is_open {
                     self.search_bar.close();
@@ -752,12 +914,12 @@ impl SuperPdfApp {
                 }
             }
 
-            if self.command_palette.is_open || text_input_focused {
+            if self.command_palette.is_open {
                 return;
             }
 
             // 4. Raccourcis d'outils à 1 touche
-            if !ctrl && !self.search_bar.is_open {
+            if !ctrl && !text_input_focused {
                 if input.key_pressed(Key::V) {
                     self.active_tool = ActiveTool::Select;
                 } else if input.key_pressed(Key::H) {
@@ -823,7 +985,8 @@ impl SuperPdfApp {
             }
 
             // Panoramique à 1 doigt sur le trackpad (Outil Main, Espace maintenu + glisser, ou clic milieu)
-            let space_held = input.key_down(Key::Space) || self.active_tool == ActiveTool::Pan;
+            let space_held = (!text_input_focused && input.key_down(Key::Space))
+                || self.active_tool == ActiveTool::Pan;
             let drag_pan_active = !pointer_over_sidebar
                 && ((space_held && input.pointer.primary_down()) || input.pointer.middle_down());
             tab.viewport.is_panning = drag_pan_active;
@@ -856,7 +1019,7 @@ impl SuperPdfApp {
 
             let step_y = 75.0;
             let step_x = 60.0;
-            if !ctrl && !self.search_bar.is_open {
+            if !ctrl && !text_input_focused {
                 if input.key_pressed(Key::ArrowDown) || input.key_pressed(Key::J) {
                     tab.viewport
                         .apply_pan_delta(Vec2::new(0.0, -step_y), viewport_size, pages);
@@ -903,8 +1066,9 @@ impl SuperPdfApp {
                 let p = tab
                     .viewport
                     .current_page_index(viewport_size, &tab.page_dimensions);
-                tab.ensure_text_layers(self.engine);
-                tab.run_turbo_ocr_for_search(p, self.engine);
+                tab.request_all_text(&self.workers);
+                tab.start_turbo_ocr();
+                tab.pump_ocr(p, &self.workers);
             }
         }
 
@@ -951,7 +1115,7 @@ impl SuperPdfApp {
                 .input(|i| i.pointer.hover_pos())
                 .map(|p| p.x <= SIDEBAR_WIDTH)
                 .unwrap_or(false);
-        if pointer_over_sidebar {
+        if pointer_over_sidebar || (self.annotation_drag.is_none() && ctx.is_pointer_over_area()) {
             return;
         }
 
@@ -992,8 +1156,11 @@ impl SuperPdfApp {
                 .clamp(0.0, page_dim.height_pt);
 
         // Curseur I-Beam quand on survole du texte en mode Sélection ou Surligner
-        if matches!(self.active_tool, ActiveTool::Select | ActiveTool::Highlight) {
-            tab.ensure_page_text_layer(page_index, self.engine);
+        if matches!(
+            self.active_tool,
+            ActiveTool::Select | ActiveTool::Highlight | ActiveTool::StickyNote
+        ) {
+            tab.request_page_text(page_index, &self.workers, true);
             let over_annot = tab
                 .annotations
                 .items
@@ -1010,11 +1177,93 @@ impl SuperPdfApp {
             ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
         }
 
+        let handle_tolerance_pt =
+            HANDLE_GRAB_RADIUS_PX * page_dim.width_pt / page_rect.width().max(1.0);
+        let selected_handle = (self.active_tool == ActiveTool::Select)
+            .then(|| tab.annotations.selected())
+            .flatten()
+            .filter(|a| a.page_index == page_index)
+            .and_then(|a| a.handle_at(pt_x, pt_y, handle_tolerance_pt));
+        if let Some(handle) = selected_handle {
+            ctx.set_cursor_icon(match handle {
+                AnnotHandle::Corner(0) | AnnotHandle::Corner(3) => egui::CursorIcon::ResizeNwSe,
+                AnnotHandle::Corner(_) => egui::CursorIcon::ResizeNeSw,
+                _ => egui::CursorIcon::Grab,
+            });
+        }
+
+        // Annotation sous le curseur : un dessin déjà sélectionné se saisit partout dans son cadre.
+        let selected_id = tab.annotations.selected_id;
+        let annotation_under_cursor = tab
+            .annotations
+            .items
+            .iter()
+            .rev()
+            .find(|a| {
+                a.page_index == page_index
+                    && (a.hit_test(pt_x, pt_y)
+                        || (selected_id == Some(a.id) && a.rect.contains_pt(pt_x, pt_y, 0.0)))
+            })
+            .map(|a| a.id);
+
         // --- CAS 1 : OUTIL SÉLECTION (V) OU SURLIGNER (H) ---
-        if matches!(self.active_tool, ActiveTool::Select | ActiveTool::Highlight) {
+        if matches!(
+            self.active_tool,
+            ActiveTool::Select | ActiveTool::Highlight | ActiveTool::StickyNote
+        ) {
+            if self.active_tool == ActiveTool::Select {
+                // Double-clic sur un bloc de texte ou une note : édition directement sur la page.
+                if double_clicked {
+                    let freetext_id = annotation_under_cursor.filter(|id| {
+                        tab.annotations.items.iter().any(|a| {
+                            a.id == *id
+                                && matches!(
+                                    a.kind,
+                                    AnnotationKind::FreeText { .. }
+                                        | AnnotationKind::StickyNote { .. }
+                                )
+                        })
+                    });
+                    if let Some(id) = freetext_id {
+                        tab.annotations.selected_id = Some(id);
+                        tab.annotations.push_undo_snapshot();
+                        self.annotation_drag = None;
+                        self.editing_freetext_id = Some(id);
+                        self.freetext_focus_pending = true;
+                        return;
+                    }
+                }
+
+                // Clic droit sur une flèche : menu des attributs.
+                if ctx.input(|i| i.pointer.secondary_released()) {
+                    let arrow_id = annotation_under_cursor.filter(|id| {
+                        tab.annotations.items.iter().any(|a| {
+                            a.id == *id
+                                && matches!(
+                                    a.kind,
+                                    AnnotationKind::Shape {
+                                        shape_kind: ShapeKind::ArrowLine { .. },
+                                        ..
+                                    } | AnnotationKind::FreeText { .. }
+                                )
+                        })
+                    });
+                    if let Some(id) = arrow_id {
+                        tab.annotations.selected_id = Some(id);
+                        tab.text_selection.clear();
+                        self.line_context_menu = Some(LineContextMenu {
+                            annotation_id: id,
+                            position: cursor,
+                            opened_on_frame: self.frame_count,
+                        });
+                        return;
+                    }
+                }
+            }
+
             // Double-clic sur un mot : sélectionne le mot entier !
             if double_clicked {
-                tab.ensure_page_text_layer(page_index, self.engine);
+                tab.request_page_text(page_index, &self.workers, true);
                 if let Some(layer) = tab.text_layers.get(page_index) {
                     if let Some((s, e, txt, boxes)) = layer.select_word_at_point(pt_x, pt_y) {
                         tab.text_selection.page_index = Some(page_index);
@@ -1029,20 +1278,24 @@ impl SuperPdfApp {
             }
 
             if primary_pressed {
-                // 1a. Vérifier d'abord si l'utilisateur clique sur une annotation existante pour la sélectionner / déplacer
+                // 1a. Poignée de l'annotation sélectionnée, sinon annotation sous le curseur
                 if self.active_tool == ActiveTool::Select && !alt_held {
-                    if let Some(hit_id) = tab
-                        .annotations
-                        .items
-                        .iter()
-                        .rev()
-                        .find(|a| a.page_index == page_index && a.hit_test(pt_x, pt_y))
-                        .map(|a| a.id)
-                    {
-                        tab.annotations.selected_id = Some(hit_id);
-                        tab.annotations.push_undo_snapshot();
-                        self.dragging_annotation_id = Some(hit_id);
-                        self.last_drag_pt = Some((pt_x, pt_y));
+                    let grabbed = selected_handle
+                        .map(|handle| (tab.annotations.selected_id, handle))
+                        .or_else(|| {
+                            annotation_under_cursor.map(|id| (Some(id), AnnotHandle::Body))
+                        });
+                    if let Some((Some(id), handle)) = grabbed {
+                        tab.annotations.selected_id = Some(id);
+                        if let Some(original) = tab.annotations.selected().cloned() {
+                            self.annotation_drag = Some(AnnotationDrag {
+                                id,
+                                handle,
+                                grab_pt: (pt_x, pt_y),
+                                original,
+                                has_moved: false,
+                            });
+                        }
                         tab.text_selection.clear();
                         return;
                     }
@@ -1050,8 +1303,8 @@ impl SuperPdfApp {
 
                 // 1b. Sinon, démarrer une sélection de texte (Flux Curseur I par défaut, ou Rectangle si Alt maintenu)
                 tab.annotations.selected_id = None;
-                self.dragging_annotation_id = None;
-                tab.ensure_page_text_layer(page_index, self.engine);
+                self.annotation_drag = None;
+                tab.request_page_text(page_index, &self.workers, true);
                 tab.text_selection.page_index = Some(page_index);
                 tab.text_selection.drag_start_pt = Some((pt_x, pt_y));
                 tab.text_selection.drag_current_pt = Some((pt_x, pt_y));
@@ -1071,20 +1324,25 @@ impl SuperPdfApp {
             }
 
             if primary_down {
-                // Déplacement en direct d'une annotation sélectionnée
-                if let (Some(drag_id), Some((lx, ly))) =
-                    (self.dragging_annotation_id, self.last_drag_pt)
-                {
-                    let dx = pt_x - lx;
-                    let dy = pt_y - ly;
-                    if dx.abs() > 0.2 || dy.abs() > 0.2 {
+                // Déplacement ou redimensionnement en direct de l'annotation saisie
+                if let Some(drag) = &mut self.annotation_drag {
+                    let dist = (pt_x - drag.grab_pt.0).hypot(pt_y - drag.grab_pt.1);
+                    if drag.has_moved || dist > 0.5 {
+                        if !drag.has_moved {
+                            drag.has_moved = true;
+                            tab.annotations.push_undo_snapshot();
+                        }
                         if let Some(annot) =
-                            tab.annotations.items.iter_mut().find(|a| a.id == drag_id)
+                            tab.annotations.items.iter_mut().find(|a| a.id == drag.id)
                         {
-                            annot.translate(dx, dy);
+                            annot.apply_handle_drag(
+                                &drag.original,
+                                drag.handle,
+                                drag.grab_pt,
+                                (pt_x, pt_y),
+                            );
                             tab.is_modified = true;
                         }
-                        self.last_drag_pt = Some((pt_x, pt_y));
                     }
                     return;
                 }
@@ -1124,8 +1382,31 @@ impl SuperPdfApp {
             }
 
             if primary_released {
-                self.dragging_annotation_id = None;
-                self.last_drag_pt = None;
+                self.annotation_drag = None;
+
+                // Outil Note : la note s'attache à la sélection, ou au mot cliqué.
+                if self.active_tool == ActiveTool::StickyNote {
+                    if !tab.text_selection.has_selection() {
+                        if let Some(layer) = tab.text_layers.get(page_index) {
+                            if let Some((_, _, txt, boxes)) = layer.select_word_at_point(pt_x, pt_y) {
+                                tab.text_selection.selected_text = txt;
+                                tab.text_selection.highlight_boxes = boxes;
+                            }
+                        }
+                    }
+                    let quads = std::mem::take(&mut tab.text_selection.highlight_boxes);
+                    tab.text_selection.clear();
+                    if !quads.is_empty() {
+                        let color = tab.annotations.active_color_rgb;
+                        let note = PdfAnnotation::new_text_note(page_index, quads, color, page_dim);
+                        let new_id = tab.annotations.add_annotation(note);
+                        tab.is_modified = true;
+                        self.editing_freetext_id = Some(new_id);
+                        self.freetext_focus_pending = true;
+                        self.freetext_awaiting_opening_release = true;
+                        self.active_tool = ActiveTool::Select;
+                    }
+                }
 
                 // Si l'outil actif est Surligner (H) et qu'une sélection vient d'être faite, créer l'annotation /Highlight ISO 32000 !
                 if self.active_tool == ActiveTool::Highlight && tab.text_selection.has_selection() {
@@ -1148,47 +1429,35 @@ impl SuperPdfApp {
             return;
         }
 
-        // --- CAS 2 : OUTIL BLOC DE TEXTE (/FreeText - Touche T) OU NOTE (/Text - Touche N) ---
-        if matches!(self.active_tool, ActiveTool::FreeText | ActiveTool::StickyNote) {
+        // --- CAS 2 : OUTIL BLOC DE TEXTE (/FreeText - Touche T) ---
+        if self.active_tool == ActiveTool::FreeText {
             if primary_pressed {
+                let rect = PdfTopDownRect {
+                    x_min: pt_x,
+                    y_min: pt_y,
+                    x_max: (pt_x + 185.0).min(page_dim.width_pt - 10.0),
+                    y_max: (pt_y + 48.0).min(page_dim.height_pt - 10.0),
+                    angle_deg: 0.0,
+                };
                 let color = tab.annotations.active_color_rgb;
-                if self.active_tool == ActiveTool::FreeText {
-                    let rect = PdfTopDownRect {
-                        x_min: pt_x,
-                        y_min: pt_y,
-                        x_max: (pt_x + 185.0).min(page_dim.width_pt - 10.0),
-                        y_max: (pt_y + 48.0).min(page_dim.height_pt - 10.0),
-                        angle_deg: 0.0,
-                    };
-                    tab.annotations.add_annotation(PdfAnnotation {
-                        id: 0,
-                        page_index,
-                        rect,
-                        color_rgb: color,
-                        kind: AnnotationKind::FreeText {
-                            text: "Nouveau bloc texte ISO 32000".to_string(),
-                            font_size: 11.5,
-                        },
-                    });
-                } else {
-                    let rect = PdfTopDownRect {
-                        x_min: pt_x,
-                        y_min: pt_y,
-                        x_max: (pt_x + 175.0).min(page_dim.width_pt - 10.0),
-                        y_max: (pt_y + 46.0).min(page_dim.height_pt - 10.0),
-                        angle_deg: 0.0,
-                    };
-                    tab.annotations.add_annotation(PdfAnnotation {
-                        id: 0,
-                        page_index,
-                        rect,
-                        color_rgb: color,
-                        kind: AnnotationKind::StickyNote {
-                            comment: "Nouvelle note PDF".to_string(),
-                            is_popup_open: true,
-                        },
-                    });
-                }
+                let (fill_rgb, border_rgb) = self
+                    .freetext_style
+                    .unwrap_or((Some(FREETEXT_DEFAULT_FILL), Some(color)));
+                let new_id = tab.annotations.add_annotation(PdfAnnotation {
+                    id: 0,
+                    page_index,
+                    rect,
+                    color_rgb: color,
+                    kind: AnnotationKind::FreeText {
+                        text: String::new(),
+                        font_size: 11.5,
+                        fill_rgb,
+                        border_rgb,
+                    },
+                });
+                self.editing_freetext_id = Some(new_id);
+                self.freetext_focus_pending = true;
+                self.freetext_awaiting_opening_release = true;
                 tab.is_modified = true;
                 self.active_tool = ActiveTool::Select;
             }
@@ -1216,7 +1485,27 @@ impl SuperPdfApp {
             if primary_released && tab.annotations.active_draft_page == Some(page_index) {
                 let pts = std::mem::take(&mut tab.annotations.active_draft_points);
                 tab.annotations.active_draft_page = None;
-                if pts.len() >= 2 {
+
+                // Un trait enchaîné rapidement complète le dessin précédent (signature).
+                let continued_ink = (self.active_tool == ActiveTool::Ink && pts.len() >= 2)
+                    .then_some(self.last_ink_stroke)
+                    .flatten()
+                    .filter(|(_, at)| at.elapsed() < INK_STROKE_GROUPING)
+                    .map(|(id, _)| id)
+                    .filter(|id| {
+                        tab.annotations
+                            .items
+                            .iter()
+                            .any(|a| a.id == *id && a.page_index == page_index)
+                    });
+                if let Some(id) = continued_ink {
+                    tab.annotations.push_undo_snapshot();
+                    if let Some(annot) = tab.annotations.items.iter_mut().find(|a| a.id == id) {
+                        annot.append_ink_stroke(pts);
+                    }
+                    self.last_ink_stroke = Some((id, Instant::now()));
+                    tab.is_modified = true;
+                } else if pts.len() >= 2 {
                     let start = pts[0];
                     let end = *pts.last().unwrap();
                     let min_x = pts.iter().map(|p| p.0).fold(f32::INFINITY, f32::min);
@@ -1240,7 +1529,7 @@ impl SuperPdfApp {
                             shape_kind: if alt_held {
                                 ShapeKind::Rectangle
                             } else {
-                                ShapeKind::ArrowLine
+                                ShapeKind::DEFAULT_ARROW
                             },
                             start_pt: start,
                             end_pt: end,
@@ -1252,14 +1541,25 @@ impl SuperPdfApp {
                         },
                         _ => unreachable!(),
                     };
-                    tab.annotations.add_annotation(PdfAnnotation {
+                    let is_ink = matches!(kind, AnnotationKind::Ink { .. });
+                    let is_shape = matches!(kind, AnnotationKind::Shape { .. });
+                    let mut annotation = PdfAnnotation {
                         id: 0,
                         page_index,
                         rect,
                         color_rgb: color,
                         kind,
-                    });
+                    };
+                    annotation.refresh_rect_from_geometry();
+                    let new_id = tab.annotations.add_annotation(annotation);
                     tab.is_modified = true;
+                    if is_ink {
+                        self.last_ink_stroke = Some((new_id, Instant::now()));
+                    }
+                    if is_shape {
+                        // La forme posée est immédiatement ajustable avec ses poignées.
+                        self.active_tool = ActiveTool::Select;
+                    }
                 }
             }
         }
@@ -1269,13 +1569,20 @@ impl SuperPdfApp {
 impl eframe::App for SuperPdfApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         self.frame_count += 1;
+        self.text_field_focused_prev = std::mem::take(&mut self.text_field_focused_now);
         let now = Instant::now();
         let dt = now.duration_since(self.last_frame_instant).as_secs_f32();
         self.last_frame_instant = now;
-        if dt > 0.0001 {
-            let instant_fps = (1.0 / dt).clamp(1.0, 240.0);
-            self.fps_smoothed = self.fps_smoothed * 0.88 + instant_fps * 0.12;
+        self.recent_frames.push_back((now, dt));
+        while self
+            .recent_frames
+            .front()
+            .is_some_and(|(t, _)| now.duration_since(*t) > FRAME_STATS_WINDOW)
+        {
+            self.recent_frames.pop_front();
         }
+
+        self.process_worker_events(ctx);
 
         if self.frame_count <= 3 || self.frame_count % 15 == 0 {
             let (ws_bytes, _) = query_process_memory_bytes();
@@ -1327,17 +1634,13 @@ impl eframe::App for SuperPdfApp {
                     } else if self.active_tool == ActiveTool::Pan {
                         ctx.set_cursor_icon(egui::CursorIcon::Grab);
                     }
-                    // Phase 2 : Ordonnanceur OCR Mode Éco Tâche de fond au repos (1 page / tick sans bloquer les 60 FPS)
-                    if tab.viewport.inertia_velocity.length_sq() < 0.1
-                        && (self.frame_count == 2 || self.frame_count % 6 == 0)
-                    {
+                    // Phase 2/3 : Éco uniquement au repos, Turbo en continu. Le calcul se fait sur le thread OCR.
+                    let is_idle = tab.viewport.inertia_velocity.length_sq() < 0.1;
+                    if is_idle || tab.ocr.mode == crate::ocr_engine::OcrSpeedMode::TurboSearch {
                         let vis_p = tab
                             .viewport
                             .current_page_index(canvas_rect.size(), &tab.page_dimensions);
-                        let added = tab.step_eco_ocr_background(vis_p, self.engine);
-                        if added > 0 && self.search_bar.is_open && !self.search_bar.query.trim().is_empty() {
-                            self.search_bar.execute_search(&tab.text_layers);
-                        }
+                        tab.pump_ocr(vis_p, &self.workers);
                     }
                 }
 
@@ -1360,8 +1663,19 @@ impl eframe::App for SuperPdfApp {
                         Vec::new()
                     };
 
+                // Le texte des pages à l'écran est prêt avant le premier clic (sélection, notes).
+                if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                    for (p_idx, _) in &visible_pages_info {
+                        tab.request_page_text(*p_idx, &self.workers, false);
+                    }
+                }
+
                 for (p_idx, p_rect) in &visible_pages_info {
                     self.handle_page_canvas_interactions(ctx, *p_idx, *p_rect);
+                }
+                // Un relâchement hors de toute page doit aussi terminer le geste.
+                if ctx.input(|i| i.pointer.primary_released()) {
+                    self.annotation_drag = None;
                 }
 
                 let painter = ui.painter_at(canvas_rect);
@@ -1384,12 +1698,195 @@ impl eframe::App for SuperPdfApp {
                 } else if let Some(tab) = self.tabs.get(self.active_tab) {
                     let viewport_size = canvas_rect.size();
                     let (_, _, total_h) = tab.viewport.compute_layout(&tab.page_dimensions);
-                    let bucket = Self::zoom_bucket(tab.viewport.zoom);
-                    let bucket_zoom = (bucket as f32) / 20.0;
-
-                    if tab.viewport.inertia_velocity.length_sq() < 0.1 {
-                        self.texture_cache.prune_stale_zoom_buckets(tab.id, bucket);
+                    // Le rendu suit les pixels physiques de l'écran (échelle Windows comprise), et n'est
+                    // recalculé qu'une fois le geste de zoom terminé : l'image existante est étirée entre-temps.
+                    let pixels_per_point = ctx.pixels_per_point();
+                    let live_zoom = tab.viewport.zoom * pixels_per_point;
+                    if (live_zoom - self.observed_zoom).abs() > 1e-4 {
+                        self.observed_zoom = live_zoom;
+                        self.observed_zoom_changed_at = Instant::now();
                     }
+                    if self.render_zoom <= 0.0
+                        || self.observed_zoom_changed_at.elapsed() >= ZOOM_SETTLE_DELAY
+                    {
+                        self.render_zoom = live_zoom;
+                    } else {
+                        ctx.request_repaint_after(ZOOM_SETTLE_DELAY);
+                    }
+                    let device_zoom = self.render_zoom;
+
+                    let page_pixels_at = |page_index: usize, zoom: f32| -> f32 {
+                        let dim = tab.page_dimensions[page_index];
+                        dim.width_pt * dim.height_pt * (BASE_DPI_SCALE * zoom).powi(2)
+                    };
+                    let largest_page_pixels = visible_pages_info
+                        .iter()
+                        .map(|(p, _)| page_pixels_at(*p, device_zoom))
+                        .fold(0.0_f32, f32::max);
+                    let mut use_tiles =
+                        tab.supports_tiled_rendering && largest_page_pixels > TILING_THRESHOLD_PIXELS;
+
+                    // Sans tuiles, les pages visibles doivent tenir ensemble dans le budget :
+                    // sinon elles s'évinceraient mutuellement en boucle.
+                    let budget = self.texture_cache.max_budget_bytes as f32;
+                    let visible_page_budget = budget * VISIBLE_TEXTURE_BUDGET_RATIO;
+                    let visible_bytes: f32 = visible_pages_info
+                        .iter()
+                        .map(|(p, _)| page_pixels_at(*p, device_zoom) * 4.0)
+                        .sum();
+
+                    // Grille de tuiles couvrant la zone visible, plus une rangée de préchargement.
+                    let tile_bucket = Self::zoom_bucket(device_zoom);
+                    let tile_zoom = tile_bucket as f32 / ZOOM_BUCKETS_PER_UNIT;
+                    let tile_scale = BASE_DPI_SCALE * tile_zoom;
+                    let mut page_tiles: Vec<PageTile> = Vec::new();
+                    if use_tiles {
+                        for &(page_index, page_rect) in &visible_pages_info {
+                            let clip = page_rect.intersect(canvas_rect);
+                            if !clip.is_positive() {
+                                continue;
+                            }
+                            let dim = tab.page_dimensions[page_index];
+                            let full_w = (dim.width_pt * tile_scale).round() as i32;
+                            let full_h = (dim.height_pt * tile_scale).round() as i32;
+                            let px_per_screen_point = full_w as f32 / page_rect.width().max(1.0);
+                            let to_tile = |points: f32| {
+                                ((points * px_per_screen_point) / TILE_SIZE_PX as f32).floor() as i32
+                            };
+                            let first_col = to_tile(clip.min.x - page_rect.min.x);
+                            let last_col = to_tile(clip.max.x - page_rect.min.x);
+                            let first_row = to_tile(clip.min.y - page_rect.min.y);
+                            let last_row = to_tile(clip.max.y - page_rect.min.y);
+                            for row in (first_row - 1).max(0)..=(last_row + 1) {
+                                for col in (first_col - 1).max(0)..=(last_col + 1) {
+                                    let (x, y) = (col * TILE_SIZE_PX, row * TILE_SIZE_PX);
+                                    if x >= full_w || y >= full_h {
+                                        continue;
+                                    }
+                                    let region = TileRegion {
+                                        x,
+                                        y,
+                                        width: TILE_SIZE_PX.min(full_w - x),
+                                        height: TILE_SIZE_PX.min(full_h - y),
+                                    };
+                                    let center = page_rect.min
+                                        + Vec2::new(
+                                            (x + region.width / 2) as f32,
+                                            (y + region.height / 2) as f32,
+                                        ) / px_per_screen_point;
+                                    page_tiles.push(PageTile {
+                                        page_index,
+                                        key: PageTextureKey {
+                                            tab_id: tab.id,
+                                            page_index,
+                                            zoom_bucket: tile_bucket,
+                                            tile: Some((col as u32, row as u32)),
+                                        },
+                                        region,
+                                        full_size_px: (full_w as f32, full_h as f32),
+                                        distance_to_center: center.distance(canvas_rect.center()),
+                                        is_visible: (first_row..=last_row).contains(&row)
+                                            && (first_col..=last_col).contains(&col),
+                                    });
+                                }
+                            }
+                        }
+                        let tile_bytes = (TILE_SIZE_PX * TILE_SIZE_PX * 4) as f32;
+                        let tile_budget = budget * TILE_BUDGET_RATIO;
+                        if page_tiles.len() as f32 * tile_bytes > tile_budget {
+                            page_tiles.retain(|tile| tile.is_visible);
+                        }
+                        if page_tiles.len() as f32 * tile_bytes > tile_budget {
+                            page_tiles.clear();
+                            use_tiles = false;
+                        }
+                        page_tiles.sort_by(|a, b| a.distance_to_center.total_cmp(&b.distance_to_center));
+                    }
+
+                    let page_zoom = if use_tiles {
+                        device_zoom * (TILED_BASE_PIXELS / largest_page_pixels.max(1.0)).sqrt()
+                    } else {
+                        device_zoom * (visible_page_budget / visible_bytes.max(1.0)).sqrt().min(1.0)
+                    };
+                    let bucket = Self::zoom_bucket(page_zoom);
+                    let bucket_zoom = (bucket as f32) / ZOOM_BUCKETS_PER_UNIT;
+
+                    let all_ready = visible_pages_info.iter().all(|(p, _)| {
+                        self.texture_cache.contains_key(&PageTextureKey {
+                            tab_id: tab.id,
+                            page_index: *p,
+                            zoom_bucket: bucket,
+                            tile: None,
+                        })
+                    }) && page_tiles
+                        .iter()
+                        .filter(|tile| tile.is_visible)
+                        .all(|tile| self.texture_cache.contains_key(&tile.key));
+                    if all_ready && tab.viewport.inertia_velocity.length_sq() < 0.1 {
+                        self.texture_cache.prune_stale_zoom_buckets(
+                            tab.id,
+                            bucket,
+                            use_tiles.then_some(tile_bucket),
+                        );
+                    }
+
+                    // Pages à rendre : visibles d'abord (les plus centrales en tête), puis les voisines.
+                    let make_job = |page_index: usize| RenderJob {
+                        key: PageTextureKey {
+                            tab_id: tab.id,
+                            page_index,
+                            zoom_bucket: bucket,
+                            tile: None,
+                        },
+                        path: tab.path.clone(),
+                        width_px: (tab.page_dimensions[page_index].width_pt * BASE_DPI_SCALE * bucket_zoom)
+                            .round() as i32,
+                        height_px: (tab.page_dimensions[page_index].height_pt * BASE_DPI_SCALE * bucket_zoom)
+                            .round() as i32,
+                        tile: None,
+                        tile_scale: 0.0,
+                    };
+                    let mut wanted_pages: Vec<(usize, f32)> = visible_pages_info
+                        .iter()
+                        .map(|(p, r)| (*p, (r.center().y - canvas_rect.center().y).abs()))
+                        .collect();
+                    wanted_pages.sort_by(|a, b| a.1.total_cmp(&b.1));
+                    let mut wanted: Vec<usize> = wanted_pages.into_iter().map(|(p, _)| p).collect();
+                    if let (Some(first), Some(last)) = (
+                        visible_pages_info.first().map(|(p, _)| *p),
+                        visible_pages_info.last().map(|(p, _)| *p),
+                    ) {
+                        let shown_bytes: f32 = visible_pages_info
+                            .iter()
+                            .map(|(p, _)| page_pixels_at(*p, bucket_zoom) * 4.0)
+                            .sum();
+                        let preload_bytes: f32 = [first.checked_sub(1), Some(last + 1)]
+                            .into_iter()
+                            .flatten()
+                            .filter(|p| *p < tab.page_dimensions.len())
+                            .map(|p| page_pixels_at(p, bucket_zoom) * 4.0)
+                            .sum();
+                        if shown_bytes + preload_bytes <= visible_page_budget {
+                            wanted.extend(first.checked_sub(1));
+                            if last + 1 < tab.page_dimensions.len() {
+                                wanted.push(last + 1);
+                            }
+                        }
+                    }
+                    let mut render_jobs: Vec<RenderJob> = wanted.into_iter().map(make_job).collect();
+                    render_jobs.extend(page_tiles.iter().map(|tile| RenderJob {
+                        key: tile.key,
+                        path: tab.path.clone(),
+                        width_px: tile.region.width,
+                        height_px: tile.region.height,
+                        tile: Some(tile.region),
+                        tile_scale,
+                    }));
+                    render_jobs.retain(|job| {
+                        !self.texture_cache.contains_key(&job.key)
+                            && !self.failed_renders.contains(&job.key)
+                    });
+                    self.workers.set_render_jobs(render_jobs);
 
                     for &(page_index, page_rect) in &visible_pages_info {
                         // Ombre portée sous la feuille
@@ -1416,18 +1913,21 @@ impl eframe::App for SuperPdfApp {
                             .iter()
                             .filter(|a| a.page_index == page_index)
                         {
-                            if let AnnotationKind::Highlight { quads } = &annot.kind {
-                                for q in quads {
-                                    mult_highlights.push(MultiplicativeHighlightQuad {
-                                        norm_rect: [
-                                            (q.x_min - 1.0) * inv_w,
-                                            (q.y_min - 1.0) * inv_h,
-                                            (q.x_max + 1.0) * inv_w,
-                                            (q.y_max + 1.0) * inv_h,
-                                        ],
-                                        color_rgb: annot.color_rgb,
-                                    });
-                                }
+                            let tinted_quads: &[PdfTopDownRect] = match &annot.kind {
+                                AnnotationKind::Highlight { quads } => quads,
+                                AnnotationKind::StickyNote { anchor_quads, .. } => anchor_quads,
+                                _ => &[],
+                            };
+                            for q in tinted_quads {
+                                mult_highlights.push(MultiplicativeHighlightQuad {
+                                    norm_rect: [
+                                        (q.x_min - 1.0) * inv_w,
+                                        (q.y_min - 1.0) * inv_h,
+                                        (q.x_max + 1.0) * inv_w,
+                                        (q.y_max + 1.0) * inv_h,
+                                    ],
+                                    color_rgb: annot.color_rgb,
+                                });
                             }
                         }
 
@@ -1481,37 +1981,56 @@ impl eframe::App for SuperPdfApp {
                             tab_id: tab.id,
                             page_index,
                             zoom_bucket: bucket,
+                            tile: None,
                         };
 
-                        if !self.texture_cache.contains_key(&key) {
-                            if let Some(doc) = &tab.document {
-                                let target_w = (page_dim.width_pt * BASE_DPI_SCALE * bucket_zoom)
-                                    .round() as i32;
-                                let target_h = (page_dim.height_pt * BASE_DPI_SCALE * bucket_zoom)
-                                    .round() as i32;
+                        // Aligné sur les pixels physiques : une image décalée d'un demi-pixel serait floue.
+                        let snap = |value: f32| (value * pixels_per_point).round() / pixels_per_point;
+                        let image_rect = Rect::from_min_size(
+                            Pos2::new(snap(page_rect.min.x), snap(page_rect.min.y)),
+                            page_rect.size(),
+                        );
+                        let full_uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
 
-                                if let Ok(color_img) =
-                                    doc.render_page(page_index, target_w, target_h)
-                                {
-                                    self.texture_cache.insert_color_image(
-                                        ctx,
-                                        key,
-                                        color_img,
-                                        &mult_highlights,
-                                    );
-                                }
-                            }
+                        // En attendant le rendu exact, on étire le palier de zoom le plus proche déjà en cache.
+                        let draw_key = if self.texture_cache.contains_key(&key) {
+                            Some(key)
+                        } else {
+                            self.texture_cache
+                                .closest_cached_key(tab.id, page_index, bucket)
+                        };
+                        if let Some(tex) = draw_key.and_then(|k| {
+                            self.texture_cache.get_with_highlights(&k, &mult_highlights)
+                        }) {
+                            painter.image(tex.id(), image_rect, full_uv, Color32::WHITE);
                         }
 
-                        if let Some(tex) =
-                            self.texture_cache.get_with_highlights(&key, &mult_highlights)
-                        {
-                            painter.image(
-                                tex.id(),
-                                page_rect,
-                                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                                Color32::WHITE,
+                        for tile in page_tiles.iter().filter(|tile| tile.page_index == page_index) {
+                            let (full_w, full_h) = tile.full_size_px;
+                            let normalized = [
+                                tile.region.x as f32 / full_w,
+                                tile.region.y as f32 / full_h,
+                                (tile.region.x + tile.region.width) as f32 / full_w,
+                                (tile.region.y + tile.region.height) as f32 / full_h,
+                            ];
+                            let tile_rect = Rect::from_min_max(
+                                Pos2::new(
+                                    snap(image_rect.min.x + normalized[0] * image_rect.width()),
+                                    snap(image_rect.min.y + normalized[1] * image_rect.height()),
+                                ),
+                                Pos2::new(
+                                    snap(image_rect.min.x + normalized[2] * image_rect.width()),
+                                    snap(image_rect.min.y + normalized[3] * image_rect.height()),
+                                ),
                             );
+                            let tile_highlights =
+                                MultiplicativeHighlightQuad::remap_to_region(&mult_highlights, normalized);
+                            if let Some(tex) = self
+                                .texture_cache
+                                .get_with_highlights(&tile.key, &tile_highlights)
+                            {
+                                painter.image(tex.id(), tile_rect, full_uv, Color32::WHITE);
+                            }
                         }
 
                         // --- 1. DESSIN DES ANNOTATIONS ISO 32000 SUR LA PAGE (JALON 5) ---
@@ -1519,10 +2038,11 @@ impl eframe::App for SuperPdfApp {
                             &painter,
                             &tab.annotations.items,
                             tab.annotations.selected_id,
+                            self.editing_freetext_id,
                             page_index,
                             page_rect,
                             page_dim,
-                            tab.viewport.zoom,
+                            ctx.input(|i| i.pointer.hover_pos()),
                         );
 
                         // Tracé temporaire en cours de dessin au Trackpad / Souris
@@ -1710,6 +2230,9 @@ impl eframe::App for SuperPdfApp {
                     );
                 }
 
+                self.render_freetext_editor(ctx, &visible_pages_info);
+                self.render_line_context_menu(ctx);
+
                 // Barre de recherche flottante `Ctrl+F`
                 if self.search_bar.is_open {
                     self.render_floating_search_bar(ctx, canvas_rect);
@@ -1727,7 +2250,11 @@ impl eframe::App for SuperPdfApp {
             });
 
         if self.automation.screenshot_output.is_some() {
-            if self.frame_count < 5 {
+            let waiting_for_pages = self.workers.is_render_busy()
+                && self.last_frame_instant.duration_since(self.app_started) < Duration::from_secs(20);
+            let delay_running = self.app_started.elapsed()
+                < Duration::from_millis(self.automation.screenshot_delay_ms);
+            if self.frame_count < 5 || waiting_for_pages || delay_running {
                 ctx.request_repaint();
             } else if !self.screenshot_requested {
                 self.screenshot_requested = true;
@@ -1739,15 +2266,57 @@ impl eframe::App for SuperPdfApp {
 }
 
 impl SuperPdfApp {
+    /// Intègre les résultats des threads d'arrière-plan (textures, texte, OCR).
+    fn process_worker_events(&mut self, ctx: &Context) {
+        while let Some(event) = self.workers.try_next_event() {
+            match event {
+                WorkerEvent::Rendered { key, image } => {
+                    if self.tabs.iter().any(|t| t.id == key.tab_id) {
+                        self.texture_cache.insert_color_image(ctx, key, image, &[]);
+                    }
+                }
+                WorkerEvent::RenderFailed { key } => {
+                    self.failed_renders.insert(key);
+                }
+                WorkerEvent::TextLayer { tab_id, layer } => {
+                    if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
+                        tab.apply_text_layer(layer);
+                        self.search_refresh_pending = true;
+                    }
+                }
+                WorkerEvent::OcrPage(outcome) => {
+                    if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == outcome.tab_id) {
+                        if tab.apply_ocr_outcome(outcome) {
+                            self.search_refresh_pending = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        if self.search_refresh_pending && self.search_bar.is_open {
+            if self.last_search_refresh.elapsed() >= SEARCH_REFRESH_INTERVAL {
+                if let Some(tab) = self.tabs.get(self.active_tab) {
+                    self.search_bar.refresh_keeping_current(&tab.text_layers);
+                }
+                self.search_refresh_pending = false;
+                self.last_search_refresh = Instant::now();
+            } else {
+                ctx.request_repaint_after(SEARCH_REFRESH_INTERVAL);
+            }
+        }
+    }
+
     /// Dessine toutes les annotations ISO 32000 d'une page sur le canevas GPU
     fn paint_page_annotations(
         painter: &egui::Painter,
         annotations: &[PdfAnnotation],
         selected_id: Option<u64>,
+        editing_id: Option<u64>,
         page_index: usize,
         page_rect: Rect,
         page_dim: crate::pdf_engine::PageDimensions,
-        zoom: f32,
+        hover_pos: Option<Pos2>,
     ) {
         let sx = page_rect.width() / page_dim.width_pt.max(1.0);
         let sy = page_rect.height() / page_dim.height_pt.max(1.0);
@@ -1765,41 +2334,40 @@ impl SuperPdfApp {
                     // Rendu via mélange multiplicatif (/BM /Multiply) directement dans la texture de page :
                     // l'encre noire du texte traverse le surligneur à 100 % en noir pur !
                 }
-                AnnotationKind::FreeText { text, font_size } => {
-                    // Carte de texte visible directement sur la page (style Adobe Acrobat FreeText)
-                    painter.rect_filled(
-                        screen_rect,
-                        CornerRadius::same(4),
-                        Color32::from_rgba_unmultiplied(255, 253, 242, 242),
-                    );
-                    painter.rect_stroke(
-                        screen_rect,
-                        CornerRadius::same(4),
-                        Stroke::new(1.5_f32, stroke_col),
-                        StrokeKind::Outside,
-                    );
-                    // Bandeau d'en-tête discret
-                    let header_rect = Rect::from_min_size(
-                        screen_rect.min,
-                        Vec2::new(screen_rect.width(), (16.0 * zoom).clamp(13.0, 22.0)),
-                    );
-                    painter.rect_filled(header_rect, CornerRadius::same(3), stroke_col);
-                    painter.text(
-                        Pos2::new(header_rect.min.x + 6.0, header_rect.center().y),
-                        Align2::LEFT_CENTER,
-                        "🅰 /FreeText (ISO 32000)",
-                        FontId::proportional((9.5 * zoom).clamp(8.5, 13.0)),
-                        Color32::WHITE,
-                    );
-
-                    let scaled_font = (font_size * zoom * 1.15).clamp(9.0, 24.0);
-                    painter.text(
-                        Pos2::new(screen_rect.min.x + 7.0, header_rect.max.y + 4.0),
-                        Align2::LEFT_TOP,
-                        text,
-                        FontId::proportional(scaled_font),
-                        Color32::from_rgb(20, 24, 34),
-                    );
+                AnnotationKind::FreeText {
+                    text,
+                    font_size,
+                    fill_rgb,
+                    border_rgb,
+                } => {
+                    if let Some((r, g, b)) = fill_rgb {
+                        painter.rect_filled(
+                            screen_rect,
+                            CornerRadius::ZERO,
+                            Color32::from_rgb(*r, *g, *b),
+                        );
+                    }
+                    if let Some((r, g, b)) = border_rgb {
+                        painter.rect_stroke(
+                            screen_rect,
+                            CornerRadius::ZERO,
+                            Stroke::new(1.5 * sy, Color32::from_rgb(*r, *g, *b)),
+                            StrokeKind::Inside,
+                        );
+                    }
+                    if editing_id != Some(annot.id) {
+                        let galley = painter.layout(
+                            text.clone(),
+                            FontId::proportional(font_size * sy),
+                            Color32::from_rgb(20, 24, 34),
+                            (screen_rect.width() - 12.0 * sx).max(10.0),
+                        );
+                        painter.with_clip_rect(screen_rect).galley(
+                            screen_rect.min + Vec2::new(6.0 * sx, 4.0 * sy),
+                            galley,
+                            Color32::from_rgb(20, 24, 34),
+                        );
+                    }
                 }
                 AnnotationKind::Ink { strokes, thickness } => {
                     for stroke in strokes {
@@ -1808,7 +2376,7 @@ impl SuperPdfApp {
                                 stroke.iter().copied().map(to_screen_pos).collect();
                             painter.add(egui::Shape::line(
                                 pts,
-                                Stroke::new((*thickness * zoom).clamp(1.5, 8.0), stroke_col),
+                                Stroke::new((*thickness * sy).max(0.8), stroke_col),
                             ));
                         }
                     }
@@ -1831,59 +2399,106 @@ impl SuperPdfApp {
                             StrokeKind::Outside,
                         );
                     }
-                    ShapeKind::ArrowLine => {
-                        let p1 = to_screen_pos(*start_pt);
-                        let p2 = to_screen_pos(*end_pt);
-                        painter.line_segment([p1, p2], Stroke::new(2.2_f32, stroke_col));
-
-                        // Pointe de flèche vectorielle (/ClosedArrow)
-                        let dir = (p2 - p1).normalized();
-                        if dir.length_sq() > 0.1 {
-                            let perp = Vec2::new(-dir.y, dir.x);
-                            let tip_len = (11.0 * zoom).clamp(8.0, 18.0);
-                            let tip_w = (5.5 * zoom).clamp(4.0, 9.0);
-                            let base = p2 - dir * tip_len;
-                            painter.add(egui::Shape::convex_polygon(
-                                vec![p2, base + perp * tip_w, base - perp * tip_w],
-                                stroke_col,
-                                Stroke::NONE,
-                            ));
+                    ShapeKind::ArrowLine {
+                        start_head,
+                        end_head,
+                    } => {
+                        let dir_to_end = unit_direction(*start_pt, *end_pt);
+                        let dir_to_start = (-dir_to_end.0, -dir_to_end.1);
+                        let stroke = Stroke::new(ARROW_LINE_WIDTH * sy, stroke_col);
+                        painter.line_segment(
+                            [
+                                to_screen_pos(line_stop_point(*start_pt, dir_to_start, *start_head)),
+                                to_screen_pos(line_stop_point(*end_pt, dir_to_end, *end_head)),
+                            ],
+                            stroke,
+                        );
+                        let endings = [
+                            (*start_head, *start_pt, dir_to_start),
+                            (*end_head, *end_pt, dir_to_end),
+                        ];
+                        for (ending, tip, dir) in endings {
+                            let Some(outline) = line_ending_outline(ending, tip, dir) else {
+                                continue;
+                            };
+                            let points: Vec<Pos2> =
+                                outline.points.iter().copied().map(to_screen_pos).collect();
+                            if outline.filled {
+                                painter.add(egui::Shape::convex_polygon(
+                                    points,
+                                    stroke_col,
+                                    Stroke::NONE,
+                                ));
+                            } else {
+                                painter.add(egui::Shape::line(points, stroke));
+                            }
                         }
                     }
                 },
                 AnnotationKind::StickyNote {
                     comment,
                     is_popup_open,
+                    anchor_quads,
                 } => {
+                    let is_editing = editing_id == Some(annot.id);
+                    let anchor_hovered = hover_pos.is_some_and(|p| {
+                        anchor_quads
+                            .iter()
+                            .any(|q| q.to_screen_rect(page_rect, page_dim).expand(2.0).contains(p))
+                    });
+                    if let Some(last) = anchor_quads.last() {
+                        let end = last.to_screen_rect(page_rect, page_dim);
+                        painter.text(
+                            Pos2::new(end.max.x + 2.0, end.min.y),
+                            Align2::LEFT_BOTTOM,
+                            "💬",
+                            FontId::proportional((11.0 * sy).clamp(10.0, 18.0)),
+                            stroke_col,
+                        );
+                    }
+                    let bubble_open = is_selected
+                        || is_editing
+                        || anchor_hovered
+                        || (anchor_quads.is_empty() && *is_popup_open);
+                    if !bubble_open {
+                        continue;
+                    }
+
+                    if let Some(first) = anchor_quads.first() {
+                        let anchor = first.to_screen_rect(page_rect, page_dim);
+                        let start = anchor.center();
+                        painter.line_segment(
+                            [start, screen_rect.clamp(start)],
+                            Stroke::new(1.0_f32, stroke_col),
+                        );
+                    }
                     painter.rect_filled(
                         screen_rect,
-                        CornerRadius::same(6),
-                        Color32::from_rgba_unmultiplied(255, 246, 205, 245),
+                        CornerRadius::same(4),
+                        Color32::from_rgb(255, 248, 214),
                     );
                     painter.rect_stroke(
                         screen_rect,
-                        CornerRadius::same(6),
-                        Stroke::new(1.5_f32, stroke_col),
+                        CornerRadius::same(4),
+                        Stroke::new(1.2_f32, stroke_col),
                         StrokeKind::Outside,
                     );
-                    let header_h = (17.0 * zoom).clamp(14.0, 22.0);
-                    let header_r =
-                        Rect::from_min_size(screen_rect.min, Vec2::new(screen_rect.width(), header_h));
-                    painter.rect_filled(header_r, CornerRadius::same(4), stroke_col);
-                    painter.text(
-                        Pos2::new(header_r.min.x + 6.0, header_r.center().y),
-                        Align2::LEFT_CENTER,
-                        "💬 Note /Text",
-                        FontId::proportional((9.5 * zoom).clamp(8.5, 13.0)),
-                        Color32::WHITE,
+                    let header = Rect::from_min_size(
+                        screen_rect.min,
+                        Vec2::new(screen_rect.width(), NOTE_HEADER_HEIGHT_PT * sy),
                     );
-                    if *is_popup_open {
-                        painter.text(
-                            Pos2::new(screen_rect.min.x + 6.0, header_r.max.y + 4.0),
-                            Align2::LEFT_TOP,
-                            comment,
-                            FontId::proportional((10.5 * zoom).clamp(9.0, 16.0)),
-                            Color32::from_rgb(35, 30, 20),
+                    painter.rect_filled(header, CornerRadius::same(3), stroke_col);
+                    if !is_editing {
+                        let galley = painter.layout(
+                            comment.clone(),
+                            FontId::proportional(NOTE_FONT_SIZE_PT * sy),
+                            INLINE_TEXT_COLOR,
+                            (screen_rect.width() - 12.0 * sx).max(10.0),
+                        );
+                        painter.with_clip_rect(screen_rect).galley(
+                            header.left_bottom() + Vec2::new(6.0 * sx, 4.0 * sy),
+                            galley,
+                            INLINE_TEXT_COLOR,
                         );
                     }
                 }
@@ -1936,29 +2551,275 @@ impl SuperPdfApp {
                 }
             }
 
-            // Cadre de sélection et poignées si cette annotation est sélectionnée
+            // Sélection : deux points aux extrémités d'une ligne, cadre et coins pour le reste.
             if is_selected {
-                let sel_box = screen_rect.expand(4.0);
-                painter.rect_stroke(
-                    sel_box,
-                    CornerRadius::same(4),
-                    Stroke::new(1.8_f32, Color32::from_rgb(90, 175, 255)),
-                    StrokeKind::Outside,
-                );
-                let corners = [
-                    sel_box.left_top(),
-                    sel_box.right_top(),
-                    sel_box.left_bottom(),
-                    sel_box.right_bottom(),
-                ];
-                for c in corners {
-                    painter.rect_filled(
-                        Rect::from_center_size(c, Vec2::splat(7.0)),
-                        CornerRadius::same(1),
-                        Color32::from_rgb(90, 175, 255),
+                const HANDLE_COLOR: Color32 = Color32::from_rgb(90, 175, 255);
+                if let Some((start, end)) = annot.line_endpoints() {
+                    for point in [start, end] {
+                        let center = to_screen_pos(point);
+                        painter.circle_filled(center, 6.0, Color32::WHITE);
+                        painter.circle_stroke(center, 6.0, Stroke::new(2.0_f32, HANDLE_COLOR));
+                    }
+                } else {
+                    painter.rect_stroke(
+                        screen_rect,
+                        CornerRadius::same(2),
+                        Stroke::new(1.5_f32, HANDLE_COLOR),
+                        StrokeKind::Outside,
                     );
+                    if !matches!(annot.kind, AnnotationKind::Highlight { .. }) {
+                        for corner in [
+                            screen_rect.left_top(),
+                            screen_rect.right_top(),
+                            screen_rect.left_bottom(),
+                            screen_rect.right_bottom(),
+                        ] {
+                            let square = Rect::from_center_size(corner, Vec2::splat(9.0));
+                            painter.rect_filled(square, CornerRadius::same(1), Color32::WHITE);
+                            painter.rect_stroke(
+                                square,
+                                CornerRadius::same(1),
+                                Stroke::new(1.5_f32, HANDLE_COLOR),
+                                StrokeKind::Outside,
+                            );
+                        }
+                    }
                 }
             }
+        }
+    }
+
+    /// Champ de saisie posé exactement sur le bloc FreeText en cours d'édition.
+    fn render_freetext_editor(&mut self, ctx: &Context, visible_pages: &[(usize, Rect)]) {
+        let Some(editing_id) = self.editing_freetext_id else {
+            return;
+        };
+        // Tant que l'éditeur est ouvert, chaque lettre lui appartient, quel que soit l'état du focus.
+        self.text_field_focused_now = true;
+        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+            return;
+        };
+        let Some(annot) = tab.annotations.items.iter_mut().find(|a| a.id == editing_id) else {
+            self.editing_freetext_id = None;
+            return;
+        };
+        let page_on_screen = visible_pages
+            .iter()
+            .find(|(p, _)| *p == annot.page_index)
+            .map(|(_, r)| *r);
+        let Some(page_rect) = page_on_screen else {
+            return;
+        };
+        let page_dim = tab.page_dimensions[annot.page_index];
+        let screen_rect = annot.rect.to_screen_rect(page_rect, page_dim);
+        let scale_y = page_rect.height() / page_dim.height_pt.max(1.0);
+        let scale_x = page_rect.width() / page_dim.width_pt.max(1.0);
+        let (text, font_size, top_inset) = match &mut annot.kind {
+            AnnotationKind::FreeText { text, font_size, .. } => (text, *font_size, 0.0),
+            AnnotationKind::StickyNote { comment, .. } => {
+                (comment, NOTE_FONT_SIZE_PT, NOTE_HEADER_HEIGHT_PT * scale_y)
+            }
+            _ => {
+                self.editing_freetext_id = None;
+                return;
+            }
+        };
+        let font = FontId::proportional(font_size * scale_y);
+        let editor_rect = Rect::from_min_max(
+            screen_rect.min + Vec2::new(0.0, top_inset),
+            screen_rect.max,
+        );
+        // Un clic dans la barre latérale (couleurs...) ne doit pas fermer le bloc en cours d'écriture.
+        let pointer_in_sidebar = self.sidebar.is_expanded()
+            && ctx
+                .input(|i| i.pointer.hover_pos())
+                .is_some_and(|p| p.x <= SIDEBAR_WIDTH);
+
+        let mut changed = false;
+        let mut finished = ctx.input(|i| i.key_pressed(Key::Escape));
+        let focus_now = std::mem::take(&mut self.freetext_focus_pending);
+        let ignore_outside_click = self.freetext_awaiting_opening_release;
+        if ctx.input(|i| i.pointer.any_released()) {
+            self.freetext_awaiting_opening_release = false;
+        }
+        egui::Area::new(egui::Id::new("superpdf_freetext_editor").with(editing_id))
+            .fixed_pos(editor_rect.min)
+            .order(Order::Foreground)
+            .show(ctx, |ui| {
+                let response = ui.add_sized(
+                    editor_rect.size(),
+                    egui::TextEdit::multiline(text)
+                        .frame(false)
+                        .font(font)
+                        .text_color(Color32::from_rgb(20, 24, 34))
+                        .hint_text("Saisissez votre texte...")
+                        .margin(egui::vec2(6.0 * scale_x, 4.0 * scale_y)),
+                );
+                if focus_now {
+                    response.request_focus();
+                }
+                changed = response.changed();
+                let outside_click = response.clicked_elsewhere();
+                finished |= !ignore_outside_click && outside_click && !pointer_in_sidebar;
+                if outside_click && pointer_in_sidebar {
+                    self.freetext_focus_pending = true;
+                }
+            });
+
+        if changed {
+            tab.is_modified = true;
+        }
+        if finished {
+            self.editing_freetext_id = None;
+            let is_blank = tab
+                .annotations
+                .items
+                .iter()
+                .find(|a| a.id == editing_id)
+                .is_some_and(|a| match &a.kind {
+                    AnnotationKind::FreeText { text, .. } => text.trim().is_empty(),
+                    AnnotationKind::StickyNote { comment, .. } => comment.trim().is_empty(),
+                    _ => false,
+                });
+            if is_blank {
+                tab.annotations.selected_id = Some(editing_id);
+                tab.annotations.delete_selected();
+            }
+        }
+    }
+
+    /// Menu du clic droit sur une flèche : couleur et style de chaque extrémité.
+    fn render_line_context_menu(&mut self, ctx: &Context) {
+        let Some(menu) = &self.line_context_menu else {
+            return;
+        };
+        let (annotation_id, position, opened_on_frame) =
+            (menu.annotation_id, menu.position, menu.opened_on_frame);
+        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+            return;
+        };
+        let Some(annot) = tab
+            .annotations
+            .items
+            .iter()
+            .find(|a| a.id == annotation_id)
+            .cloned()
+        else {
+            self.line_context_menu = None;
+            return;
+        };
+        let arrow_heads = match annot.kind {
+            AnnotationKind::Shape {
+                shape_kind:
+                    ShapeKind::ArrowLine {
+                        start_head,
+                        end_head,
+                    },
+                ..
+            } => Some((start_head, end_head)),
+            _ => None,
+        };
+        let block_style = match annot.kind {
+            AnnotationKind::FreeText {
+                fill_rgb,
+                border_rgb,
+                ..
+            } => Some((fill_rgb, border_rgb)),
+            _ => None,
+        };
+        if arrow_heads.is_none() && block_style.is_none() {
+            self.line_context_menu = None;
+            return;
+        }
+
+        let mut new_fill = None;
+        let mut new_border = None;
+        let mut new_color = None;
+        let mut new_start = None;
+        let mut new_end = None;
+        let ending_row = |ui: &mut egui::Ui, title: &str, current: LineEnding| {
+            let mut picked = None;
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(title).size(11.0));
+                for ending in LineEnding::ALL {
+                    if ui.selectable_label(current == ending, ending.label()).clicked() {
+                        picked = Some(ending);
+                    }
+                }
+            });
+            picked
+        };
+
+        let area = egui::Area::new(egui::Id::new("superpdf_line_context_menu"))
+            .fixed_pos(position)
+            .order(Order::Tooltip)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    if let Some((fill, border)) = block_style {
+                        new_fill = color_choice_row(ui, "Fond", fill, &FREETEXT_FILL_CHOICES);
+                        new_border = color_choice_row(ui, "Contour", border, &FREETEXT_BORDER_CHOICES);
+                    }
+                    if let Some((start_head, end_head)) = arrow_heads {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("Couleur").size(11.0));
+                            for (name, rgb) in PALETTE_COLORS {
+                                let swatch =
+                                    egui::Button::new(if annot.color_rgb == rgb { "✔" } else { " " })
+                                        .fill(Color32::from_rgb(rgb.0, rgb.1, rgb.2))
+                                        .min_size(Vec2::new(22.0, 16.0));
+                                if ui.add(swatch).on_hover_text(name).clicked() {
+                                    new_color = Some(rgb);
+                                }
+                            }
+                        });
+                        new_start = ending_row(ui, "Début", start_head);
+                        new_end = ending_row(ui, "Fin    ", end_head);
+                    }
+                });
+            });
+
+        if new_fill.is_some() || new_border.is_some() {
+            tab.annotations.push_undo_snapshot();
+            if let Some(target) = tab.annotations.items.iter_mut().find(|a| a.id == annotation_id) {
+                if let AnnotationKind::FreeText {
+                    fill_rgb,
+                    border_rgb,
+                    ..
+                } = &mut target.kind
+                {
+                    *fill_rgb = new_fill.unwrap_or(*fill_rgb);
+                    *border_rgb = new_border.unwrap_or(*border_rgb);
+                    self.freetext_style = Some((*fill_rgb, *border_rgb));
+                }
+            }
+            tab.is_modified = true;
+        }
+
+        if new_color.is_some() || new_start.is_some() || new_end.is_some() {
+            tab.annotations.push_undo_snapshot();
+            if let Some(target) = tab.annotations.items.iter_mut().find(|a| a.id == annotation_id) {
+                if let Some(color) = new_color {
+                    target.color_rgb = color;
+                }
+                if let AnnotationKind::Shape {
+                    shape_kind: ShapeKind::ArrowLine {
+                        start_head,
+                        end_head,
+                    },
+                    ..
+                } = &mut target.kind
+                {
+                    *start_head = new_start.unwrap_or(*start_head);
+                    *end_head = new_end.unwrap_or(*end_head);
+                }
+            }
+            tab.is_modified = true;
+        }
+
+        let dismissed = ctx.input(|i| i.key_pressed(Key::Escape))
+            || (self.frame_count != opened_on_frame && area.response.clicked_elsewhere());
+        if dismissed {
+            self.line_context_menu = None;
         }
     }
 
@@ -1984,6 +2845,7 @@ impl SuperPdfApp {
         };
 
         let mut create_highlight = false;
+        let mut create_note = false;
 
         egui::Area::new(egui::Id::new("superpdf_text_selection_bar"))
             .fixed_pos(pos)
@@ -2016,6 +2878,13 @@ impl SuperPdfApp {
                             {
                                 create_highlight = true;
                             }
+                            if ui
+                                .small_button("💬 Note (N)")
+                                .on_hover_text("Attacher une note à ce texte")
+                                .clicked()
+                            {
+                                create_note = true;
+                            }
                             ui.separator();
                             ui.colored_label(
                                 Color32::from_rgb(135, 195, 255),
@@ -2034,6 +2903,24 @@ impl SuperPdfApp {
                         });
                     });
             });
+
+        if create_note {
+            if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                if let Some(page_index) = tab.text_selection.page_index {
+                    let quads = tab.text_selection.highlight_boxes.clone();
+                    if !quads.is_empty() {
+                        let color = tab.annotations.active_color_rgb;
+                        let page_dim = tab.page_dimensions[page_index];
+                        let note = PdfAnnotation::new_text_note(page_index, quads, color, page_dim);
+                        let new_id = tab.annotations.add_annotation(note);
+                        tab.is_modified = true;
+                        tab.text_selection.clear();
+                        self.editing_freetext_id = Some(new_id);
+                        self.freetext_focus_pending = true;
+                    }
+                }
+            }
+        }
 
         if create_highlight {
             if let Some(tab) = self.tabs.get_mut(self.active_tab) {
@@ -2089,6 +2976,7 @@ impl SuperPdfApp {
                                 .hint_text("Rechercher dans le PDF (Ctrl+F)...")
                                 .desired_width(185.0);
                             let resp = ui.add(edit);
+                            self.text_field_focused_now |= resp.has_focus();
                             if self.search_bar.focus_requested {
                                 resp.request_focus();
                                 self.search_bar.focus_requested = false;
@@ -2153,9 +3041,10 @@ impl SuperPdfApp {
                 let vis_p = tab
                     .viewport
                     .current_page_index(canvas_rect.size(), &tab.page_dimensions);
-                tab.ensure_text_layers(self.engine);
-                // Phase 3 : Mode Turbo OCR déclenché automatiquement lors d'une recherche `Ctrl+F`
-                tab.run_turbo_ocr_for_search(vis_p, self.engine);
+                // Phase 3 : les résultats s'ajoutent au fil de l'indexation, sans bloquer la saisie.
+                tab.request_all_text(&self.workers);
+                tab.start_turbo_ocr();
+                tab.pump_ocr(vis_p, &self.workers);
                 self.search_bar.execute_search(&tab.text_layers);
             }
             self.scroll_to_current_search_match(canvas_rect.size());
@@ -2213,7 +3102,8 @@ impl SuperPdfApp {
                         {
                             self.search_bar.open();
                             if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-                                tab.ensure_text_layers(self.engine);
+                                tab.request_all_text(&self.workers);
+                                tab.start_turbo_ocr();
                             }
                         }
 
@@ -2472,6 +3362,8 @@ impl SuperPdfApp {
             ui.separator();
             if let Some(tab) = self.tabs.get_mut(self.active_tab) {
                 let mut delete_clicked = false;
+                let mut picked_fill = None;
+                let mut picked_border = None;
                 egui::Frame::NONE
                     .inner_margin(Margin::symmetric(10, 4))
                     .show(ui, |ui| {
@@ -2497,41 +3389,72 @@ impl SuperPdfApp {
                                 );
                             });
 
-                            // Sélecteur de couleur rapide
-                            ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new("Couleur :").size(10.5));
-                                for (cname, crgb) in PALETTE_COLORS {
-                                    let c32 = Color32::from_rgb(crgb.0, crgb.1, crgb.2);
-                                    let is_curr = annot.color_rgb == crgb;
-                                    let btn = egui::Button::new(if is_curr { "✔" } else { " " })
-                                        .fill(c32)
-                                        .min_size(Vec2::new(22.0, 16.0));
-                                    if ui.add(btn).on_hover_text(cname).clicked() {
-                                        annot.color_rgb = crgb;
+                            if let AnnotationKind::FreeText {
+                                fill_rgb,
+                                border_rgb,
+                                ..
+                            } = &annot.kind
+                            {
+                                picked_fill = color_choice_row(ui, "Fond", *fill_rgb, &FREETEXT_FILL_CHOICES);
+                                picked_border =
+                                    color_choice_row(ui, "Contour", *border_rgb, &FREETEXT_BORDER_CHOICES);
+                            } else {
+                                // Sélecteur de couleur rapide
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new("Couleur :").size(10.5));
+                                    for (cname, crgb) in PALETTE_COLORS {
+                                        let c32 = Color32::from_rgb(crgb.0, crgb.1, crgb.2);
+                                        let is_curr = annot.color_rgb == crgb;
+                                        let btn = egui::Button::new(if is_curr { "✔" } else { " " })
+                                            .fill(c32)
+                                            .min_size(Vec2::new(22.0, 16.0));
+                                        if ui.add(btn).on_hover_text(cname).clicked() {
+                                            annot.color_rgb = crgb;
+                                        }
                                     }
-                                }
-                            });
+                                });
+                            }
 
                             // Édition directe du contenu texte pour FreeText et StickyNote
                             match &mut annot.kind {
                                 AnnotationKind::FreeText { text, .. } => {
-                                    ui.add(
+                                    let field = ui.add(
                                         egui::TextEdit::multiline(text)
                                             .desired_rows(2)
                                             .desired_width(SIDEBAR_WIDTH - 24.0),
                                     );
+                                    self.text_field_focused_now |= field.has_focus();
                                 }
                                 AnnotationKind::StickyNote { comment, .. } => {
-                                    ui.add(
+                                    let field = ui.add(
                                         egui::TextEdit::multiline(comment)
                                             .desired_rows(2)
                                             .desired_width(SIDEBAR_WIDTH - 24.0),
                                     );
+                                    self.text_field_focused_now |= field.has_focus();
                                 }
                                 _ => {}
                             }
                         }
                     });
+                if picked_fill.is_some() || picked_border.is_some() {
+                    tab.annotations.push_undo_snapshot();
+                    if let Some(PdfAnnotation {
+                        kind:
+                            AnnotationKind::FreeText {
+                                fill_rgb,
+                                border_rgb,
+                                ..
+                            },
+                        ..
+                    }) = tab.annotations.selected_mut()
+                    {
+                        *fill_rgb = picked_fill.unwrap_or(*fill_rgb);
+                        *border_rgb = picked_border.unwrap_or(*border_rgb);
+                        self.freetext_style = Some((*fill_rgb, *border_rgb));
+                    }
+                    tab.is_modified = true;
+                }
                 if delete_clicked {
                     tab.annotations.delete_selected();
                     tab.is_modified = true;
@@ -2822,6 +3745,14 @@ impl SuperPdfApp {
         let hibernated_count = self.tabs.iter().filter(|t| t.is_hibernated()).count();
         let ram_mb = self.process_working_set_bytes as f32 / (1024.0 * 1024.0);
         let annot_count = tab.annotations.items.len();
+        // Moyenne réelle sur la fenêtre : un gel de plusieurs secondes fait chuter le chiffre.
+        let window_secs: f32 = self.recent_frames.iter().map(|(_, dt)| *dt).sum();
+        let fps = self.recent_frames.len() as f32 / window_secs.max(0.001);
+        let worst_frame_ms = self
+            .recent_frames
+            .iter()
+            .map(|(_, dt)| *dt * 1000.0)
+            .fold(0.0_f32, f32::max);
 
         let pill_pos = Pos2::new(
             (canvas_rect.max.x - 690.0).max(canvas_rect.min.x + 12.0),
@@ -2870,8 +3801,8 @@ impl SuperPdfApp {
                             ui.separator();
                             ui.label(
                                 egui::RichText::new(format!(
-                                    "RAM {:.1} Mo | ⚡ {:.0} FPS",
-                                    ram_mb, self.fps_smoothed
+                                    "RAM {:.1} Mo | {:.0} FPS | pire image {:.0} ms",
+                                    ram_mb, fps, worst_frame_ms
                                 ))
                                 .size(11.0)
                                 .color(Color32::from_rgb(130, 225, 175)),
@@ -2972,6 +3903,7 @@ impl SuperPdfApp {
                             .hint_text("Tapez le nom d'un onglet, d'un outil (Surligner, Texte...) ou d'une page...")
                             .desired_width(palette_w - 8.0);
                         let resp = ui.add(text_edit);
+                        self.text_field_focused_now |= resp.has_focus();
                         if self.command_palette.focus_requested {
                             resp.request_focus();
                             self.command_palette.focus_requested = false;

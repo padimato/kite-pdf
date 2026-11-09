@@ -12,3 +12,18 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 lopdf = "0.34"
 rfd = "0.15"
 anyhow = "1.0"
+oar-ocr = { version = "0.10.2", default-features = false, features = ["simd"] }
+# ONNX Runtime est chargé depuis assets/models/onnxruntime.dll (pas de liaison statique, indépendant de la version de MSVC).
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["load-dynamic"] }
+
+# Le code applicatif reste débogable, mais les dépendances (image, egui, ONNX) sont optimisées même en debug.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4

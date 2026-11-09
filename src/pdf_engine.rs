@@ -1,6 +1,7 @@
 use crate::text_search::{PageTextLayer, PdfTopDownRect, PositionedChar};
 use anyhow::{Context, Result};
 use egui::ColorImage;
+use image::RgbImage;
 use lopdf::content::{Content, Operation};
 use lopdf::{dictionary, Document, Object, Stream};
 use pdfium_render::prelude::*;
@@ -28,6 +29,15 @@ impl PageDimensions {
     }
 }
 
+/// Portion d'une page à rendre, en pixels à l'échelle demandée (origine en haut à gauche de la page).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TileRegion {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
 /// Métadonnées et accès au document PDF via PDFium
 pub struct PdfEngine {
     pdfium: Pdfium,
@@ -42,6 +52,8 @@ pub struct LoadedPdfDocument<'a> {
     pub path: PathBuf,
     pub title: String,
     pub page_dimensions: Vec<PageDimensions>,
+    /// Le document contient de vrais champs de formulaire (un `/AcroForm` vide ne compte pas)
+    has_form_widgets: bool,
     doc: PdfDocument<'a>,
 }
 
@@ -85,6 +97,22 @@ impl PdfEngine {
         )
     }
 
+    /// Ouvre un document sans lire les dimensions de chaque page (ouvertures répétées des threads d'arrière-plan).
+    pub fn open_lightweight<'a>(&'a self, path: &Path) -> Result<LoadedPdfDocument<'a>> {
+        let _lock = PDFIUM_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let doc = self
+            .pdfium
+            .load_pdf_from_file(path, None)
+            .with_context(|| format!("Échec d'ouverture du fichier PDF : {}", path.display()))?;
+        Ok(LoadedPdfDocument {
+            path: path.to_path_buf(),
+            title: String::new(),
+            page_dimensions: Vec::new(),
+            has_form_widgets: false,
+            doc,
+        })
+    }
+
     /// Charge un document PDF depuis le disque et extrait uniquement les métadonnées légères des pages.
     pub fn load_document<'a>(&'a self, path: &Path) -> Result<LoadedPdfDocument<'a>> {
         let _lock = PDFIUM_GUARD.lock().unwrap_or_else(|e| e.into_inner());
@@ -96,11 +124,19 @@ impl PdfEngine {
         let pages = doc.pages();
         let page_count = pages.len();
         let mut page_dimensions = Vec::with_capacity(page_count as usize);
+        let document_declares_form = doc.form().is_some();
+        let mut has_form_widgets = false;
 
         for idx in 0..page_count {
             let page = pages
                 .get(idx)
                 .with_context(|| format!("Impossible de lire la page {}", idx + 1))?;
+            has_form_widgets = has_form_widgets
+                || (document_declares_form
+                    && page
+                        .annotations()
+                        .iter()
+                        .any(|a| a.annotation_type() == PdfPageAnnotationType::Widget));
             page_dimensions.push(PageDimensions {
                 width_pt: page.width().value,
                 height_pt: page.height().value,
@@ -117,9 +153,117 @@ impl PdfEngine {
             path: path.to_path_buf(),
             title,
             page_dimensions,
+            has_form_widgets,
             doc,
         })
     }
+}
+
+/// Boîtes (points PDF, origine bas-gauche) des objets texte situés hors page ou hors de leur masque de découpe.
+/// Ces textes n'apparaissent jamais à l'écran mais PDFium les extrait quand même.
+fn hidden_text_boxes(page: &PdfPage<'_>, page_w: f32, page_h: f32) -> Vec<[f32; 4]> {
+    let mut hidden = Vec::new();
+    for obj in page.objects().iter() {
+        if obj.as_text_object().is_none() {
+            continue;
+        }
+        let Ok(bounds) = obj.bounds() else {
+            continue;
+        };
+        let (left, right) = (bounds.left().value, bounds.right().value);
+        let (bottom, top) = (bounds.bottom().value, bounds.top().value);
+        let (x0, x1) = (left.min(right), left.max(right));
+        let (y0, y1) = (bottom.min(top), bottom.max(top));
+        let (cx, cy) = ((x0 + x1) * 0.5, (y0 + y1) * 0.5);
+
+        let off_page = x1 < 0.0 || x0 > page_w || y1 < 0.0 || y0 > page_h;
+        let clipped_out = obj.get_clip_path().is_some_and(|clip| {
+            (0..clip.len()).any(|i| {
+                let Ok(path) = clip.get(i) else {
+                    return false;
+                };
+                let mut path_box = [f32::MAX, f32::MAX, f32::MIN, f32::MIN];
+                for s in 0..path.len() {
+                    if let Ok(segment) = path.get(s) {
+                        let (x, y) = (segment.x().value, segment.y().value);
+                        path_box = [
+                            path_box[0].min(x),
+                            path_box[1].min(y),
+                            path_box[2].max(x),
+                            path_box[3].max(y),
+                        ];
+                    }
+                }
+                // Un masque sans point (masque textuel) ne permet pas de conclure.
+                path_box[0] <= path_box[2]
+                    && (cx < path_box[0] - 1.0
+                        || cx > path_box[2] + 1.0
+                        || cy < path_box[1] - 1.0
+                        || cy > path_box[3] + 1.0)
+            })
+        });
+        if off_page || clipped_out {
+            hidden.push([x0, y0, x1, y1]);
+        }
+    }
+    hidden
+}
+
+/// Parcourt un objet de page en descendant dans les formulaires et appelle `visit` pour chaque image,
+/// avec son rectangle en coordonnées de page (les enfants d'un formulaire sont exprimés dans son repère).
+fn visit_page_images<F>(
+    obj: &PdfPageObject<'_>,
+    form_matrices: &mut Vec<PdfMatrix>,
+    page_size: (f32, f32),
+    visit: &mut F,
+) where
+    F: FnMut(&PdfPageObject<'_>, PdfTopDownRect),
+{
+    if let Some(form) = obj.as_x_object_form_object() {
+        let Ok(matrix) = obj.matrix() else {
+            return;
+        };
+        form_matrices.push(matrix);
+        for i in 0..form.len() {
+            if let Ok(child) = form.get(i) {
+                visit_page_images(&child, form_matrices, page_size, visit);
+            }
+        }
+        form_matrices.pop();
+        return;
+    }
+    if obj.as_image_object().is_none() {
+        return;
+    }
+    let Ok(bounds) = obj.bounds() else {
+        return;
+    };
+    let (page_w, page_h) = page_size;
+    let mut xs = [f32::MAX, f32::MIN];
+    let mut ys = [f32::MAX, f32::MIN];
+    for (x, y) in [
+        (bounds.left(), bounds.top()),
+        (bounds.right(), bounds.top()),
+        (bounds.left(), bounds.bottom()),
+        (bounds.right(), bounds.bottom()),
+    ] {
+        let (mut px, mut py) = (x, y);
+        for m in form_matrices.iter().rev() {
+            (px, py) = m.apply_to_points(px, py);
+        }
+        xs = [xs[0].min(px.value), xs[1].max(px.value)];
+        ys = [ys[0].min(py.value), ys[1].max(py.value)];
+    }
+    visit(
+        obj,
+        PdfTopDownRect {
+            x_min: xs[0].clamp(0.0, page_w),
+            x_max: xs[1].clamp(0.0, page_w),
+            y_min: (page_h - ys[1]).clamp(0.0, page_h),
+            y_max: (page_h - ys[0]).clamp(0.0, page_h),
+            angle_deg: 0.0,
+        },
+    );
 }
 
 impl<'a> LoadedPdfDocument<'a> {
@@ -158,6 +302,54 @@ impl<'a> LoadedPdfDocument<'a> {
         Ok(ColorImage::from_rgba_unmultiplied([actual_w, actual_h], &rgba))
     }
 
+    /// Rend uniquement `region` de la page à `scale` pixels par point PDF.
+    /// La taille de la page virtuelle n'est pas limitée : seule la tuile occupe de la mémoire.
+    pub fn render_page_tile(
+        &self,
+        page_index: usize,
+        scale: f32,
+        region: TileRegion,
+    ) -> Result<ColorImage> {
+        let _lock = PDFIUM_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let page = self
+            .doc
+            .pages()
+            .get(page_index as u16)
+            .with_context(|| format!("Page {} hors limites", page_index))?;
+
+        let config = PdfRenderConfig::new()
+            .scale_page_by_factor(scale)
+            .translate(
+                PdfPoints::new(-(region.x as f32) / scale),
+                PdfPoints::new(-(region.y as f32) / scale),
+            )
+            .context("Transformation de tuile invalide")?
+            .clip(0, 0, region.width, region.height)
+            .render_annotations(false)
+            .use_lcd_text_rendering(true);
+
+        let mut bitmap = PdfBitmap::empty(
+            region.width,
+            region.height,
+            PdfBitmapFormat::BGRA,
+            self.doc.bindings(),
+        )
+        .context("Allocation de la tuile impossible")?;
+        page.render_into_bitmap_with_config(&mut bitmap, &config)
+            .with_context(|| format!("Erreur de rendu de tuile sur la page {}", page_index + 1))?;
+
+        let rgba = bitmap.as_rgba_bytes();
+        Ok(ColorImage::from_rgba_unmultiplied(
+            [region.width as usize, region.height as usize],
+            &rgba,
+        ))
+    }
+
+    /// Les champs de formulaire ne peuvent pas être dessinés dans une tuile (limite de PDFium).
+    pub fn has_form_fields(&self) -> bool {
+        self.has_form_widgets
+    }
+
     /// Extrait la couche de texte natif d'une seule page à la volée (< 1 ms, idéal pour les très gros PDF).
     pub fn extract_single_page_text_layer(&self, page_idx: usize) -> PageTextLayer {
         let _lock = PDFIUM_GUARD.lock().unwrap_or_else(|e| e.into_inner());
@@ -166,6 +358,7 @@ impl<'a> LoadedPdfDocument<'a> {
         if let Ok(page) = pages.get(page_idx as u16) {
             let page_w = page.width().value;
             let page_h = page.height().value;
+            let hidden_boxes = hidden_text_boxes(&page, page_w, page_h);
             if let Ok(text_page) = page.text() {
                 for ch_item in text_page.chars().iter() {
                     let Some(ch) = ch_item.unicode_char() else {
@@ -182,6 +375,14 @@ impl<'a> LoadedPdfDocument<'a> {
                         let right = b.right().value;
                         let top = b.top().value;
                         let bottom = b.bottom().value;
+
+                        let (cx, cy) = ((left + right) * 0.5, (top + bottom) * 0.5);
+                        if hidden_boxes
+                            .iter()
+                            .any(|h| cx >= h[0] && cx <= h[2] && cy >= h[1] && cy <= h[3])
+                        {
+                            continue;
+                        }
 
                         let x_min = left.min(right).clamp(0.0, page_w);
                         let x_max = left.max(right).clamp(0.0, page_w);
@@ -222,9 +423,7 @@ impl<'a> LoadedPdfDocument<'a> {
         PageTextLayer::new(page_idx, positioned_chars)
     }
 
-    /// Inspecte tous les objets graphiques d'une page PDF via PDFium pour détecter les images matricielles
-    /// embarquées (`XObject /Subtype /Image`, ex: graphiques JPG insérés dans un rapport Word ou schémas techniques)
-    /// et retourner leurs coordonnées exactes en points PDF top-down ainsi que leurs dimensions en pixels.
+    /// Liste les images embarquées d'une page (formulaires inclus) : rectangle en points PDF top-down et taille en pixels.
     #[allow(dead_code)]
     pub fn list_page_image_regions(&self, page_idx: usize) -> Vec<(PdfTopDownRect, usize, usize)> {
         let _lock = PDFIUM_GUARD.lock().unwrap_or_else(|e| e.into_inner());
@@ -232,101 +431,60 @@ impl<'a> LoadedPdfDocument<'a> {
         let Ok(page) = self.doc.pages().get(page_idx as u16) else {
             return regions;
         };
-        let page_w = page.width().value;
-        let page_h = page.height().value;
-
-        for obj in page.objects().iter() {
-            if let Some(img_obj) = obj.as_image_object() {
-                if let Ok(bounds) = obj.bounds() {
-                    let left = bounds.left().value;
-                    let right = bounds.right().value;
-                    let top = bounds.top().value;
-                    let bottom = bounds.bottom().value;
-
-                    let x_min = left.min(right).clamp(0.0, page_w);
-                    let x_max = left.max(right).clamp(0.0, page_w);
-                    let y_min = (page_h - top.max(bottom)).clamp(0.0, page_h);
-                    let y_max = (page_h - top.min(bottom)).clamp(0.0, page_h);
-
-                    let px_w = img_obj
-                        .width()
-                        .map(|w| w as usize)
-                        .unwrap_or_else(|_| (x_max - x_min).round() as usize);
-                    let px_h = img_obj
-                        .height()
-                        .map(|h| h as usize)
-                        .unwrap_or_else(|_| (y_max - y_min).round() as usize);
-
-                    if (x_max - x_min) >= 12.0 && (y_max - y_min) >= 12.0 {
-                        regions.push((
-                            PdfTopDownRect {
-                                x_min,
-                                y_min,
-                                x_max,
-                                y_max,
-                                angle_deg: 0.0,
-                            },
-                            px_w,
-                            px_h,
-                        ));
-                    }
-                }
+        let page_size = (page.width().value, page.height().value);
+        let mut visit = |obj: &PdfPageObject<'_>, rect: PdfTopDownRect| {
+            if rect.width() < 12.0 || rect.height() < 12.0 {
+                return;
             }
+            if let Some(image) = obj.as_image_object() {
+                let px_w = image.width().map_or(rect.width().round() as usize, |w| w as usize);
+                let px_h = image.height().map_or(rect.height().round() as usize, |h| h as usize);
+                regions.push((rect, px_w, px_h));
+            }
+        };
+        for obj in page.objects().iter() {
+            visit_page_images(&obj, &mut Vec::new(), page_size, &mut visit);
         }
         regions
     }
 
-    /// Extrait directement le bitmap natif (`ColorImage`) de chaque objet `XObject /Subtype /Image` de la page,
-    /// sans ré-échantillonnage de page entière (ultra-rapide et 100 % fidèle aux pixels d'origine du JPG/PNG).
-    pub fn extract_page_embedded_image_bitmaps(
-        &self,
-        page_idx: usize,
-    ) -> Vec<(PdfTopDownRect, ColorImage)> {
+    /// Extrait les pixels d'origine de chaque image embarquée (formulaires inclus), sans ré-échantillonnage.
+    pub fn extract_page_embedded_images(&self, page_idx: usize) -> Vec<(PdfTopDownRect, RgbImage)> {
         let _lock = PDFIUM_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let mut results = Vec::new();
         let Ok(page) = self.doc.pages().get(page_idx as u16) else {
             return results;
         };
-        let page_w = page.width().value;
-        let page_h = page.height().value;
-
-        for obj in page.objects().iter() {
-            if let Some(img_obj) = obj.as_image_object() {
-                let Ok(bounds) = obj.bounds() else {
-                    continue;
-                };
-                let left = bounds.left().value;
-                let right = bounds.right().value;
-                let top = bounds.top().value;
-                let bottom = bounds.bottom().value;
-
-                let x_min = left.min(right).clamp(0.0, page_w);
-                let x_max = left.max(right).clamp(0.0, page_w);
-                let y_min = (page_h - top.max(bottom)).clamp(0.0, page_h);
-                let y_max = (page_h - top.min(bottom)).clamp(0.0, page_h);
-
-                if (x_max - x_min) < 20.0 || (y_max - y_min) < 20.0 {
-                    continue;
-                }
-
-                let rect_pt = PdfTopDownRect {
-                    x_min,
-                    y_min,
-                    x_max,
-                    y_max,
-                    angle_deg: 0.0,
-                };
-
-                if let Ok(bitmap) = img_obj.get_raw_bitmap() {
-                    let rgba = bitmap.as_rgba_bytes();
-                    let w = bitmap.width() as usize;
-                    let h = bitmap.height() as usize;
-                    if w >= 16 && h >= 16 {
-                        let color_img = ColorImage::from_rgba_unmultiplied([w, h], &rgba);
-                        results.push((rect_pt, color_img));
-                    }
-                }
+        let page_size = (page.width().value, page.height().value);
+        let mut visit = |obj: &PdfPageObject<'_>, rect: PdfTopDownRect| {
+            if rect.width() < 20.0 || rect.height() < 20.0 {
+                return;
             }
+            let Some(image) = obj.as_image_object() else {
+                return;
+            };
+            let Ok(bitmap) = image.get_raw_bitmap() else {
+                return;
+            };
+            let (w, h) = (bitmap.width() as usize, bitmap.height() as usize);
+            let rgba = bitmap.as_rgba_bytes();
+            if w < 16 || h < 16 || rgba.len() != w * h * 4 {
+                return;
+            }
+            // Les zones transparentes sont composées sur blanc, le fond attendu par la détection.
+            let rgb: Vec<u8> = rgba
+                .chunks_exact(4)
+                .flat_map(|p| {
+                    let alpha = p[3] as u32;
+                    [0, 1, 2].map(|c| ((p[c] as u32 * alpha + 255 * (255 - alpha)) / 255) as u8)
+                })
+                .collect();
+            if let Some(pixels) = RgbImage::from_raw(w as u32, h as u32, rgb) {
+                results.push((rect, pixels));
+            }
+        };
+        for obj in page.objects().iter() {
+            visit_page_images(&obj, &mut Vec::new(), page_size, &mut visit);
         }
         results
     }
@@ -616,6 +774,48 @@ mod tests {
             .expect("Doit rendre la page 1 en RGBA");
         assert_eq!(img.width(), 800);
         assert_eq!(img.height(), 1132);
+    }
+
+    #[test]
+    fn test_tile_render_matches_same_area_of_full_page() {
+        let sample_path = PathBuf::from("test_pdfs/unit_test_sample.pdf");
+        ensure_sample_pdf(&sample_path).expect("Doit créer le PDF de test");
+        let engine = PdfEngine::instance();
+        let doc = engine.load_document(&sample_path).expect("Doit charger le PDF");
+        let dim = doc.page_dimensions[0];
+
+        let scale = 3.0_f32;
+        let (full_w, full_h) = (
+            (dim.width_pt * scale).round() as i32,
+            (dim.height_pt * scale).round() as i32,
+        );
+        let full = doc.render_page(0, full_w, full_h).expect("Doit rendre la page");
+        let region = TileRegion {
+            x: 300,
+            y: 500,
+            width: 512,
+            height: 256,
+        };
+        let tile = doc.render_page_tile(0, scale, region).expect("Doit rendre la tuile");
+        assert_eq!(tile.size, [512, 256]);
+
+        let mut total_difference = 0_u64;
+        let mut dark_pixels = 0_u32;
+        for y in 0..region.height as usize {
+            for x in 0..region.width as usize {
+                let from_tile = tile.pixels[y * 512 + x];
+                let index = (y + region.y as usize) * full.width() + x + region.x as usize;
+                let from_page = full.pixels[index];
+                total_difference += from_tile.r().abs_diff(from_page.r()) as u64;
+                dark_pixels += u32::from(from_tile.r() < 128);
+            }
+        }
+        let mean_difference = total_difference as f32 / (512.0 * 256.0);
+        assert!(dark_pixels > 100, "la tuile doit contenir du contenu de la page");
+        assert!(
+            mean_difference < 8.0,
+            "la tuile doit être alignée sur la page, écart moyen {mean_difference}"
+        );
     }
 
     #[test]

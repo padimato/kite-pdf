@@ -4,6 +4,7 @@ use crate::ocr_engine::{HybridOcrEngine, OcrSpeedMode, TabOcrState};
 use crate::pdf_engine::{LoadedPdfDocument, PageDimensions, PdfEngine};
 use crate::text_search::{PageTextLayer, TextSelectionState};
 use crate::viewport::ViewportState;
+use crate::worker::{BackgroundWorkers, OcrJob, OcrPageOutcome};
 use anyhow::Result;
 use egui::Color32;
 use std::path::PathBuf;
@@ -46,7 +47,7 @@ impl ActiveTool {
             ActiveTool::Highlight => ("✒", "Surligner", "H"),
             ActiveTool::FreeText => ("🅰", "Texte", "T"),
             ActiveTool::Ink => ("✏", "Dessin", "D"),
-            ActiveTool::Shape => ("▭", "Formes", "R"),
+            ActiveTool::Shape => ("↗", "Flèche (Alt : rectangle)", "R"),
             ActiveTool::StickyNote => ("💬", "Note", "N"),
             ActiveTool::Measure => ("📏", "Mesure", "M"),
         }
@@ -131,12 +132,16 @@ pub struct DocumentTab {
     pub page_dimensions: Vec<PageDimensions>,
     pub document: Option<LoadedPdfDocument<'static>>,
     pub text_layers: Vec<PageTextLayer>,
+    /// Pages dont la couche de texte a déjà été demandée au thread d'arrière-plan
+    text_requested: Vec<bool>,
     pub text_selection: TextSelectionState,
     pub annotations: AnnotationManager,
     pub ocr: TabOcrState,
     pub viewport: ViewportState,
     pub is_modified: bool,
     pub badge_color: Color32,
+    /// Faux si le PDF contient un formulaire : ses champs n'apparaîtraient pas dans les tuiles
+    pub supports_tiled_rendering: bool,
 }
 
 impl DocumentTab {
@@ -155,6 +160,7 @@ impl DocumentTab {
             }
             annotations.selected_id = None;
         }
+        let supports_tiled_rendering = !doc.has_form_fields();
         let page_count = page_dimensions.len();
         let mut ocr = TabOcrState::default();
         ocr.ensure_initialized(page_count);
@@ -165,12 +171,14 @@ impl DocumentTab {
             page_dimensions,
             document: Some(doc),
             text_layers: Vec::new(),
+            text_requested: vec![false; page_count],
             text_selection: TextSelectionState::default(),
             annotations,
             ocr,
             viewport: ViewportState::default(),
             is_modified: false,
             badge_color,
+            supports_tiled_rendering,
         }
     }
 
@@ -224,6 +232,7 @@ impl DocumentTab {
     /// Phase 2 de l'Ordonnanceur OCR (Mode Éco Tâche de fond) :
     /// Inspecte au maximum 1 page par tick autour de `visible_page` lorsque l'application est au repos,
     /// garantissant 0 lag et le maintien des 60 FPS.
+    #[cfg(test)]
     pub fn step_eco_ocr_background(
         &mut self,
         visible_page: usize,
@@ -273,14 +282,135 @@ impl DocumentTab {
             total_added += self.run_ocr_on_page(focus_page, engine);
         }
 
-        // Puis scanner une fenêtre de pages autour de `focus_page` (toutes les pages pour un PDF <= 16 pages)
-        let max_turbo_pages = total.min(16);
-        for idx in 0..max_turbo_pages {
+        for idx in 0..total {
             if !self.ocr.page_scanned[idx] {
                 total_added += self.run_ocr_on_page(idx, engine);
             }
         }
         total_added
+    }
+
+    fn ensure_text_slots(&mut self) {
+        let total = self.page_dimensions.len();
+        if self.text_layers.len() < total {
+            self.text_layers = (0..total)
+                .map(|idx| PageTextLayer::new(idx, Vec::new()))
+                .collect();
+        }
+        if self.text_requested.len() < total {
+            self.text_requested.resize(total, false);
+        }
+    }
+
+    /// Demande en arrière-plan la couche de texte d'une page, une seule fois.
+    pub fn request_page_text(&mut self, page: usize, workers: &BackgroundWorkers, interactive: bool) {
+        if page >= self.page_dimensions.len() {
+            return;
+        }
+        self.ensure_text_slots();
+        if !self.text_requested[page] {
+            self.text_requested[page] = true;
+            workers.request_text_layer(self.id, self.path.clone(), page, interactive);
+        }
+    }
+
+    /// Demande l'indexation de tout le document pour la recherche.
+    pub fn request_all_text(&mut self, workers: &BackgroundWorkers) {
+        for page in 0..self.page_dimensions.len() {
+            self.request_page_text(page, workers, false);
+        }
+    }
+
+    /// Intègre une couche de texte reçue du thread d'arrière-plan.
+    pub fn apply_text_layer(&mut self, layer: PageTextLayer) {
+        self.ensure_text_slots();
+        if let Some(slot) = self.text_layers.get_mut(layer.page_index) {
+            if slot.chars.is_empty() {
+                *slot = layer;
+            }
+        }
+    }
+
+    /// Bascule en mode Turbo (`Ctrl+F`) : l'OCR enchaîne les pages sans pause.
+    pub fn start_turbo_ocr(&mut self) {
+        self.ocr.ensure_initialized(self.page_dimensions.len());
+        self.ocr.mode = OcrSpeedMode::TurboSearch;
+    }
+
+    /// Soumet au thread OCR la page non traitée la plus proche de `visible_page`.
+    pub fn pump_ocr(&mut self, visible_page: usize, workers: &BackgroundWorkers) {
+        let total = self.page_dimensions.len();
+        if total == 0 || self.ocr.unavailable_reason.is_some() || self.ocr.in_flight_page.is_some() {
+            return;
+        }
+        self.ocr.ensure_initialized(total);
+        let visible = visible_page.min(total - 1);
+        let next = (0..total)
+            .flat_map(|d| [visible.checked_add(d), visible.checked_sub(d)])
+            .flatten()
+            .find(|&p| p < total && !self.ocr.page_scanned[p]);
+        let Some(page) = next else {
+            return;
+        };
+        if self.ocr.mode == OcrSpeedMode::InstantOpen {
+            self.ocr.mode = OcrSpeedMode::EcoBackground;
+        }
+        let submitted = workers.submit_ocr(OcrJob {
+            tab_id: self.id,
+            path: self.path.clone(),
+            page,
+            eco: self.ocr.mode != OcrSpeedMode::TurboSearch,
+        });
+        if submitted {
+            self.ocr.in_flight_page = Some(page);
+        }
+    }
+
+    /// Intègre le résultat OCR d'une page. Retourne `true` si la couche de texte a changé.
+    pub fn apply_ocr_outcome(&mut self, outcome: OcrPageOutcome) -> bool {
+        self.ensure_text_slots();
+        self.ocr.ensure_initialized(self.page_dimensions.len());
+        self.ocr.in_flight_page = None;
+        let page = outcome.page;
+        if page >= self.page_dimensions.len() {
+            return false;
+        }
+        if let Some(reason) = outcome.error {
+            self.ocr.status_summary = format!("OCR indisponible : {reason}");
+            self.ocr.unavailable_reason = Some(reason);
+            return false;
+        }
+
+        let mut changed = false;
+        if let Some(native) = outcome.native_layer {
+            if self.text_layers[page].chars.is_empty() {
+                changed = !native.chars.is_empty();
+                self.text_layers[page] = native;
+            }
+            self.text_requested[page] = true;
+        }
+        self.ocr.page_scanned[page] = true;
+        self.ocr.detected_images_count += outcome.images_found;
+
+        if !outcome.segments.is_empty() {
+            HybridOcrEngine::merge_segments_into_layer(&mut self.text_layers[page], &outcome.segments);
+            self.ocr.recognized_ocr_chars_count +=
+                outcome.segments.iter().map(|s| s.chars.len()).sum::<usize>();
+            self.ocr.recognized_segments_count += outcome.segments.len();
+            self.ocr.has_unsaved_ocr = true;
+            self.is_modified = true;
+            changed = true;
+        }
+
+        let scanned = self.ocr.scanned_pages_count();
+        self.ocr.status_summary = format!(
+            "OCR p.{}/{} : {} img, {} lignes",
+            scanned,
+            self.page_dimensions.len(),
+            self.ocr.detected_images_count,
+            self.ocr.recognized_segments_count
+        );
+        changed
     }
 
     /// Extrait à la demande la couche de texte d'une seule page (`page_index`) en < 1 ms,
