@@ -154,11 +154,10 @@ impl DocumentTab {
         let title = doc.title.clone();
         let page_dimensions = doc.page_dimensions.clone();
         let mut annotations = AnnotationManager::new();
-        if let Ok(loaded_annots) = load_annotations_from_pdf(&path, &page_dimensions) {
-            for a in loaded_annots {
-                annotations.add_annotation(a);
+        if doc.has_app_drawn_annotations {
+            if let Ok(loaded_annots) = load_annotations_from_pdf(&path, &page_dimensions) {
+                annotations.load_items(loaded_annots);
             }
-            annotations.selected_id = None;
         }
         let supports_tiled_rendering = !doc.has_form_fields();
         let page_count = page_dimensions.len();

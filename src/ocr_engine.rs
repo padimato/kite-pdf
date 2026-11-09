@@ -902,10 +902,7 @@ pub fn append_invisible_ocr_layer_to_doc(
         let page_dim = page_dimensions
             .get(layer.page_index)
             .copied()
-            .unwrap_or(PageDimensions {
-                width_pt: 595.0,
-                height_pt: 842.0,
-            });
+            .unwrap_or(PageDimensions::simple(595.0, 842.0));
 
         // Regrouper les caractères OCR consécutifs de même orientation en mots (avec le rect du 1er caractère et le rect union)
         let mut words: Vec<(String, PdfTopDownRect, PdfTopDownRect, f32)> = Vec::new();
@@ -971,14 +968,12 @@ pub fn append_invisible_ocr_layer_to_doc(
         ops.push(Operation::new("Tr", vec![3.into()]));
 
         for (word_str, word_rect, start_rect, angle_deg) in words {
-            let rad = angle_deg.to_radians();
+            let rad = (angle_deg + page_dim.rotation_deg as f32).to_radians();
             let cos_a = rad.cos();
             let sin_a = rad.sin();
 
             // Coordonnées PDF bottom-up exactes du 1er caractère du mot
-            let tx = start_rect.x_min;
-            let ty_topdown = start_rect.y_max - 2.0;
-            let ty = (page_dim.height_pt - ty_topdown).clamp(0.0, page_dim.height_pt);
+            let (tx, ty) = page_dim.view_to_pdf(start_rect.x_min, start_rect.y_max - 2.0);
 
             // Calibrer la taille de police `Courier-Bold` (chasse 0.60 em) pour couvrir toute l'étendue géométrique du mot
             let span_pt = word_rect.width().hypot(word_rect.height());

@@ -12,6 +12,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 lopdf = "0.34"
 rfd = "0.15"
 anyhow = "1.0"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 oar-ocr = { version = "0.10.2", default-features = false, features = ["simd"] }
 # ONNX Runtime est chargé depuis assets/models/onnxruntime.dll (pas de liaison statique, indépendant de la version de MSVC).
 ort = { version = "=2.0.0-rc.13", default-features = false, features = ["load-dynamic"] }

@@ -14,11 +14,61 @@ static PDFIUM_GUARD: Mutex<()> = Mutex::new(());
 /// Dimensions d'une page PDF en points (1 pt = 1/72 pouce)
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PageDimensions {
+    /// Largeur et hauteur telles qu'affichées (rotation de la page comprise)
     pub width_pt: f32,
     pub height_pt: f32,
+    /// Coin bas-gauche de la zone visible (`/CropBox`) dans l'espace utilisateur du PDF
+    pub box_left: f32,
+    pub box_bottom: f32,
+    /// `/Rotate` de la page : 0, 90, 180 ou 270
+    pub rotation_deg: u32,
 }
 
 impl PageDimensions {
+    /// Page sans rotation dont la zone visible commence à l'origine.
+    pub fn simple(width_pt: f32, height_pt: f32) -> Self {
+        Self {
+            width_pt,
+            height_pt,
+            box_left: 0.0,
+            box_bottom: 0.0,
+            rotation_deg: 0,
+        }
+    }
+
+    /// Taille de la zone visible avant application de `/Rotate`.
+    pub fn unrotated_size(&self) -> (f32, f32) {
+        if self.rotation_deg == 90 || self.rotation_deg == 270 {
+            (self.height_pt, self.width_pt)
+        } else {
+            (self.width_pt, self.height_pt)
+        }
+    }
+
+    /// Convertit un point de l'espace utilisateur PDF vers le repère affiché (origine en haut à gauche).
+    pub fn pdf_to_view(&self, x: f32, y: f32) -> (f32, f32) {
+        let (box_w, box_h) = self.unrotated_size();
+        let (ux, uy) = (x - self.box_left, y - self.box_bottom);
+        match self.rotation_deg {
+            90 => (uy, ux),
+            180 => (box_w - ux, uy),
+            270 => (box_h - uy, box_w - ux),
+            _ => (ux, box_h - uy),
+        }
+    }
+
+    /// Opération inverse de [`Self::pdf_to_view`].
+    pub fn view_to_pdf(&self, x: f32, y: f32) -> (f32, f32) {
+        let (box_w, box_h) = self.unrotated_size();
+        let (ux, uy) = match self.rotation_deg {
+            90 => (y, x),
+            180 => (box_w - x, y),
+            270 => (box_w - y, box_h - x),
+            _ => (x, box_h - y),
+        };
+        (ux + self.box_left, uy + self.box_bottom)
+    }
+
     #[allow(dead_code)]
     pub fn aspect_ratio(&self) -> f32 {
         if self.height_pt > 0.0 {
@@ -54,6 +104,8 @@ pub struct LoadedPdfDocument<'a> {
     pub page_dimensions: Vec<PageDimensions>,
     /// Le document contient de vrais champs de formulaire (un `/AcroForm` vide ne compte pas)
     has_form_widgets: bool,
+    /// Au moins une annotation que l'application reprend à son compte
+    pub has_app_drawn_annotations: bool,
     doc: PdfDocument<'a>,
 }
 
@@ -109,6 +161,7 @@ impl PdfEngine {
             title: String::new(),
             page_dimensions: Vec::new(),
             has_form_widgets: false,
+            has_app_drawn_annotations: false,
             doc,
         })
     }
@@ -126,6 +179,7 @@ impl PdfEngine {
         let mut page_dimensions = Vec::with_capacity(page_count as usize);
         let document_declares_form = doc.form().is_some();
         let mut has_form_widgets = false;
+        let mut has_app_drawn_annotations = false;
 
         for idx in 0..page_count {
             let page = pages
@@ -137,10 +191,12 @@ impl PdfEngine {
                         .annotations()
                         .iter()
                         .any(|a| a.annotation_type() == PdfPageAnnotationType::Widget));
-            page_dimensions.push(PageDimensions {
-                width_pt: page.width().value,
-                height_pt: page.height().value,
-            });
+            page_dimensions.push(page_view_dimensions(&page));
+            has_app_drawn_annotations = has_app_drawn_annotations
+                || page
+                    .annotations()
+                    .iter()
+                    .any(|a| annotation_is_drawn_by_app(a.annotation_type()));
         }
 
         let title = path
@@ -154,14 +210,61 @@ impl PdfEngine {
             title,
             page_dimensions,
             has_form_widgets,
+            has_app_drawn_annotations,
             doc,
         })
     }
 }
 
+fn page_view_dimensions(page: &PdfPage<'_>) -> PageDimensions {
+    let (box_left, box_bottom) = page
+        .boundaries()
+        .bounding()
+        .map(|b| (b.bounds.left().value, b.bounds.bottom().value))
+        .unwrap_or((0.0, 0.0));
+    PageDimensions {
+        width_pt: page.width().value,
+        height_pt: page.height().value,
+        box_left,
+        box_bottom,
+        rotation_deg: page.rotation().map_or(0, |r| r.as_degrees() as u32),
+    }
+}
+
+/// Supprime, dans la copie en mémoire du thread de rendu, les annotations que l'application dessine
+/// elle-même. Tampons, soulignés, polygones... restent dessinés par PDFium avec leur apparence d'origine.
+fn remove_annotations_drawn_by_app(page: &mut PdfPage<'_>) {
+    let annotations = page.annotations_mut();
+    let mut index = annotations.len();
+    while index > 0 {
+        index -= 1;
+        let Ok(annotation) = annotations.get(index) else {
+            continue;
+        };
+        if annotation_is_drawn_by_app(annotation.annotation_type()) {
+            let _ = annotations.delete_annotation(annotation);
+        }
+    }
+}
+
+fn annotation_is_drawn_by_app(annotation_type: PdfPageAnnotationType) -> bool {
+    matches!(
+        annotation_type,
+        PdfPageAnnotationType::Highlight
+            | PdfPageAnnotationType::FreeText
+            | PdfPageAnnotationType::Ink
+            | PdfPageAnnotationType::Square
+            | PdfPageAnnotationType::Circle
+            | PdfPageAnnotationType::Line
+            | PdfPageAnnotationType::Text
+            | PdfPageAnnotationType::Popup
+    )
+}
+
 /// Boîtes (points PDF, origine bas-gauche) des objets texte situés hors page ou hors de leur masque de découpe.
 /// Ces textes n'apparaissent jamais à l'écran mais PDFium les extrait quand même.
-fn hidden_text_boxes(page: &PdfPage<'_>, page_w: f32, page_h: f32) -> Vec<[f32; 4]> {
+fn hidden_text_boxes(page: &PdfPage<'_>, dim: PageDimensions) -> Vec<[f32; 4]> {
+    let (box_w, box_h) = dim.unrotated_size();
     let mut hidden = Vec::new();
     for obj in page.objects().iter() {
         if obj.as_text_object().is_none() {
@@ -176,7 +279,10 @@ fn hidden_text_boxes(page: &PdfPage<'_>, page_w: f32, page_h: f32) -> Vec<[f32; 
         let (y0, y1) = (bottom.min(top), bottom.max(top));
         let (cx, cy) = ((x0 + x1) * 0.5, (y0 + y1) * 0.5);
 
-        let off_page = x1 < 0.0 || x0 > page_w || y1 < 0.0 || y0 > page_h;
+        let off_page = x1 < dim.box_left
+            || x0 > dim.box_left + box_w
+            || y1 < dim.box_bottom
+            || y0 > dim.box_bottom + box_h;
         let clipped_out = obj.get_clip_path().is_some_and(|clip| {
             (0..clip.len()).any(|i| {
                 let Ok(path) = clip.get(i) else {
@@ -214,7 +320,7 @@ fn hidden_text_boxes(page: &PdfPage<'_>, page_w: f32, page_h: f32) -> Vec<[f32; 
 fn visit_page_images<F>(
     obj: &PdfPageObject<'_>,
     form_matrices: &mut Vec<PdfMatrix>,
-    page_size: (f32, f32),
+    dim: PageDimensions,
     visit: &mut F,
 ) where
     F: FnMut(&PdfPageObject<'_>, PdfTopDownRect),
@@ -226,7 +332,7 @@ fn visit_page_images<F>(
         form_matrices.push(matrix);
         for i in 0..form.len() {
             if let Ok(child) = form.get(i) {
-                visit_page_images(&child, form_matrices, page_size, visit);
+                visit_page_images(&child, form_matrices, dim, visit);
             }
         }
         form_matrices.pop();
@@ -238,7 +344,6 @@ fn visit_page_images<F>(
     let Ok(bounds) = obj.bounds() else {
         return;
     };
-    let (page_w, page_h) = page_size;
     let mut xs = [f32::MAX, f32::MIN];
     let mut ys = [f32::MAX, f32::MIN];
     for (x, y) in [
@@ -251,16 +356,17 @@ fn visit_page_images<F>(
         for m in form_matrices.iter().rev() {
             (px, py) = m.apply_to_points(px, py);
         }
-        xs = [xs[0].min(px.value), xs[1].max(px.value)];
-        ys = [ys[0].min(py.value), ys[1].max(py.value)];
+        let (view_x, view_y) = dim.pdf_to_view(px.value, py.value);
+        xs = [xs[0].min(view_x), xs[1].max(view_x)];
+        ys = [ys[0].min(view_y), ys[1].max(view_y)];
     }
     visit(
         obj,
         PdfTopDownRect {
-            x_min: xs[0].clamp(0.0, page_w),
-            x_max: xs[1].clamp(0.0, page_w),
-            y_min: (page_h - ys[1]).clamp(0.0, page_h),
-            y_max: (page_h - ys[0]).clamp(0.0, page_h),
+            x_min: xs[0].clamp(0.0, dim.width_pt),
+            x_max: xs[1].clamp(0.0, dim.width_pt),
+            y_min: ys[0].clamp(0.0, dim.height_pt),
+            y_max: ys[1].clamp(0.0, dim.height_pt),
             angle_deg: 0.0,
         },
     );
@@ -275,11 +381,12 @@ impl<'a> LoadedPdfDocument<'a> {
     /// Effectue le rendu matriciel haute qualité d'une page donnée à la taille cible en pixels.
     pub fn render_page(&self, page_index: usize, target_width_px: i32, target_height_px: i32) -> Result<ColorImage> {
         let _lock = PDFIUM_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-        let page = self
+        let mut page = self
             .doc
             .pages()
             .get(page_index as u16)
             .with_context(|| format!("Page {} hors limites", page_index))?;
+        remove_annotations_drawn_by_app(&mut page);
 
         let width_px = target_width_px.clamp(64, 4096);
         let height_px = target_height_px.clamp(64, 4096);
@@ -288,7 +395,7 @@ impl<'a> LoadedPdfDocument<'a> {
             .set_target_width(width_px)
             .set_target_height(height_px)
             .render_form_data(true)
-            .render_annotations(false)
+            .render_annotations(true)
             .use_lcd_text_rendering(true);
 
         let bitmap = page
@@ -311,11 +418,12 @@ impl<'a> LoadedPdfDocument<'a> {
         region: TileRegion,
     ) -> Result<ColorImage> {
         let _lock = PDFIUM_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-        let page = self
+        let mut page = self
             .doc
             .pages()
             .get(page_index as u16)
             .with_context(|| format!("Page {} hors limites", page_index))?;
+        remove_annotations_drawn_by_app(&mut page);
 
         let config = PdfRenderConfig::new()
             .scale_page_by_factor(scale)
@@ -325,7 +433,7 @@ impl<'a> LoadedPdfDocument<'a> {
             )
             .context("Transformation de tuile invalide")?
             .clip(0, 0, region.width, region.height)
-            .render_annotations(false)
+            .render_annotations(true)
             .use_lcd_text_rendering(true);
 
         let mut bitmap = PdfBitmap::empty(
@@ -356,9 +464,8 @@ impl<'a> LoadedPdfDocument<'a> {
         let pages = self.doc.pages();
         let mut positioned_chars = Vec::new();
         if let Ok(page) = pages.get(page_idx as u16) {
-            let page_w = page.width().value;
-            let page_h = page.height().value;
-            let hidden_boxes = hidden_text_boxes(&page, page_w, page_h);
+            let dim = page_view_dimensions(&page);
+            let hidden_boxes = hidden_text_boxes(&page, dim);
             if let Ok(text_page) = page.text() {
                 for ch_item in text_page.chars().iter() {
                     let Some(ch) = ch_item.unicode_char() else {
@@ -384,11 +491,15 @@ impl<'a> LoadedPdfDocument<'a> {
                             continue;
                         }
 
-                        let x_min = left.min(right).clamp(0.0, page_w);
-                        let x_max = left.max(right).clamp(0.0, page_w);
-                        let y_min = (page_h - top.max(bottom)).clamp(0.0, page_h);
-                        let y_max = (page_h - top.min(bottom)).clamp(0.0, page_h);
-                        let raw_angle = ch_item.angle_degrees().unwrap_or(0.0);
+                        let (view_a_x, view_a_y) = dim.pdf_to_view(left, top);
+                        let (view_b_x, view_b_y) = dim.pdf_to_view(right, bottom);
+                        let x_min = view_a_x.min(view_b_x).clamp(0.0, dim.width_pt);
+                        let x_max = view_a_x.max(view_b_x).clamp(0.0, dim.width_pt);
+                        let y_min = view_a_y.min(view_b_y).clamp(0.0, dim.height_pt);
+                        let y_max = view_a_y.max(view_b_y).clamp(0.0, dim.height_pt);
+                        let raw_angle = (ch_item.angle_degrees().unwrap_or(0.0)
+                            + dim.rotation_deg as f32)
+                            .rem_euclid(360.0);
                         let angle_deg = if raw_angle > 180.0 {
                             raw_angle - 360.0
                         } else {
@@ -431,7 +542,7 @@ impl<'a> LoadedPdfDocument<'a> {
         let Ok(page) = self.doc.pages().get(page_idx as u16) else {
             return regions;
         };
-        let page_size = (page.width().value, page.height().value);
+        let dim = page_view_dimensions(&page);
         let mut visit = |obj: &PdfPageObject<'_>, rect: PdfTopDownRect| {
             if rect.width() < 12.0 || rect.height() < 12.0 {
                 return;
@@ -443,7 +554,7 @@ impl<'a> LoadedPdfDocument<'a> {
             }
         };
         for obj in page.objects().iter() {
-            visit_page_images(&obj, &mut Vec::new(), page_size, &mut visit);
+            visit_page_images(&obj, &mut Vec::new(), dim, &mut visit);
         }
         regions
     }
@@ -455,7 +566,7 @@ impl<'a> LoadedPdfDocument<'a> {
         let Ok(page) = self.doc.pages().get(page_idx as u16) else {
             return results;
         };
-        let page_size = (page.width().value, page.height().value);
+        let dim = page_view_dimensions(&page);
         let mut visit = |obj: &PdfPageObject<'_>, rect: PdfTopDownRect| {
             if rect.width() < 20.0 || rect.height() < 20.0 {
                 return;
@@ -480,11 +591,18 @@ impl<'a> LoadedPdfDocument<'a> {
                 })
                 .collect();
             if let Some(pixels) = RgbImage::from_raw(w as u32, h as u32, rgb) {
-                results.push((rect, pixels));
+                // L'OCR travaille dans le repère affiché : l'image suit la rotation de la page.
+                let oriented = match dim.rotation_deg {
+                    90 => image::imageops::rotate90(&pixels),
+                    180 => image::imageops::rotate180(&pixels),
+                    270 => image::imageops::rotate270(&pixels),
+                    _ => pixels,
+                };
+                results.push((rect, oriented));
             }
         };
         for obj in page.objects().iter() {
-            visit_page_images(&obj, &mut Vec::new(), page_size, &mut visit);
+            visit_page_images(&obj, &mut Vec::new(), dim, &mut visit);
         }
         results
     }
@@ -774,6 +892,43 @@ mod tests {
             .expect("Doit rendre la page 1 en RGBA");
         assert_eq!(img.width(), 800);
         assert_eq!(img.height(), 1132);
+    }
+
+    #[test]
+    fn test_view_and_pdf_coordinates_are_inverse_on_rotated_cropped_pages() {
+        for rotation_deg in [0, 90, 180, 270] {
+            let (unrotated_w, unrotated_h) = (400.0_f32, 600.0_f32);
+            let (width_pt, height_pt) = if rotation_deg % 180 == 0 {
+                (unrotated_w, unrotated_h)
+            } else {
+                (unrotated_h, unrotated_w)
+            };
+            let dim = PageDimensions {
+                width_pt,
+                height_pt,
+                box_left: 30.0,
+                box_bottom: 50.0,
+                rotation_deg,
+            };
+            let (view_x, view_y) = dim.pdf_to_view(130.0, 250.0);
+            let (pdf_x, pdf_y) = dim.view_to_pdf(view_x, view_y);
+            assert!((pdf_x - 130.0).abs() < 1e-3 && (pdf_y - 250.0).abs() < 1e-3);
+        }
+        let upright = PageDimensions {
+            width_pt: 400.0,
+            height_pt: 600.0,
+            box_left: 30.0,
+            box_bottom: 50.0,
+            rotation_deg: 0,
+        };
+        assert_eq!(upright.pdf_to_view(30.0, 650.0), (0.0, 0.0));
+        let turned = PageDimensions {
+            rotation_deg: 90,
+            width_pt: 600.0,
+            height_pt: 400.0,
+            ..upright
+        };
+        assert_eq!(turned.pdf_to_view(30.0, 50.0), (0.0, 0.0), "le coin bas-gauche monte en haut à gauche");
     }
 
     #[test]

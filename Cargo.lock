@@ -3770,6 +3770,7 @@ name = "super_pdf_reader"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "eframe",
  "egui",
  "image",

@@ -1,7 +1,8 @@
 use crate::annotations::{
     line_ending_outline, line_stop_point, save_annotations_and_ocr_to_pdf, unit_direction,
     AnnotHandle, AnnotationKind, LineEnding, PdfAnnotation, ShapeKind, ARROW_LINE_WIDTH,
-    FREETEXT_DEFAULT_FILL, PALETTE_COLORS,
+    default_author, format_pdf_date, pdf_date_now, CommentReply, ReviewState,
+    FREETEXT_DEFAULT_FILL, FREETEXT_TEXT_RGB, PALETTE_COLORS, REVIEW_STATES,
 };
 use crate::memory_manager::{
     query_process_memory_bytes, LruTextureCache, MultiplicativeHighlightQuad, PageTextureKey,
@@ -21,6 +22,7 @@ use egui::{
 };
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::os::windows::process::CommandExt;
 use std::time::{Duration, Instant};
 
 /// Fenêtre glissante du compteur d'images : assez longue pour qu'un gel reste visible.
@@ -68,10 +70,123 @@ const FREETEXT_BORDER_CHOICES: [(&str, Rgb); 7] = [
     PALETTE_COLORS[4],
 ];
 
-/// Hauteur du liseré coloré en tête d'une bulle de note, en points PDF.
-const NOTE_HEADER_HEIGHT_PT: f32 = 5.0;
-const NOTE_FONT_SIZE_PT: f32 = 10.5;
 const INLINE_TEXT_COLOR: Color32 = Color32::from_rgb(20, 24, 34);
+/// Largeur d'une bulle de commentaire : constante à l'écran, comme dans Acrobat.
+const COMMENT_PANEL_WIDTH: f32 = 300.0;
+const COMMENT_PANEL_BACKGROUND: Color32 = Color32::from_rgb(255, 255, 255);
+const COMMENT_MUTED_TEXT: Color32 = Color32::from_rgb(105, 112, 125);
+/// Zone sensible de l'ascenseur, plus large que son trait pour être facile à attraper.
+const SCROLLBAR_HIT_WIDTH: f32 = 16.0;
+const SCROLLBAR_MARGIN: f32 = 12.0;
+const FREETEXT_DEFAULT_FONT_SIZE: f32 = 12.0;
+const FREETEXT_FONT_SIZE_RANGE: (f32, f32) = (4.0, 144.0);
+const FREETEXT_FONT_SIZES: [f32; 8] = [8.0, 10.0, 12.0, 14.0, 18.0, 24.0, 36.0, 48.0];
+
+/// Géométrie de l'ascenseur vertical
+struct ScrollbarGeometry {
+    hit_area: Rect,
+    track_top: f32,
+    track_height: f32,
+    thumb_top: f32,
+    thumb_height: f32,
+    max_scroll: f32,
+}
+
+impl ScrollbarGeometry {
+    fn compute(canvas_rect: Rect, total_height: f32, scroll_y: f32) -> Option<Self> {
+        let viewport_height = canvas_rect.height();
+        if total_height <= viewport_height {
+            return None;
+        }
+        let track_top = canvas_rect.min.y + SCROLLBAR_MARGIN;
+        let track_height = viewport_height - 2.0 * SCROLLBAR_MARGIN;
+        let thumb_height = track_height * (viewport_height / total_height).clamp(0.06, 1.0);
+        let max_scroll = total_height - viewport_height;
+        let progress = (scroll_y / max_scroll).clamp(0.0, 1.0);
+        Some(Self {
+            hit_area: Rect::from_min_max(
+                Pos2::new(canvas_rect.max.x - SCROLLBAR_HIT_WIDTH, track_top),
+                Pos2::new(canvas_rect.max.x, track_top + track_height),
+            ),
+            track_top,
+            track_height,
+            thumb_top: track_top + progress * (track_height - thumb_height),
+            thumb_height,
+            max_scroll,
+        })
+    }
+
+    fn contains_thumb_y(&self, y: f32) -> bool {
+        y >= self.thumb_top && y <= self.thumb_top + self.thumb_height
+    }
+
+    fn scroll_for_thumb_top(&self, thumb_top: f32) -> f32 {
+        let free_travel = (self.track_height - self.thumb_height).max(1.0);
+        ((thumb_top - self.track_top) / free_travel).clamp(0.0, 1.0) * self.max_scroll
+    }
+}
+
+/// Partie d'un commentaire en cours de modification
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommentEditTarget {
+    Main,
+    Reply(usize),
+}
+
+/// Action choisie dans le menu contextuel d'un onglet
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TabMenuAction {
+    RevealInExplorer,
+    OpenWithDefaultApp,
+    CloseThis,
+    CloseOthers,
+    CloseBelow,
+}
+
+/// Choix du corps de texte. Retourne la nouvelle taille quand l'utilisateur en choisit une.
+fn font_size_row(ui: &mut egui::Ui, current: f32) -> Option<f32> {
+    let mut picked = None;
+    let (min_size, max_size) = FREETEXT_FONT_SIZE_RANGE;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 3.0;
+        ui.label(egui::RichText::new("Taille").size(10.5));
+        if ui.small_button("−").clicked() {
+            picked = Some((current - 1.0).round().max(min_size));
+        }
+        ui.label(egui::RichText::new(format!("{current:.0} pt")).size(10.5).strong());
+        if ui.small_button("+").clicked() {
+            picked = Some((current + 1.0).round().min(max_size));
+        }
+        for size in FREETEXT_FONT_SIZES {
+            let label = egui::RichText::new(format!("{size:.0}")).size(10.5);
+            if ui.selectable_label((current - size).abs() < 0.05, label).clicked() {
+                picked = Some(size);
+            }
+        }
+    });
+    picked
+}
+
+/// Position de la bulle à l'écran : sa place enregistrée, ou à côté de l'icône d'une note libre.
+fn comment_panel_origin(
+    annot: &PdfAnnotation,
+    page_rect: Rect,
+    page_dim: crate::pdf_engine::PageDimensions,
+) -> Pos2 {
+    let screen = annot.rect.to_screen_rect(page_rect, page_dim);
+    if annot.is_fixed_to_text() {
+        screen.min
+    } else {
+        screen.right_top() + Vec2::new(6.0, 0.0)
+    }
+}
+
+fn review_state_label(state: &str) -> &'static str {
+    REVIEW_STATES
+        .iter()
+        .find(|(value, _)| *value == state)
+        .map_or("", |(_, label)| *label)
+}
 
 /// Ligne de choix « Aucun + nuancier ». Retourne le nouveau choix quand l'utilisateur en fait un.
 fn color_choice_row(
@@ -192,6 +307,17 @@ pub struct SuperPdfApp {
     /// Bloc FreeText en cours d'édition directement sur la page
     editing_freetext_id: Option<u64>,
     freetext_focus_pending: bool,
+    /// Taille choisie pour les prochains blocs de texte
+    freetext_font_size: f32,
+    /// Saisie de l'ascenseur : décalage du pointeur par rapport au haut de la poignée
+    scrollbar_grab: Option<f32>,
+    pointer_on_scrollbar: bool,
+    /// Commentaire dont la bulle est ouverte
+    open_comment_id: Option<u64>,
+    comment_edit: Option<(u64, CommentEditTarget)>,
+    comment_focus_pending: bool,
+    comment_reply_focus_pending: bool,
+    comment_reply_draft: String,
     /// Dernier style choisi : les blocs suivants le reprennent (`None` tant que rien n'a été choisi)
     freetext_style: Option<(Option<Rgb>, Option<Rgb>)>,
     /// Un champ de saisie avait le focus à l'image précédente : seules ces images bloquent les raccourcis à une touche
@@ -296,6 +422,14 @@ impl SuperPdfApp {
             annotation_drag: None,
             editing_freetext_id: None,
             freetext_focus_pending: false,
+            freetext_font_size: FREETEXT_DEFAULT_FONT_SIZE,
+            scrollbar_grab: None,
+            pointer_on_scrollbar: false,
+            open_comment_id: None,
+            comment_edit: None,
+            comment_focus_pending: false,
+            comment_reply_focus_pending: false,
+            comment_reply_draft: String::new(),
             freetext_style: None,
             text_field_focused_prev: false,
             text_field_focused_now: false,
@@ -450,6 +584,7 @@ impl SuperPdfApp {
                     if let Some(first) = quads.first() {
                         let union_rect = quads.iter().fold(*first, |acc, q| acc.union(q));
                         tab.annotations.add_annotation(PdfAnnotation {
+                            meta: Default::default(),
                             id: 0,
                             page_index: target_page,
                             rect: union_rect,
@@ -862,7 +997,10 @@ impl SuperPdfApp {
                 self.command_palette.toggle();
             }
             if input.key_pressed(Key::Escape) {
-                if self.editing_freetext_id.is_some() || self.line_context_menu.is_some() {
+                if self.editing_freetext_id.is_some()
+                    || self.line_context_menu.is_some()
+                    || self.comment_edit.is_some()
+                {
                     // Géré par l'éditeur en place et le menu contextuel.
                 } else if self.command_palette.is_open {
                     self.command_palette.close();
@@ -1115,7 +1253,10 @@ impl SuperPdfApp {
                 .input(|i| i.pointer.hover_pos())
                 .map(|p| p.x <= SIDEBAR_WIDTH)
                 .unwrap_or(false);
-        if pointer_over_sidebar || (self.annotation_drag.is_none() && ctx.is_pointer_over_area()) {
+        if pointer_over_sidebar
+            || self.pointer_on_scrollbar
+            || (self.annotation_drag.is_none() && ctx.is_pointer_over_area())
+        {
             return;
         }
 
@@ -1202,7 +1343,9 @@ impl SuperPdfApp {
             .find(|a| {
                 a.page_index == page_index
                     && (a.hit_test(pt_x, pt_y)
-                        || (selected_id == Some(a.id) && a.rect.contains_pt(pt_x, pt_y, 0.0)))
+                        || (selected_id == Some(a.id)
+                            && matches!(a.kind, AnnotationKind::Ink { .. })
+                            && a.rect.contains_pt(pt_x, pt_y, 0.0)))
             })
             .map(|a| a.id);
 
@@ -1212,29 +1355,36 @@ impl SuperPdfApp {
             ActiveTool::Select | ActiveTool::Highlight | ActiveTool::StickyNote
         ) {
             if self.active_tool == ActiveTool::Select {
-                // Double-clic sur un bloc de texte ou une note : édition directement sur la page.
+                // Double-clic : édition du bloc de texte, ou du commentaire sur le texte marqué.
                 if double_clicked {
-                    let freetext_id = annotation_under_cursor.filter(|id| {
-                        tab.annotations.items.iter().any(|a| {
-                            a.id == *id
-                                && matches!(
-                                    a.kind,
-                                    AnnotationKind::FreeText { .. }
-                                        | AnnotationKind::StickyNote { .. }
-                                )
-                        })
-                    });
-                    if let Some(id) = freetext_id {
-                        tab.annotations.selected_id = Some(id);
-                        tab.annotations.push_undo_snapshot();
-                        self.annotation_drag = None;
-                        self.editing_freetext_id = Some(id);
-                        self.freetext_focus_pending = true;
-                        return;
+                    if let Some(id) = annotation_under_cursor {
+                        let kind = tab.annotations.items.iter().find(|a| a.id == id).map(|a| &a.kind);
+                        let is_freetext = matches!(kind, Some(AnnotationKind::FreeText { .. }));
+                        let is_comment = matches!(
+                            kind,
+                            Some(AnnotationKind::StickyNote { .. } | AnnotationKind::Highlight { .. })
+                        );
+                        if is_freetext || is_comment {
+                            tab.annotations.selected_id = Some(id);
+                            tab.annotations.push_undo_snapshot();
+                            self.annotation_drag = None;
+                            tab.text_selection.clear();
+                            if is_freetext {
+                                self.editing_freetext_id = Some(id);
+                                self.freetext_focus_pending = true;
+                            } else {
+                                if let Some(annot) = tab.annotations.selected_mut() {
+                                    annot.convert_highlight_to_note(page_dim);
+                                }
+                                self.comment_edit = Some((id, CommentEditTarget::Main));
+                                self.comment_focus_pending = true;
+                            }
+                            return;
+                        }
                     }
                 }
 
-                // Clic droit sur une flèche : menu des attributs.
+                // Clic droit sur une annotation : menu de ses attributs.
                 if ctx.input(|i| i.pointer.secondary_released()) {
                     let arrow_id = annotation_under_cursor.filter(|id| {
                         tab.annotations.items.iter().any(|a| {
@@ -1245,6 +1395,8 @@ impl SuperPdfApp {
                                         shape_kind: ShapeKind::ArrowLine { .. },
                                         ..
                                     } | AnnotationKind::FreeText { .. }
+                                        | AnnotationKind::StickyNote { .. }
+                                        | AnnotationKind::Highlight { .. }
                                 )
                         })
                     });
@@ -1278,7 +1430,9 @@ impl SuperPdfApp {
             }
 
             if primary_pressed {
-                // 1a. Poignée de l'annotation sélectionnée, sinon annotation sous le curseur
+                // 1a. Poignée de l'annotation sélectionnée, sinon annotation sous le curseur.
+                // Surlignages et notes sont solidaires du texte : ils se sélectionnent sans se déplacer.
+                let mut keep_annotation_selected = false;
                 if self.active_tool == ActiveTool::Select && !alt_held {
                     let grabbed = selected_handle
                         .map(|handle| (tab.annotations.selected_id, handle))
@@ -1287,22 +1441,29 @@ impl SuperPdfApp {
                         });
                     if let Some((Some(id), handle)) = grabbed {
                         tab.annotations.selected_id = Some(id);
-                        if let Some(original) = tab.annotations.selected().cloned() {
-                            self.annotation_drag = Some(AnnotationDrag {
-                                id,
-                                handle,
-                                grab_pt: (pt_x, pt_y),
-                                original,
-                                has_moved: false,
-                            });
+                        let original = tab.annotations.selected().cloned();
+                        if original.as_ref().is_some_and(|a| a.is_fixed_to_text()) {
+                            keep_annotation_selected = true;
+                        } else {
+                            if let Some(original) = original {
+                                self.annotation_drag = Some(AnnotationDrag {
+                                    id,
+                                    handle,
+                                    grab_pt: (pt_x, pt_y),
+                                    original,
+                                    has_moved: false,
+                                });
+                            }
+                            tab.text_selection.clear();
+                            return;
                         }
-                        tab.text_selection.clear();
-                        return;
                     }
                 }
 
                 // 1b. Sinon, démarrer une sélection de texte (Flux Curseur I par défaut, ou Rectangle si Alt maintenu)
-                tab.annotations.selected_id = None;
+                if !keep_annotation_selected {
+                    tab.annotations.selected_id = None;
+                }
                 self.annotation_drag = None;
                 tab.request_page_text(page_index, &self.workers, true);
                 tab.text_selection.page_index = Some(page_index);
@@ -1384,6 +1545,13 @@ impl SuperPdfApp {
             if primary_released {
                 self.annotation_drag = None;
 
+                // Un glissé sur du texte marqué est une sélection de texte, pas un clic sur l'annotation.
+                if tab.text_selection.has_selection()
+                    && tab.annotations.selected().is_some_and(|a| a.is_fixed_to_text())
+                {
+                    tab.annotations.selected_id = None;
+                }
+
                 // Outil Note : la note s'attache à la sélection, ou au mot cliqué.
                 if self.active_tool == ActiveTool::StickyNote {
                     if !tab.text_selection.has_selection() {
@@ -1401,9 +1569,8 @@ impl SuperPdfApp {
                         let note = PdfAnnotation::new_text_note(page_index, quads, color, page_dim);
                         let new_id = tab.annotations.add_annotation(note);
                         tab.is_modified = true;
-                        self.editing_freetext_id = Some(new_id);
-                        self.freetext_focus_pending = true;
-                        self.freetext_awaiting_opening_release = true;
+                        self.comment_edit = Some((new_id, CommentEditTarget::Main));
+                        self.comment_focus_pending = true;
                         self.active_tool = ActiveTool::Select;
                     }
                 }
@@ -1415,6 +1582,7 @@ impl SuperPdfApp {
                         let union_rect = quads.iter().fold(*first, |acc, q| acc.union(q));
                         let color = tab.annotations.active_color_rgb;
                         tab.annotations.add_annotation(PdfAnnotation {
+                            meta: Default::default(),
                             id: 0,
                             page_index,
                             rect: union_rect,
@@ -1444,13 +1612,15 @@ impl SuperPdfApp {
                     .freetext_style
                     .unwrap_or((Some(FREETEXT_DEFAULT_FILL), Some(color)));
                 let new_id = tab.annotations.add_annotation(PdfAnnotation {
+                    meta: Default::default(),
                     id: 0,
                     page_index,
                     rect,
                     color_rgb: color,
                     kind: AnnotationKind::FreeText {
                         text: String::new(),
-                        font_size: 11.5,
+                        font_size: self.freetext_font_size,
+                        text_rgb: FREETEXT_TEXT_RGB,
                         fill_rgb,
                         border_rgb,
                     },
@@ -1544,6 +1714,7 @@ impl SuperPdfApp {
                     let is_ink = matches!(kind, AnnotationKind::Ink { .. });
                     let is_shape = matches!(kind, AnnotationKind::Shape { .. });
                     let mut annotation = PdfAnnotation {
+                        meta: Default::default(),
                         id: 0,
                         page_index,
                         rect,
@@ -1618,6 +1789,7 @@ impl eframe::App for SuperPdfApp {
                 let _response = ui.allocate_rect(canvas_rect, Sense::click_and_drag());
 
                 self.handle_inputs(ctx, canvas_rect);
+                self.handle_scrollbar(ctx, canvas_rect);
 
                 if let Some(tab) = self.tabs.get_mut(self.active_tab) {
                     if tab.is_hibernated() {
@@ -1696,7 +1868,6 @@ impl eframe::App for SuperPdfApp {
                         Color32::from_rgb(255, 110, 110),
                     );
                 } else if let Some(tab) = self.tabs.get(self.active_tab) {
-                    let viewport_size = canvas_rect.size();
                     let (_, _, total_h) = tab.viewport.compute_layout(&tab.page_dimensions);
                     // Le rendu suit les pixels physiques de l'écran (échelle Windows comprise), et n'est
                     // recalculé qu'une fois le geste de zoom terminé : l'image existante est étirée entre-temps.
@@ -2192,33 +2363,38 @@ impl eframe::App for SuperPdfApp {
                         );
                     }
 
-                    // Mini barre de défilement verticale ultra-fine à droite (4 px)
-                    if total_h > viewport_size.y {
-                        let scrollbar_track_h = viewport_size.y - 24.0;
-                        let thumb_ratio = (viewport_size.y / total_h).clamp(0.06, 1.0);
-                        let thumb_h = scrollbar_track_h * thumb_ratio;
-                        let scroll_progress = (tab.viewport.scroll_offset.y
-                            / (total_h - viewport_size.y))
-                            .clamp(0.0, 1.0);
-                        let thumb_y = canvas_rect.min.y
-                            + 12.0
-                            + scroll_progress * (scrollbar_track_h - thumb_h);
-
+                    // Ascenseur vertical : s'élargit quand il est survolé ou saisi.
+                    if let Some(bar) =
+                        ScrollbarGeometry::compute(canvas_rect, total_h, tab.viewport.scroll_offset.y)
+                    {
+                        let is_active = self.pointer_on_scrollbar || self.scrollbar_grab.is_some();
+                        let (bar_width, alpha) = if is_active { (10.0, 220) } else { (4.0, 140) };
                         let thumb_rect = Rect::from_min_size(
-                            Pos2::new(canvas_rect.max.x - 8.0, thumb_y),
-                            Vec2::new(4.0, thumb_h),
+                            Pos2::new(canvas_rect.max.x - 4.0 - bar_width, bar.thumb_top),
+                            Vec2::new(bar_width, bar.thumb_height),
                         );
+                        if is_active {
+                            painter.rect_filled(
+                                Rect::from_min_max(
+                                    Pos2::new(thumb_rect.min.x, bar.track_top),
+                                    Pos2::new(thumb_rect.max.x, bar.track_top + bar.track_height),
+                                ),
+                                CornerRadius::same(4),
+                                Color32::from_rgba_unmultiplied(120, 130, 150, 45),
+                            );
+                        }
                         painter.rect_filled(
                             thumb_rect,
-                            CornerRadius::same(2),
-                            Color32::from_rgba_unmultiplied(150, 170, 210, 140),
+                            CornerRadius::same(4),
+                            Color32::from_rgba_unmultiplied(150, 170, 210, alpha),
                         );
                     }
                 }
 
                 // Barre flottante d'action sur le texte sélectionné (`📋 Copier Ctrl+C` + `✒ Surligner H`)
+                // Masquée pendant le glissé : elle se retrouverait sous le pointeur au moment du relâchement.
                 if let Some((anchor_pos, sel_text, char_count, copied_ok, sel_mode)) =
-                    selection_toolbar_anchor
+                    selection_toolbar_anchor.filter(|_| !ctx.input(|i| i.pointer.primary_down()))
                 {
                     self.render_selection_floating_bar(
                         ctx,
@@ -2231,6 +2407,7 @@ impl eframe::App for SuperPdfApp {
                 }
 
                 self.render_freetext_editor(ctx, &visible_pages_info);
+                self.render_comment_panel(ctx, canvas_rect, &visible_pages_info);
                 self.render_line_context_menu(ctx);
 
                 // Barre de recherche flottante `Ctrl+F`
@@ -2337,6 +2514,7 @@ impl SuperPdfApp {
                 AnnotationKind::FreeText {
                     text,
                     font_size,
+                    text_rgb,
                     fill_rgb,
                     border_rgb,
                 } => {
@@ -2359,7 +2537,7 @@ impl SuperPdfApp {
                         let galley = painter.layout(
                             text.clone(),
                             FontId::proportional(font_size * sy),
-                            Color32::from_rgb(20, 24, 34),
+                            Color32::from_rgb(text_rgb.0, text_rgb.1, text_rgb.2),
                             (screen_rect.width() - 12.0 * sx).max(10.0),
                         );
                         painter.with_clip_rect(screen_rect).galley(
@@ -2399,6 +2577,19 @@ impl SuperPdfApp {
                             StrokeKind::Outside,
                         );
                     }
+                    ShapeKind::Ellipse => {
+                        let (radius_x, radius_y) =
+                            (screen_rect.width() * 0.5, screen_rect.height() * 0.5);
+                        let center = screen_rect.center();
+                        let mut outline: Vec<Pos2> = (0..64)
+                            .map(|i| {
+                                let angle = i as f32 / 64.0 * std::f32::consts::TAU;
+                                center + Vec2::new(angle.cos() * radius_x, angle.sin() * radius_y)
+                            })
+                            .collect();
+                        outline.push(outline[0]);
+                        painter.add(egui::Shape::line(outline, Stroke::new(2.0_f32, stroke_col)));
+                    }
                     ShapeKind::ArrowLine {
                         start_head,
                         end_head,
@@ -2437,69 +2628,99 @@ impl SuperPdfApp {
                 },
                 AnnotationKind::StickyNote {
                     comment,
-                    is_popup_open,
                     anchor_quads,
+                    ..
                 } => {
-                    let is_editing = editing_id == Some(annot.id);
-                    let anchor_hovered = hover_pos.is_some_and(|p| {
-                        anchor_quads
-                            .iter()
-                            .any(|q| q.to_screen_rect(page_rect, page_dim).expand(2.0).contains(p))
+                    let anchored = !anchor_quads.is_empty();
+                    let hovered = hover_pos.is_some_and(|p| {
+                        if anchored {
+                            anchor_quads
+                                .iter()
+                                .any(|q| q.to_screen_rect(page_rect, page_dim).expand(2.0).contains(p))
+                        } else {
+                            screen_rect.expand(2.0).contains(p)
+                        }
                     });
-                    if let Some(last) = anchor_quads.last() {
-                        let end = last.to_screen_rect(page_rect, page_dim);
-                        painter.text(
-                            Pos2::new(end.max.x + 2.0, end.min.y),
-                            Align2::LEFT_BOTTOM,
-                            "💬",
-                            FontId::proportional((11.0 * sy).clamp(10.0, 18.0)),
-                            stroke_col,
-                        );
-                    }
-                    let bubble_open = is_selected
-                        || is_editing
-                        || anchor_hovered
-                        || (anchor_quads.is_empty() && *is_popup_open);
-                    if !bubble_open {
-                        continue;
+                    let marker_font = FontId::proportional((11.0 * sy).clamp(10.0, 18.0));
+                    match anchor_quads.last() {
+                        Some(last) => {
+                            let end = last.to_screen_rect(page_rect, page_dim);
+                            painter.text(
+                                Pos2::new(end.max.x + 2.0, end.min.y),
+                                Align2::LEFT_BOTTOM,
+                                "💬",
+                                marker_font,
+                                stroke_col,
+                            );
+                        }
+                        None => {
+                            painter.text(
+                                screen_rect.center(),
+                                Align2::CENTER_CENTER,
+                                "💬",
+                                marker_font,
+                                stroke_col,
+                            );
+                        }
                     }
 
+                    // Aperçu au survol ; la bulle complète s'ouvre à la sélection.
+                    if !hovered || is_selected {
+                        continue;
+                    }
+                    let origin = comment_panel_origin(annot, page_rect, page_dim);
+                    let inner_width = COMMENT_PANEL_WIDTH - 20.0;
+                    let date = format_pdf_date(if annot.meta.modified.is_empty() {
+                        &annot.meta.created
+                    } else {
+                        &annot.meta.modified
+                    });
+                    let header = painter.layout_no_wrap(
+                        format!("{}   {}", annot.meta.author, date),
+                        FontId::proportional(11.5),
+                        INLINE_TEXT_COLOR,
+                    );
+                    let body = painter.layout(
+                        comment.clone(),
+                        FontId::proportional(13.0),
+                        INLINE_TEXT_COLOR,
+                        inner_width,
+                    );
+                    let replies_text = match annot.meta.replies.len() {
+                        0 => String::new(),
+                        1 => "1 réponse".to_string(),
+                        n => format!("{n} réponses"),
+                    };
+                    let replies = painter.layout_no_wrap(
+                        replies_text,
+                        FontId::proportional(11.0),
+                        COMMENT_MUTED_TEXT,
+                    );
+                    let height = 24.0 + header.size().y + body.size().y + replies.size().y;
+                    let bubble = Rect::from_min_size(origin, Vec2::new(COMMENT_PANEL_WIDTH, height));
                     if let Some(first) = anchor_quads.first() {
-                        let anchor = first.to_screen_rect(page_rect, page_dim);
-                        let start = anchor.center();
+                        let start = first.to_screen_rect(page_rect, page_dim).center();
                         painter.line_segment(
-                            [start, screen_rect.clamp(start)],
+                            [start, bubble.clamp(start)],
                             Stroke::new(1.0_f32, stroke_col),
                         );
                     }
-                    painter.rect_filled(
-                        screen_rect,
-                        CornerRadius::same(4),
-                        Color32::from_rgb(255, 248, 214),
-                    );
+                    painter.rect_filled(bubble, CornerRadius::same(4), COMMENT_PANEL_BACKGROUND);
                     painter.rect_stroke(
-                        screen_rect,
+                        bubble,
                         CornerRadius::same(4),
                         Stroke::new(1.2_f32, stroke_col),
                         StrokeKind::Outside,
                     );
-                    let header = Rect::from_min_size(
-                        screen_rect.min,
-                        Vec2::new(screen_rect.width(), NOTE_HEADER_HEIGHT_PT * sy),
-                    );
-                    painter.rect_filled(header, CornerRadius::same(3), stroke_col);
-                    if !is_editing {
-                        let galley = painter.layout(
-                            comment.clone(),
-                            FontId::proportional(NOTE_FONT_SIZE_PT * sy),
-                            INLINE_TEXT_COLOR,
-                            (screen_rect.width() - 12.0 * sx).max(10.0),
-                        );
-                        painter.with_clip_rect(screen_rect).galley(
-                            header.left_bottom() + Vec2::new(6.0 * sx, 4.0 * sy),
+                    let mut cursor_y = bubble.min.y + 8.0;
+                    for galley in [header, body, replies] {
+                        let height = galley.size().y;
+                        painter.galley(
+                            Pos2::new(bubble.min.x + 10.0, cursor_y),
                             galley,
                             INLINE_TEXT_COLOR,
                         );
+                        cursor_y += height + 4.0;
                     }
                 }
                 AnnotationKind::Measure {
@@ -2552,7 +2773,7 @@ impl SuperPdfApp {
             }
 
             // Sélection : deux points aux extrémités d'une ligne, cadre et coins pour le reste.
-            if is_selected {
+            if is_selected && !matches!(annot.kind, AnnotationKind::StickyNote { .. }) {
                 const HANDLE_COLOR: Color32 = Color32::from_rgb(90, 175, 255);
                 if let Some((start, end)) = annot.line_endpoints() {
                     for point in [start, end] {
@@ -2589,6 +2810,86 @@ impl SuperPdfApp {
         }
     }
 
+    /// Clic ou glissé sur l'ascenseur vertical.
+    fn handle_scrollbar(&mut self, ctx: &Context, canvas_rect: Rect) {
+        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+            self.pointer_on_scrollbar = false;
+            return;
+        };
+        let (_, _, total_height) = tab.viewport.compute_layout(&tab.page_dimensions);
+        let Some(bar) =
+            ScrollbarGeometry::compute(canvas_rect, total_height, tab.viewport.scroll_offset.y)
+        else {
+            self.pointer_on_scrollbar = false;
+            self.scrollbar_grab = None;
+            return;
+        };
+
+        let (pointer, pressed, down) = ctx.input(|i| {
+            (
+                i.pointer.hover_pos(),
+                i.pointer.primary_pressed(),
+                i.pointer.primary_down(),
+            )
+        });
+        let over_floating_panel = ctx.is_pointer_over_area();
+        self.pointer_on_scrollbar = self.scrollbar_grab.is_some()
+            || (!over_floating_panel && pointer.is_some_and(|p| bar.hit_area.contains(p)));
+
+        if pressed && self.pointer_on_scrollbar {
+            if let Some(y) = pointer.map(|p| p.y) {
+                // Sur la poignée : on garde le point de saisie. Ailleurs : la poignée vient sous le pointeur.
+                self.scrollbar_grab = Some(if bar.contains_thumb_y(y) {
+                    y - bar.thumb_top
+                } else {
+                    bar.thumb_height * 0.5
+                });
+            }
+        }
+        if !down {
+            self.scrollbar_grab = None;
+        }
+        if let (Some(grab), Some(pointer)) = (self.scrollbar_grab, pointer) {
+            tab.viewport.scroll_offset.y = bar.scroll_for_thumb_top(pointer.y - grab);
+            tab.viewport.inertia_velocity = Vec2::ZERO;
+            tab.viewport
+                .clamp_scroll(canvas_rect.size(), &tab.page_dimensions);
+            ctx.request_repaint();
+        }
+        if self.pointer_on_scrollbar {
+            ctx.set_cursor_icon(egui::CursorIcon::Default);
+        }
+    }
+
+    fn apply_tab_menu_action(&mut self, index: usize, action: TabMenuAction) {
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        let full_path = std::path::absolute(&tab.path).unwrap_or_else(|_| tab.path.clone());
+        match action {
+            TabMenuAction::RevealInExplorer => {
+                // `/select,` exige des guillemets que `Command::arg` échapperait.
+                let _ = std::process::Command::new("explorer")
+                    .raw_arg(format!("/select,\"{}\"", full_path.display()))
+                    .spawn();
+            }
+            TabMenuAction::OpenWithDefaultApp => {
+                let _ = std::process::Command::new("explorer").arg(&full_path).spawn();
+            }
+            TabMenuAction::CloseThis => self.close_tab(index),
+            TabMenuAction::CloseOthers => {
+                for other in (0..self.tabs.len()).rev().filter(|i| *i != index) {
+                    self.close_tab(other);
+                }
+            }
+            TabMenuAction::CloseBelow => {
+                for below in (index + 1..self.tabs.len()).rev() {
+                    self.close_tab(below);
+                }
+            }
+        }
+    }
+
     /// Champ de saisie posé exactement sur le bloc FreeText en cours d'édition.
     fn render_freetext_editor(&mut self, ctx: &Context, visible_pages: &[(usize, Rect)]) {
         let Some(editing_id) = self.editing_freetext_id else {
@@ -2614,22 +2915,19 @@ impl SuperPdfApp {
         let screen_rect = annot.rect.to_screen_rect(page_rect, page_dim);
         let scale_y = page_rect.height() / page_dim.height_pt.max(1.0);
         let scale_x = page_rect.width() / page_dim.width_pt.max(1.0);
-        let (text, font_size, top_inset) = match &mut annot.kind {
-            AnnotationKind::FreeText { text, font_size, .. } => (text, *font_size, 0.0),
-            AnnotationKind::StickyNote { comment, .. } => {
-                (comment, NOTE_FONT_SIZE_PT, NOTE_HEADER_HEIGHT_PT * scale_y)
-            }
-            _ => {
-                self.editing_freetext_id = None;
-                return;
-            }
+        let AnnotationKind::FreeText {
+            text,
+            font_size,
+            text_rgb,
+            ..
+        } = &mut annot.kind
+        else {
+            self.editing_freetext_id = None;
+            return;
         };
-        let font = FontId::proportional(font_size * scale_y);
-        let editor_rect = Rect::from_min_max(
-            screen_rect.min + Vec2::new(0.0, top_inset),
-            screen_rect.max,
-        );
-        // Un clic dans la barre latérale (couleurs...) ne doit pas fermer le bloc en cours d'écriture.
+        let font = FontId::proportional(*font_size * scale_y);
+        let text_color = Color32::from_rgb(text_rgb.0, text_rgb.1, text_rgb.2);
+        // Un clic dans la barre latérale (couleurs, taille...) ne doit pas fermer le bloc en cours d'écriture.
         let pointer_in_sidebar = self.sidebar.is_expanded()
             && ctx
                 .input(|i| i.pointer.hover_pos())
@@ -2643,15 +2941,15 @@ impl SuperPdfApp {
             self.freetext_awaiting_opening_release = false;
         }
         egui::Area::new(egui::Id::new("superpdf_freetext_editor").with(editing_id))
-            .fixed_pos(editor_rect.min)
+            .fixed_pos(screen_rect.min)
             .order(Order::Foreground)
             .show(ctx, |ui| {
                 let response = ui.add_sized(
-                    editor_rect.size(),
+                    screen_rect.size(),
                     egui::TextEdit::multiline(text)
                         .frame(false)
                         .font(font)
-                        .text_color(Color32::from_rgb(20, 24, 34))
+                        .text_color(text_color)
                         .hint_text("Saisissez votre texte...")
                         .margin(egui::vec2(6.0 * scale_x, 4.0 * scale_y)),
                 );
@@ -2676,11 +2974,7 @@ impl SuperPdfApp {
                 .items
                 .iter()
                 .find(|a| a.id == editing_id)
-                .is_some_and(|a| match &a.kind {
-                    AnnotationKind::FreeText { text, .. } => text.trim().is_empty(),
-                    AnnotationKind::StickyNote { comment, .. } => comment.trim().is_empty(),
-                    _ => false,
-                });
+                .is_some_and(|a| matches!(&a.kind, AnnotationKind::FreeText { text, .. } if text.trim().is_empty()));
             if is_blank {
                 tab.annotations.selected_id = Some(editing_id);
                 tab.annotations.delete_selected();
@@ -2688,7 +2982,318 @@ impl SuperPdfApp {
         }
     }
 
-    /// Menu du clic droit sur une flèche : couleur et style de chaque extrémité.
+    /// Bulle de commentaire façon Acrobat : auteur, heure, texte, réponses et état de révision.
+    fn render_comment_panel(
+        &mut self,
+        ctx: &Context,
+        canvas_rect: Rect,
+        visible_pages: &[(usize, Rect)],
+    ) {
+        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+            return;
+        };
+        let selected_note = tab
+            .annotations
+            .selected()
+            .filter(|a| matches!(a.kind, AnnotationKind::StickyNote { .. }))
+            .map(|a| a.id);
+
+        if self.open_comment_id != selected_note {
+            // Un commentaire refermé sans contenu ne laisse pas de trace.
+            if let Some(previous) = self.open_comment_id {
+                if let Some(index) = tab
+                    .annotations
+                    .items
+                    .iter()
+                    .position(|a| a.id == previous && a.is_empty_comment())
+                {
+                    if tab.annotations.items[index].meta.was_highlight {
+                        tab.annotations.items[index].revert_empty_comment_to_highlight();
+                    } else {
+                        tab.annotations.items.remove(index);
+                    }
+                }
+            }
+            self.open_comment_id = selected_note;
+            self.comment_reply_draft.clear();
+        }
+        if self.comment_edit.is_some_and(|(id, _)| Some(id) != selected_note) {
+            self.comment_edit = None;
+        }
+        let Some(note_id) = selected_note else {
+            return;
+        };
+        let Some(annot) = tab.annotations.items.iter().find(|a| a.id == note_id).cloned() else {
+            return;
+        };
+        let Some(page_rect) = visible_pages
+            .iter()
+            .find(|(p, _)| *p == annot.page_index)
+            .map(|(_, r)| *r)
+        else {
+            return;
+        };
+        let AnnotationKind::StickyNote { comment, .. } = &annot.kind else {
+            return;
+        };
+        let page_dim = tab.page_dimensions[annot.page_index];
+        let scale = page_rect.width() / page_dim.width_pt.max(1.0);
+        let origin = comment_panel_origin(&annot, page_rect, page_dim);
+        let panel_pos = Pos2::new(
+            origin.x.clamp(canvas_rect.min.x + 8.0, (canvas_rect.max.x - COMMENT_PANEL_WIDTH - 28.0).max(canvas_rect.min.x + 8.0)),
+            origin.y.clamp(canvas_rect.min.y + 8.0, (canvas_rect.max.y - 120.0).max(canvas_rect.min.y + 8.0)),
+        );
+
+        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+            self.comment_edit = None;
+        }
+        let editing = self.comment_edit.map(|(_, target)| target);
+        let mut main_text = comment.clone();
+        let mut edited_reply: Option<(usize, String)> = match editing {
+            Some(CommentEditTarget::Reply(index)) => annot
+                .meta
+                .replies
+                .get(index)
+                .map(|reply| (index, reply.text.clone())),
+            _ => None,
+        };
+        let focus_edit = std::mem::take(&mut self.comment_focus_pending);
+        let focus_reply = std::mem::take(&mut self.comment_reply_focus_pending);
+        let mut draft = std::mem::take(&mut self.comment_reply_draft);
+        let mut close_panel = false;
+        let mut send_reply = false;
+        let mut delete_reply = None;
+        let mut start_edit = None;
+        let mut finish_edit = false;
+        let mut header_drag = Vec2::ZERO;
+        let mut reply_has_focus = false;
+        let mut open_menu_at = None;
+
+        let area = egui::Area::new(egui::Id::new("superpdf_comment_panel").with(note_id))
+            .fixed_pos(panel_pos)
+            .order(Order::Foreground)
+            .show(ctx, |ui| {
+                ui.visuals_mut().override_text_color = Some(INLINE_TEXT_COLOR);
+                ui.visuals_mut().extreme_bg_color = Color32::from_rgb(245, 246, 248);
+                ui.visuals_mut().widgets.inactive.weak_bg_fill = Color32::from_rgb(236, 238, 242);
+                ui.visuals_mut().widgets.hovered.weak_bg_fill = Color32::from_rgb(222, 226, 233);
+                egui::Frame::NONE
+                    .fill(COMMENT_PANEL_BACKGROUND)
+                    .stroke(Stroke::new(1.5_f32, annot.egui_color(255)))
+                    .corner_radius(CornerRadius::same(6))
+                    .inner_margin(Margin::same(10))
+                    .shadow(egui::epaint::Shadow {
+                        offset: [0, 3],
+                        blur: 10,
+                        spread: 0,
+                        color: Color32::from_black_alpha(70),
+                    })
+                    .show(ui, |ui| {
+                        ui.set_width(COMMENT_PANEL_WIDTH - 20.0);
+                        let date = if annot.meta.modified.is_empty() {
+                            &annot.meta.created
+                        } else {
+                            &annot.meta.modified
+                        };
+                        let header = ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(&annot.meta.author).strong().color(INLINE_TEXT_COLOR));
+                            ui.label(egui::RichText::new(format_pdf_date(date)).size(11.0).color(COMMENT_MUTED_TEXT));
+                            if let Some(review) = annot.meta.review_state.as_ref().filter(|r| r.state != "None") {
+                                ui.label(
+                                    egui::RichText::new(review_state_label(&review.state))
+                                        .size(10.5)
+                                        .color(Color32::from_rgb(30, 110, 200)),
+                                );
+                            }
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.small_button("✖").on_hover_text("Fermer").clicked() {
+                                    close_panel = true;
+                                }
+                                let more = ui.small_button("…").on_hover_text("Options");
+                                if more.clicked() {
+                                    open_menu_at = Some(more.rect.left_bottom());
+                                }
+                            });
+                        });
+                        if annot.is_fixed_to_text() {
+                            let drag = ui.interact(
+                                header.response.rect,
+                                ui.id().with("comment_header"),
+                                Sense::drag(),
+                            );
+                            header_drag = drag.drag_delta();
+                        }
+
+                        if editing == Some(CommentEditTarget::Main) {
+                            let field = ui.add(
+                                egui::TextEdit::multiline(&mut main_text)
+                                    .desired_rows(2)
+                                    .desired_width(f32::INFINITY)
+                                    .hint_text("Saisissez votre commentaire..."),
+                            );
+                            if focus_edit {
+                                field.request_focus();
+                            }
+                            if ui.small_button("Terminer").clicked() {
+                                finish_edit = true;
+                            }
+                        } else {
+                            let label = ui.add(egui::Label::new(comment.as_str()).wrap().sense(Sense::click()));
+                            if label.double_clicked() {
+                                start_edit = Some(CommentEditTarget::Main);
+                            }
+                        }
+
+                        for (index, reply) in annot.meta.replies.iter().enumerate() {
+                            ui.separator();
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new(&reply.author).strong().size(12.0).color(INLINE_TEXT_COLOR));
+                                ui.label(egui::RichText::new(format_pdf_date(&reply.date)).size(10.5).color(COMMENT_MUTED_TEXT));
+                            });
+                            match edited_reply.as_mut().filter(|(i, _)| *i == index) {
+                                Some((_, text)) => {
+                                    let field = ui.add(
+                                        egui::TextEdit::multiline(text)
+                                            .desired_rows(1)
+                                            .desired_width(f32::INFINITY),
+                                    );
+                                    if focus_edit {
+                                        field.request_focus();
+                                    }
+                                    if ui.small_button("Terminer").clicked() {
+                                        finish_edit = true;
+                                    }
+                                }
+                                None => {
+                                    let label = ui.add(egui::Label::new(reply.text.as_str()).wrap().sense(Sense::click()));
+                                    if label.double_clicked() {
+                                        start_edit = Some(CommentEditTarget::Reply(index));
+                                    }
+                                    label.context_menu(|ui| {
+                                        if ui.button("Modifier").clicked() {
+                                            start_edit = Some(CommentEditTarget::Reply(index));
+                                            ui.close_menu();
+                                        }
+                                        if ui.button("Supprimer").clicked() {
+                                            delete_reply = Some(index);
+                                            ui.close_menu();
+                                        }
+                                    });
+                                }
+                            }
+                        }
+
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            let field = ui.add(
+                                egui::TextEdit::singleline(&mut draft)
+                                    .desired_width(COMMENT_PANEL_WIDTH - 96.0)
+                                    .hint_text("Ajouter une réponse"),
+                            );
+                            if focus_reply {
+                                field.request_focus();
+                            }
+                            reply_has_focus = field.has_focus();
+                            let pressed_enter =
+                                field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                            let can_send = !draft.trim().is_empty();
+                            if ui.add_enabled(can_send, egui::Button::new("Répondre").small()).clicked()
+                                || (pressed_enter && can_send)
+                            {
+                                send_reply = true;
+                            }
+                        });
+                    });
+            });
+        self.comment_reply_draft = draft;
+        if editing.is_some() || reply_has_focus {
+            self.text_field_focused_now = true;
+        }
+
+        let panel_rect = area.response.rect;
+        let right_clicked_inside = ctx.input(|i| {
+            i.pointer.secondary_released()
+                && i.pointer.hover_pos().is_some_and(|p| panel_rect.contains(p))
+        });
+        if right_clicked_inside && self.comment_edit.is_none() && !ctx.is_context_menu_open() {
+            open_menu_at = ctx.input(|i| i.pointer.hover_pos());
+        }
+
+        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+            return;
+        };
+        if header_drag != Vec2::ZERO {
+            if let Some(target) = tab.annotations.items.iter_mut().find(|a| a.id == note_id) {
+                target.translate(header_drag.x / scale, header_drag.y / scale);
+                tab.is_modified = true;
+            }
+        }
+        if main_text != *comment {
+            if let Some(PdfAnnotation {
+                kind: AnnotationKind::StickyNote { comment, .. },
+                ..
+            }) = tab.annotations.items.iter_mut().find(|a| a.id == note_id)
+            {
+                *comment = main_text;
+                tab.is_modified = true;
+            }
+        }
+        if let Some((index, text)) = edited_reply {
+            if let Some(reply) = tab
+                .annotations
+                .items
+                .iter_mut()
+                .find(|a| a.id == note_id)
+                .and_then(|a| a.meta.replies.get_mut(index))
+            {
+                if reply.text != text {
+                    reply.text = text;
+                    tab.is_modified = true;
+                }
+            }
+        }
+        if let Some(index) = delete_reply {
+            tab.annotations.push_undo_snapshot();
+            if let Some(target) = tab.annotations.items.iter_mut().find(|a| a.id == note_id) {
+                target.meta.replies.remove(index);
+                tab.is_modified = true;
+            }
+        }
+        if send_reply {
+            tab.annotations.push_undo_snapshot();
+            if let Some(target) = tab.annotations.items.iter_mut().find(|a| a.id == note_id) {
+                target.meta.replies.push(CommentReply {
+                    author: default_author(),
+                    date: pdf_date_now(),
+                    text: self.comment_reply_draft.trim().to_string(),
+                    ..Default::default()
+                });
+                tab.is_modified = true;
+            }
+            self.comment_reply_draft.clear();
+            self.comment_reply_focus_pending = true;
+        }
+        if let Some(target) = start_edit {
+            tab.annotations.push_undo_snapshot();
+            self.comment_edit = Some((note_id, target));
+            self.comment_focus_pending = true;
+        }
+        if finish_edit {
+            self.comment_edit = None;
+        }
+        if close_panel {
+            tab.annotations.selected_id = None;
+        }
+        if let Some(position) = open_menu_at {
+            self.line_context_menu = Some(LineContextMenu {
+                annotation_id: note_id,
+                position,
+                opened_on_frame: self.frame_count,
+            });
+        }
+    }
+
+    /// Menu du clic droit : attributs d'une flèche ou d'un bloc, actions d'un commentaire.
     fn render_line_context_menu(&mut self, ctx: &Context) {
         let Some(menu) = &self.line_context_menu else {
             return;
@@ -2721,22 +3326,31 @@ impl SuperPdfApp {
         };
         let block_style = match annot.kind {
             AnnotationKind::FreeText {
+                font_size,
                 fill_rgb,
                 border_rgb,
                 ..
-            } => Some((fill_rgb, border_rgb)),
+            } => Some((font_size, fill_rgb, border_rgb)),
             _ => None,
         };
-        if arrow_heads.is_none() && block_style.is_none() {
+        let is_note = matches!(annot.kind, AnnotationKind::StickyNote { .. });
+        let is_highlight = matches!(annot.kind, AnnotationKind::Highlight { .. });
+        if arrow_heads.is_none() && block_style.is_none() && !is_note && !is_highlight {
             self.line_context_menu = None;
             return;
         }
 
         let mut new_fill = None;
         let mut new_border = None;
+        let mut new_size = None;
         let mut new_color = None;
         let mut new_start = None;
         let mut new_end = None;
+        let mut new_state: Option<&'static str> = None;
+        let mut reply_requested = false;
+        let mut edit_requested = false;
+        let mut comment_requested = false;
+        let mut delete_requested = false;
         let ending_row = |ui: &mut egui::Ui, title: &str, current: LineEnding| {
             let mut picked = None;
             ui.horizontal(|ui| {
@@ -2749,17 +3363,52 @@ impl SuperPdfApp {
             });
             picked
         };
+        let current_state = annot
+            .meta
+            .review_state
+            .as_ref()
+            .map_or("None", |r| r.state.as_str());
 
         let area = egui::Area::new(egui::Id::new("superpdf_line_context_menu"))
             .fixed_pos(position)
             .order(Order::Tooltip)
             .show(ctx, |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    if let Some((fill, border)) = block_style {
+                    if is_note {
+                        if ui.button("Répondre").clicked() {
+                            reply_requested = true;
+                        }
+                        if ui.button("Modifier le commentaire").clicked() {
+                            edit_requested = true;
+                        }
+                        if ui.button("Supprimer").clicked() {
+                            delete_requested = true;
+                        }
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("État").size(11.0));
+                            for (value, label) in REVIEW_STATES {
+                                if ui.selectable_label(current_state == value, label).clicked() {
+                                    new_state = Some(value);
+                                }
+                            }
+                        });
+                    }
+                    if is_highlight {
+                        if ui.button("Ajouter un commentaire").clicked() {
+                            comment_requested = true;
+                        }
+                        if ui.button("Supprimer").clicked() {
+                            delete_requested = true;
+                        }
+                        ui.separator();
+                    }
+                    if let Some((font_size, fill, border)) = block_style {
                         new_fill = color_choice_row(ui, "Fond", fill, &FREETEXT_FILL_CHOICES);
                         new_border = color_choice_row(ui, "Contour", border, &FREETEXT_BORDER_CHOICES);
+                        new_size = font_size_row(ui, font_size);
                     }
-                    if let Some((start_head, end_head)) = arrow_heads {
+                    if arrow_heads.is_some() || is_note || is_highlight {
                         ui.horizontal(|ui| {
                             ui.label(egui::RichText::new("Couleur").size(11.0));
                             for (name, rgb) in PALETTE_COLORS {
@@ -2772,53 +3421,96 @@ impl SuperPdfApp {
                                 }
                             }
                         });
+                    }
+                    if let Some((start_head, end_head)) = arrow_heads {
                         new_start = ending_row(ui, "Début", start_head);
                         new_end = ending_row(ui, "Fin    ", end_head);
                     }
                 });
             });
 
-        if new_fill.is_some() || new_border.is_some() {
-            tab.annotations.push_undo_snapshot();
-            if let Some(target) = tab.annotations.items.iter_mut().find(|a| a.id == annotation_id) {
-                if let AnnotationKind::FreeText {
-                    fill_rgb,
-                    border_rgb,
-                    ..
-                } = &mut target.kind
-                {
-                    *fill_rgb = new_fill.unwrap_or(*fill_rgb);
-                    *border_rgb = new_border.unwrap_or(*border_rgb);
-                    self.freetext_style = Some((*fill_rgb, *border_rgb));
-                }
-            }
-            tab.is_modified = true;
-        }
-
-        if new_color.is_some() || new_start.is_some() || new_end.is_some() {
+        let page_dim = tab.page_dimensions[annot.page_index];
+        let something_changed = new_fill.is_some()
+            || new_border.is_some()
+            || new_size.is_some()
+            || new_color.is_some()
+            || new_start.is_some()
+            || new_end.is_some()
+            || new_state.is_some();
+        if something_changed {
             tab.annotations.push_undo_snapshot();
             if let Some(target) = tab.annotations.items.iter_mut().find(|a| a.id == annotation_id) {
                 if let Some(color) = new_color {
                     target.color_rgb = color;
                 }
-                if let AnnotationKind::Shape {
-                    shape_kind: ShapeKind::ArrowLine {
-                        start_head,
-                        end_head,
-                    },
-                    ..
-                } = &mut target.kind
-                {
-                    *start_head = new_start.unwrap_or(*start_head);
-                    *end_head = new_end.unwrap_or(*end_head);
+                if let Some(state) = new_state {
+                    target.meta.review_state = Some(ReviewState {
+                        state: state.to_string(),
+                        author: default_author(),
+                        date: pdf_date_now(),
+                    });
+                }
+                match &mut target.kind {
+                    AnnotationKind::Shape {
+                        shape_kind:
+                            ShapeKind::ArrowLine {
+                                start_head,
+                                end_head,
+                            },
+                        ..
+                    } => {
+                        *start_head = new_start.unwrap_or(*start_head);
+                        *end_head = new_end.unwrap_or(*end_head);
+                    }
+                    AnnotationKind::FreeText {
+                        font_size,
+                        fill_rgb,
+                        border_rgb,
+                        ..
+                    } => {
+                        *fill_rgb = new_fill.unwrap_or(*fill_rgb);
+                        *border_rgb = new_border.unwrap_or(*border_rgb);
+                        *font_size = new_size.unwrap_or(*font_size);
+                        self.freetext_style = Some((*fill_rgb, *border_rgb));
+                        self.freetext_font_size = *font_size;
+                    }
+                    _ => {}
                 }
             }
             tab.is_modified = true;
         }
 
+        let mut close_menu = false;
+        if reply_requested {
+            self.comment_reply_focus_pending = true;
+            close_menu = true;
+        }
+        if edit_requested {
+            tab.annotations.push_undo_snapshot();
+            self.comment_edit = Some((annotation_id, CommentEditTarget::Main));
+            self.comment_focus_pending = true;
+            close_menu = true;
+        }
+        if comment_requested {
+            tab.annotations.push_undo_snapshot();
+            if let Some(target) = tab.annotations.items.iter_mut().find(|a| a.id == annotation_id) {
+                target.convert_highlight_to_note(page_dim);
+            }
+            tab.annotations.selected_id = Some(annotation_id);
+            self.comment_edit = Some((annotation_id, CommentEditTarget::Main));
+            self.comment_focus_pending = true;
+            close_menu = true;
+        }
+        if delete_requested {
+            tab.annotations.selected_id = Some(annotation_id);
+            tab.annotations.delete_selected();
+            tab.is_modified = true;
+            close_menu = true;
+        }
+
         let dismissed = ctx.input(|i| i.key_pressed(Key::Escape))
             || (self.frame_count != opened_on_frame && area.response.clicked_elsewhere());
-        if dismissed {
+        if dismissed || close_menu {
             self.line_context_menu = None;
         }
     }
@@ -2915,8 +3607,8 @@ impl SuperPdfApp {
                         let new_id = tab.annotations.add_annotation(note);
                         tab.is_modified = true;
                         tab.text_selection.clear();
-                        self.editing_freetext_id = Some(new_id);
-                        self.freetext_focus_pending = true;
+                        self.comment_edit = Some((new_id, CommentEditTarget::Main));
+                        self.comment_focus_pending = true;
                     }
                 }
             }
@@ -2930,6 +3622,7 @@ impl SuperPdfApp {
                         let union_rect = quads.iter().fold(*first, |acc, q| acc.union(q));
                         let color = tab.annotations.active_color_rgb;
                         tab.annotations.add_annotation(PdfAnnotation {
+                            meta: Default::default(),
                             id: 0,
                             page_index,
                             rect: union_rect,
@@ -3067,6 +3760,7 @@ impl SuperPdfApp {
         let mut tab_to_close: Option<usize> = None;
         let mut tab_to_select: Option<usize> = None;
         let mut match_to_select: Option<usize> = None;
+        let mut tab_menu_action: Option<(usize, TabMenuAction)> = None;
 
         ui.spacing_mut().item_spacing = Vec2::new(6.0, 4.0);
 
@@ -3275,7 +3969,6 @@ impl SuperPdfApp {
                 ui.spacing_mut().item_spacing.y = 4.0;
                 for (idx, tab) in self.tabs.iter().enumerate() {
                     let is_active = idx == self.active_tab;
-                    let is_hib = tab.is_hibernated();
                     let bg_fill = if is_active {
                         Color32::from_rgb(40, 48, 68)
                     } else {
@@ -3295,51 +3988,6 @@ impl SuperPdfApp {
                         .corner_radius(CornerRadius::same(7))
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
-                                let badge_text = format!("#{}", idx + 1);
-                                ui.colored_label(tab.badge_color, badge_text);
-
-                                let current_p = tab.viewport.current_page_index(
-                                    Vec2::new(900.0, 800.0),
-                                    &tab.page_dimensions,
-                                ) + 1;
-                                let total_p = tab.page_count();
-
-                                let short_title = if tab.title.chars().count() > 21 {
-                                    let s: String = tab.title.chars().take(19).collect();
-                                    format!("{}...", s)
-                                } else {
-                                    tab.title.clone()
-                                };
-                                let mod_star = if tab.is_modified { " *" } else { "" };
-                                let ram_state = if is_hib { "💤 0 Mo" } else { "⚡ Actif" };
-
-                                let title_btn = egui::Button::new(
-                                    egui::RichText::new(format!(
-                                        "{}{}\np.{}/{} • {:.0}% • {}",
-                                        short_title,
-                                        mod_star,
-                                        current_p,
-                                        total_p,
-                                        tab.viewport.zoom * 100.0,
-                                        ram_state
-                                    ))
-                                    .size(11.0)
-                                    .color(if is_active {
-                                        Color32::WHITE
-                                    } else {
-                                        Color32::from_rgb(185, 194, 212)
-                                    }),
-                                )
-                                .frame(false);
-
-                                if ui
-                                    .add_sized([154.0, 28.0], title_btn)
-                                    .on_hover_text(&tab.title)
-                                    .clicked()
-                                {
-                                    tab_to_select = Some(idx);
-                                }
-
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
@@ -3350,6 +3998,84 @@ impl SuperPdfApp {
                                         {
                                             tab_to_close = Some(idx);
                                         }
+
+                                        let name_area = ui.available_rect_before_wrap();
+                                        let row = ui
+                                            .interact(
+                                                name_area,
+                                                ui.id().with(("tab_row", tab.id)),
+                                                Sense::click(),
+                                            )
+                                            .on_hover_text(tab.path.display().to_string());
+                                        if row.clicked() {
+                                            tab_to_select = Some(idx);
+                                        }
+                                        row.context_menu(|ui| {
+                                            let mut choose = |ui: &mut egui::Ui,
+                                                              label: &str,
+                                                              action: TabMenuAction| {
+                                                if ui.button(label).clicked() {
+                                                    tab_menu_action = Some((idx, action));
+                                                    ui.close_menu();
+                                                }
+                                            };
+                                            choose(
+                                                ui,
+                                                "Afficher dans l'explorateur de fichiers",
+                                                TabMenuAction::RevealInExplorer,
+                                            );
+                                            choose(
+                                                ui,
+                                                "Ouvrir avec l'application par défaut",
+                                                TabMenuAction::OpenWithDefaultApp,
+                                            );
+                                            ui.separator();
+                                            if ui.button("Copier le chemin complet").clicked() {
+                                                let full = std::path::absolute(&tab.path)
+                                                    .unwrap_or_else(|_| tab.path.clone());
+                                                ui.ctx().copy_text(full.display().to_string());
+                                                ui.close_menu();
+                                            }
+                                            if ui.button("Copier le nom du fichier").clicked() {
+                                                ui.ctx().copy_text(tab.title.clone());
+                                                ui.close_menu();
+                                            }
+                                            ui.separator();
+                                            choose(ui, "Fermer", TabMenuAction::CloseThis);
+                                            choose(ui, "Fermer les autres onglets", TabMenuAction::CloseOthers);
+                                            choose(ui, "Fermer les onglets en dessous", TabMenuAction::CloseBelow);
+                                        });
+
+                                        let mut name = egui::text::LayoutJob::single_section(
+                                            format!(
+                                                "{}{}",
+                                                tab.title,
+                                                if tab.is_modified { " *" } else { "" }
+                                            ),
+                                            egui::TextFormat {
+                                                font_id: FontId::proportional(12.0),
+                                                color: if is_active {
+                                                    Color32::WHITE
+                                                } else {
+                                                    Color32::from_rgb(185, 194, 212)
+                                                },
+                                                ..Default::default()
+                                            },
+                                        );
+                                        name.wrap.max_rows = 2;
+                                        name.wrap.break_anywhere = true;
+                                        name.wrap.overflow_character = Some('…');
+                                        ui.with_layout(
+                                            egui::Layout::left_to_right(egui::Align::Center),
+                                            |ui| {
+                                                ui.add(
+                                                    egui::Label::new(name)
+                                                        .wrap()
+                                                        .selectable(false)
+                                                        .sense(Sense::hover()),
+                                                );
+                                            },
+                                        );
                                     },
                                 );
                             });
@@ -3364,6 +4090,7 @@ impl SuperPdfApp {
                 let mut delete_clicked = false;
                 let mut picked_fill = None;
                 let mut picked_border = None;
+                let mut picked_size = None;
                 egui::Frame::NONE
                     .inner_margin(Margin::symmetric(10, 4))
                     .show(ui, |ui| {
@@ -3390,6 +4117,7 @@ impl SuperPdfApp {
                             });
 
                             if let AnnotationKind::FreeText {
+                                font_size,
                                 fill_rgb,
                                 border_rgb,
                                 ..
@@ -3398,6 +4126,7 @@ impl SuperPdfApp {
                                 picked_fill = color_choice_row(ui, "Fond", *fill_rgb, &FREETEXT_FILL_CHOICES);
                                 picked_border =
                                     color_choice_row(ui, "Contour", *border_rgb, &FREETEXT_BORDER_CHOICES);
+                                picked_size = font_size_row(ui, *font_size);
                             } else {
                                 // Sélecteur de couleur rapide
                                 ui.horizontal(|ui| {
@@ -3437,11 +4166,12 @@ impl SuperPdfApp {
                             }
                         }
                     });
-                if picked_fill.is_some() || picked_border.is_some() {
+                if picked_fill.is_some() || picked_border.is_some() || picked_size.is_some() {
                     tab.annotations.push_undo_snapshot();
                     if let Some(PdfAnnotation {
                         kind:
                             AnnotationKind::FreeText {
+                                font_size,
                                 fill_rgb,
                                 border_rgb,
                                 ..
@@ -3451,7 +4181,9 @@ impl SuperPdfApp {
                     {
                         *fill_rgb = picked_fill.unwrap_or(*fill_rgb);
                         *border_rgb = picked_border.unwrap_or(*border_rgb);
+                        *font_size = picked_size.unwrap_or(*font_size);
                         self.freetext_style = Some((*fill_rgb, *border_rgb));
+                        self.freetext_font_size = *font_size;
                     }
                     tab.is_modified = true;
                 }
@@ -3662,6 +4394,9 @@ impl SuperPdfApp {
                 }
             });
 
+        if let Some((idx, action)) = tab_menu_action {
+            self.apply_tab_menu_action(idx, action);
+        }
         if let Some(idx) = tab_to_select {
             self.switch_to_tab(idx);
         }

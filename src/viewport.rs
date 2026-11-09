@@ -208,10 +208,7 @@ mod tests {
 
     fn sample_pages() -> Vec<PageDimensions> {
         vec![
-            PageDimensions {
-                width_pt: 595.0,
-                height_pt: 842.0,
-            };
+            PageDimensions::simple(595.0, 842.0);
             5
         ]
     }
