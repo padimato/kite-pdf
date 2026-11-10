@@ -2,6 +2,7 @@ use crate::annotations::{load_annotations_from_pdf, AnnotationManager};
 use crate::memory_manager::LruTextureCache;
 use crate::ocr_engine::{HybridOcrEngine, OcrSpeedMode, TabOcrState};
 use crate::pdf_engine::{LoadedPdfDocument, PageDimensions, PdfEngine};
+use crate::recent_files::{match_score, normalize, RecentFiles};
 use crate::text_search::{PageTextLayer, TextSelectionState};
 use crate::viewport::ViewportState;
 use crate::worker::{BackgroundWorkers, OcrJob, OcrPageOutcome};
@@ -11,6 +12,10 @@ use std::path::PathBuf;
 
 pub const SIDEBAR_WIDTH: f32 = 268.0;
 pub const HOVER_TRIGGER_EDGE_PX: f32 = 18.0;
+/// Vitesse de glissement de la barre latérale (plus grand = plus vif), en 1/s.
+const SIDEBAR_ANIM_SPEED: f32 = 16.0;
+/// Pas de temps maximal pris en compte par image pour l'animation, en secondes.
+const SIDEBAR_ANIM_MAX_STEP_S: f32 = 1.0 / 30.0;
 pub const HOVER_KEEP_OPEN_PX: f32 = SIDEBAR_WIDTH + 18.0;
 
 /// Outils disponibles dans la grille supérieure de la barre latérale (et activables à 1 touche)
@@ -114,9 +119,11 @@ impl SidebarState {
             self.anim_progress = target;
             false
         } else {
-            let speed = 14.0;
-            self.anim_progress = (self.anim_progress + diff * (speed * dt).clamp(0.08, 0.45))
-                .clamp(0.0, 1.0);
+            // Approche exponentielle indépendante de la cadence d'affichage. Le pas de temps est borné :
+            // la première image après une période d'inactivité ne doit pas faire sauter la barre.
+            let dt = dt.clamp(0.001, SIDEBAR_ANIM_MAX_STEP_S);
+            let blend = 1.0 - (-SIDEBAR_ANIM_SPEED * dt).exp();
+            self.anim_progress = (self.anim_progress + diff * blend).clamp(0.0, 1.0);
             true
         }
     }
@@ -477,19 +484,17 @@ impl DocumentTab {
     }
 }
 
-/// Action exécutable depuis la Palette de Commandes (`Ctrl+K`)
+/// Action exécutable depuis la barre centrale (`Ctrl+T` / `Ctrl+K`)
 #[derive(Debug, Clone, PartialEq)]
 pub enum PaletteCommand {
     SwitchTab(usize),
+    OpenRecent(PathBuf),
     ToggleSidebarPin,
     OpenFileDialog,
+    OpenSearch,
     SaveAnnotatedPdf,
     RunHybridOcrTurbo,
-    OpenHybridWordJpgDemo,
-    NewDemoTab,
-    Open15TabsBenchmark,
     HibernateInactiveTabs,
-    PopulateDemoAnnotations,
     UndoAnnotation,
     RedoAnnotation,
     DeleteSelectedAnnotation,
@@ -505,17 +510,112 @@ pub enum PaletteCommand {
 pub struct PaletteEntry {
     pub category: &'static str,
     pub label: String,
+    /// Ligne secondaire (dossier d'un PDF récent, explication d'une action)
+    pub detail: String,
     pub shortcut: &'static str,
     pub command: PaletteCommand,
 }
 
-/// État de la Palette de Commandes rapide (`Ctrl+K` / `Ctrl+P`)
+/// État de la barre centrale de recherche (`Ctrl+T`, aussi `Ctrl+K` / `Ctrl+P`)
 #[derive(Debug, Clone, Default)]
 pub struct CommandPaletteState {
     pub is_open: bool,
     pub query: String,
     pub selected_index: usize,
     pub focus_requested: bool,
+}
+
+/// Action proposée par la barre centrale, avec les mots qui permettent de la retrouver
+/// (« comment », « stabilo », « sauvegarder »… et pas seulement son libellé exact).
+struct ActionSpec {
+    category: &'static str,
+    label: String,
+    detail: &'static str,
+    keywords: &'static str,
+    shortcut: &'static str,
+    command: PaletteCommand,
+}
+
+impl ActionSpec {
+    fn new(
+        category: &'static str,
+        label: &str,
+        detail: &'static str,
+        keywords: &'static str,
+        shortcut: &'static str,
+        command: PaletteCommand,
+    ) -> Self {
+        Self { category, label: label.to_string(), detail, keywords, shortcut, command }
+    }
+
+    fn into_entry(self) -> PaletteEntry {
+        PaletteEntry {
+            category: self.category,
+            label: self.label,
+            detail: self.detail.to_string(),
+            shortcut: self.shortcut,
+            command: self.command,
+        }
+    }
+}
+
+fn tool_keywords(tool: ActiveTool) -> (&'static str, &'static str) {
+    match tool {
+        ActiveTool::Select => ("Sélectionner et copier du texte, déplacer une annotation", "selection selectionner curseur copier texte souris"),
+        ActiveTool::Pan => ("Faire défiler le document à la main", "main deplacer glisser defiler pan naviguer"),
+        ActiveTool::Highlight => ("Surligner un passage du texte", "surligner surligneur stabilo highlight marquer fluo souligner"),
+        ActiveTool::FreeText => ("Écrire une zone de texte sur la page", "texte ecrire taper zone saisie machine a ecrire"),
+        ActiveTool::Ink => ("Dessiner à main levée", "dessin dessiner crayon stylo main levee gribouiller signer"),
+        ActiveTool::Shape => ("Tracer une flèche ou un rectangle", "fleche rectangle forme cadre encadrer pointer"),
+        ActiveTool::StickyNote => ("Ajouter un commentaire (note) sur la page", "commentaire commenter comment note bulle annoter remarque post it memo"),
+        ActiveTool::Measure => ("Mesurer une distance sur la page", "mesure mesurer regle distance longueur"),
+    }
+}
+
+fn action_specs() -> Vec<ActionSpec> {
+    use PaletteCommand as C;
+    let mut actions = vec![
+        ActionSpec::new("Fichier", "Ouvrir un PDF depuis le disque…", "Choisir un fichier dans l'explorateur", "ouvrir fichier parcourir explorateur disque importer", "Ctrl+O", C::OpenFileDialog),
+        ActionSpec::new("Fichier", "Enregistrer le PDF", "Annotations et texte reconnu par l'OCR inclus", "enregistrer sauvegarder save garder", "Ctrl+S", C::SaveAnnotatedPdf),
+        ActionSpec::new("Document", "Rechercher dans le PDF", "Trouver un mot dans le document ouvert", "rechercher chercher trouver find mot", "Ctrl+F", C::OpenSearch),
+        ActionSpec::new("Document", "Reconnaître le texte des images (OCR)", "Rend cherchable le texte des figures et des scans", "ocr reconnaissance texte image scanner scan figure", "OCR", C::RunHybridOcrTurbo),
+        ActionSpec::new("Annotations", "Annuler", "Défaire la dernière modification d'annotation", "annuler undo defaire retour arriere", "Ctrl+Z", C::UndoAnnotation),
+        ActionSpec::new("Annotations", "Rétablir", "Refaire la modification annulée", "retablir redo refaire", "Ctrl+Y", C::RedoAnnotation),
+        ActionSpec::new("Annotations", "Supprimer l'annotation sélectionnée", "", "supprimer effacer enlever retirer delete", "Suppr", C::DeleteSelectedAnnotation),
+        ActionSpec::new("Onglet", "Fermer l'onglet actif", "", "fermer onglet close", "Ctrl+W", C::CloseActiveTab),
+        ActionSpec::new("Affichage", "Ajuster à la largeur", "", "ajuster largeur zoom fit", "Ctrl+9", C::FitToWidth),
+        ActionSpec::new("Affichage", "Afficher la page entière", "", "ajuster page entiere hauteur zoom fit", "Ctrl+0", C::FitToPage),
+        ActionSpec::new("Affichage", "Zoom à 100 %", "", "zoom 100 taille reelle reinitialiser", "100%", C::ZoomReset100),
+        ActionSpec::new("Affichage", "Épingler ou masquer la barre latérale", "", "barre laterale epingler masquer cacher plein ecran", "Ctrl+B", C::ToggleSidebarPin),
+        ActionSpec::new("Mémoire", "Libérer la mémoire des onglets inactifs", "", "memoire ram purger liberer hiberner", "Purge", C::HibernateInactiveTabs),
+    ];
+    for tool in ActiveTool::all() {
+        let (_, name, key) = tool.icon_and_label();
+        let (detail, keywords) = tool_keywords(*tool);
+        actions.push(ActionSpec::new("Outil", &format!("Outil {name}"), detail, keywords, key, C::SelectTool(*tool)));
+    }
+    actions
+}
+
+/// « 12 », « p12 », « page 12 », « aller a la page 12 » → page 12.
+fn parse_page_request(normalized_query: &str) -> Option<usize> {
+    let rest = normalized_query
+        .trim_start_matches("aller a la")
+        .trim_start_matches("aller")
+        .trim()
+        .trim_start_matches("page")
+        .trim_start_matches('p')
+        .trim();
+    rest.parse::<usize>().ok().filter(|p| *p >= 1)
+}
+
+fn paths_match(a: &std::path::Path, b: &std::path::Path) -> bool {
+    let canon = |p: &std::path::Path| {
+        std::fs::canonicalize(p)
+            .map(|c| c.to_string_lossy().trim_start_matches(r"\\?\").to_lowercase())
+            .unwrap_or_else(|_| p.to_string_lossy().to_lowercase())
+    };
+    canon(a) == canon(b)
 }
 
 impl CommandPaletteState {
@@ -539,167 +639,81 @@ impl CommandPaletteState {
         }
     }
 
-    /// Construit et filtre la liste des commandes en fonction de `self.query`
+    /// Résultats pour la requête courante : page, onglets ouverts, PDF de l'historique et actions,
+    /// classés par pertinence. Sans requête : les PDF récents, puis « Ouvrir un PDF… ».
     pub fn filtered_entries(
         &self,
-        tabs_info: &[(usize, String, usize, bool)],
+        tabs_info: &[(usize, String, usize, PathBuf)],
         active_tab_page_count: usize,
+        recent: &RecentFiles,
+        now: u64,
     ) -> Vec<PaletteEntry> {
-        let mut all = Vec::with_capacity(32);
+        let query = normalize(&self.query);
+        let mut scored: Vec<(f32, PaletteEntry)> = Vec::new();
 
-        // 1. Onglets ouverts
-        for (idx, title, pages, hibernated) in tabs_info {
-            let shortcut = match idx {
-                0 => "Ctrl+1",
-                1 => "Ctrl+2",
-                2 => "Ctrl+3",
-                3 => "Ctrl+4",
-                4 => "Ctrl+5",
-                5 => "Ctrl+6",
-                6 => "Ctrl+7",
-                7 => "Ctrl+8",
-                _ => "Ctrl+Tab",
-            };
-            let state_tag = if *hibernated { " [Hiberné 0 Mo]" } else { " [Actif]" };
-            all.push(PaletteEntry {
-                category: "Onglet",
-                label: format!("#{} : {} ({} p.){}", idx + 1, title, pages, state_tag),
-                shortcut,
-                command: PaletteCommand::SwitchTab(*idx),
-            });
+        if let Some(page) = parse_page_request(&query) {
+            if page <= active_tab_page_count {
+                scored.push((100.0, PaletteEntry {
+                    category: "Page",
+                    label: format!("Aller à la page {page}"),
+                    detail: format!("sur {active_tab_page_count}"),
+                    shortcut: "Entrée",
+                    command: PaletteCommand::JumpToPage(page - 1),
+                }));
+            }
         }
 
-        // 2. Commandes OCR Hybride Multi-Angles, Annotations ISO 32000, Mémoire & Onglets
-        all.push(PaletteEntry {
-            category: "OCR Hybride",
-            label: "Scanner les graphiques JPG embarqués (Mode Turbo Multi-Angles 0°..360°)".to_string(),
-            shortcut: "OCR Turbo",
-            command: PaletteCommand::RunHybridOcrTurbo,
-        });
-        all.push(PaletteEntry {
-            category: "OCR Hybride",
-            label: "Ouvrir le PDF Hybride Word + Graphique JPG Multi-Orientations (Jalon 6)".to_string(),
-            shortcut: "Démo OCR",
-            command: PaletteCommand::OpenHybridWordJpgDemo,
-        });
-        all.push(PaletteEntry {
-            category: "Annotations",
-            label: "Enregistrer le PDF avec les annotations ISO 32000 & Couche Texte OCR (Tr 3)".to_string(),
-            shortcut: "Ctrl+S",
-            command: PaletteCommand::SaveAnnotatedPdf,
-        });
-        all.push(PaletteEntry {
-            category: "Annotations",
-            label: "Générer la vitrine complète d'annotations ISO 32000 sur la page courante".to_string(),
-            shortcut: "Démo Annot",
-            command: PaletteCommand::PopulateDemoAnnotations,
-        });
-        all.push(PaletteEntry {
-            category: "Annotations",
-            label: "Annuler la dernière action d'annotation (Undo)".to_string(),
-            shortcut: "Ctrl+Z",
-            command: PaletteCommand::UndoAnnotation,
-        });
-        all.push(PaletteEntry {
-            category: "Annotations",
-            label: "Rétablir l'action d'annotation (Redo)".to_string(),
-            shortcut: "Ctrl+Y",
-            command: PaletteCommand::RedoAnnotation,
-        });
-        all.push(PaletteEntry {
-            category: "Annotations",
-            label: "Supprimer l'annotation sélectionnée".to_string(),
-            shortcut: "Suppr",
-            command: PaletteCommand::DeleteSelectedAnnotation,
-        });
-        all.push(PaletteEntry {
-            category: "Mémoire",
-            label: "Ouvrir 15 PDF en simultané (Stress-Test Virtualisation & Hibernation)".to_string(),
-            shortcut: "15 PDF",
-            command: PaletteCommand::Open15TabsBenchmark,
-        });
-        all.push(PaletteEntry {
-            category: "Mémoire",
-            label: "Purger le cache de textures & Hiberner tous les onglets inactifs".to_string(),
-            shortcut: "Purge RAM",
-            command: PaletteCommand::HibernateInactiveTabs,
-        });
-        all.push(PaletteEntry {
-            category: "Interface",
-            label: "Épingler / Masquer la barre latérale gauche (Mode Plein Écran 100%)".to_string(),
-            shortcut: "Ctrl+B",
-            command: PaletteCommand::ToggleSidebarPin,
-        });
-        all.push(PaletteEntry {
-            category: "Fichier",
-            label: "Ouvrir un fichier PDF depuis le disque...".to_string(),
-            shortcut: "Ctrl+O",
-            command: PaletteCommand::OpenFileDialog,
-        });
-        all.push(PaletteEntry {
-            category: "Onglet",
-            label: "Ouvrir un nouvel onglet PDF de démonstration".to_string(),
-            shortcut: "Ctrl+T",
-            command: PaletteCommand::NewDemoTab,
-        });
-        all.push(PaletteEntry {
-            category: "Onglet",
-            label: "Fermer l'onglet PDF actif".to_string(),
-            shortcut: "Ctrl+W",
-            command: PaletteCommand::CloseActiveTab,
-        });
-        all.push(PaletteEntry {
-            category: "Affichage",
-            label: "Ajuster le PDF à la largeur de la fenêtre (Fit Width)".to_string(),
-            shortcut: "Ctrl+9",
-            command: PaletteCommand::FitToWidth,
-        });
-        all.push(PaletteEntry {
-            category: "Affichage",
-            label: "Ajuster une page entière à la hauteur (Fit Page)".to_string(),
-            shortcut: "Ctrl+0",
-            command: PaletteCommand::FitToPage,
-        });
-        all.push(PaletteEntry {
-            category: "Affichage",
-            label: "Réinitialiser le zoom à 100%".to_string(),
-            shortcut: "100%",
-            command: PaletteCommand::ZoomReset100,
-        });
-
-        // 3. Outils d'annotation et de lecture
-        for tool in ActiveTool::all() {
-            let (icon, name, key) = tool.icon_and_label();
-            all.push(PaletteEntry {
-                category: "Outil",
-                label: format!("{} Activer l'outil : {}", icon, name),
-                shortcut: key,
-                command: PaletteCommand::SelectTool(*tool),
-            });
+        const TAB_SHORTCUTS: [&str; 8] = ["Ctrl+1", "Ctrl+2", "Ctrl+3", "Ctrl+4", "Ctrl+5", "Ctrl+6", "Ctrl+7", "Ctrl+8"];
+        if !query.is_empty() {
+            for (idx, title, pages, path) in tabs_info {
+                let folder = normalize(&path.to_string_lossy());
+                if let Some(score) = match_score(&query, &normalize(title), &folder) {
+                    scored.push((score + 1.5, PaletteEntry {
+                        category: "Onglet",
+                        label: crate::recent_files::decode_percent(title),
+                        detail: format!("Déjà ouvert · {pages} pages"),
+                        shortcut: TAB_SHORTCUTS.get(*idx).copied().unwrap_or("Ctrl+Tab"),
+                        command: PaletteCommand::SwitchTab(*idx),
+                    }));
+                }
+            }
         }
 
-        // 4. Saut direct vers une page du document actif
-        for p in 1..=active_tab_page_count.min(20) {
-            all.push(PaletteEntry {
-                category: "Navigation",
-                label: format!("Aller à la Page {}", p),
-                shortcut: "Entrée",
-                command: PaletteCommand::JumpToPage(p - 1),
-            });
+        let max_recent = if query.is_empty() { 8 } else { 12 };
+        for (score, file) in recent.search(&self.query, now).into_iter().take(max_recent) {
+            let open_idx = tabs_info.iter().find(|t| paths_match(&t.3, &file.path)).map(|t| t.0);
+            if open_idx.is_some() && !query.is_empty() {
+                continue; // déjà proposé comme onglet ouvert
+            }
+            scored.push((score, PaletteEntry {
+                category: "Récent",
+                label: file.file_name(),
+                detail: file.folder_label(),
+                shortcut: if open_idx.is_some() { "ouvert" } else { "Entrée" },
+                command: match open_idx {
+                    Some(i) => PaletteCommand::SwitchTab(i),
+                    None => PaletteCommand::OpenRecent(file.path.clone()),
+                },
+            }));
         }
 
-        let q = self.query.trim().to_lowercase();
-        if q.is_empty() {
-            return all;
+        for action in action_specs() {
+            if query.is_empty() {
+                if action.command == PaletteCommand::OpenFileDialog {
+                    scored.push((-1.0, action.into_entry()));
+                }
+                continue;
+            }
+            let label = normalize(&action.label);
+            let secondary = format!("{} {} {}", normalize(action.category), normalize(action.detail), action.keywords);
+            if let Some(score) = match_score(&query, &label, &secondary) {
+                // Une action passe devant un PDF au nom proche : « comment » vise l'outil Note.
+                scored.push((score + 0.5, action.into_entry()));
+            }
         }
 
-        all.into_iter()
-            .filter(|entry| {
-                entry.label.to_lowercase().contains(&q)
-                    || entry.category.to_lowercase().contains(&q)
-                    || entry.shortcut.to_lowercase().contains(&q)
-            })
-            .collect()
+        scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+        scored.into_iter().map(|(_, e)| e).collect()
     }
 }
 
@@ -740,28 +754,32 @@ mod tests {
         palette.open();
 
         let tabs = vec![
-            (0, "Architecture_Rust.pdf".to_string(), 5, false),
-            (1, "Spécification_ISO_32000.pdf".to_string(), 8, true),
+            (0, "Architecture_Rust.pdf".to_string(), 5, PathBuf::from("Architecture_Rust.pdf")),
+            (1, "Spécification_ISO_32000.pdf".to_string(), 8, PathBuf::from("Spécification_ISO_32000.pdf")),
         ];
+        let recent = RecentFiles::in_memory();
+        let results = |palette: &CommandPaletteState| palette.filtered_entries(&tabs, 5, &recent, 0);
 
-        palette.query = "spécification".to_string();
-        let results = palette.filtered_entries(&tabs, 5);
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].command, PaletteCommand::SwitchTab(1));
+        palette.query = "specification".to_string();
+        assert_eq!(results(&palette)[0].command, PaletteCommand::SwitchTab(1));
 
-        palette.query = "iso".to_string();
-        let iso_results = palette.filtered_entries(&tabs, 5);
-        assert!(iso_results
-            .iter()
-            .any(|e| e.command == PaletteCommand::SaveAnnotatedPdf));
+        // Les mots du langage courant mènent à l'outil, pas seulement son nom exact.
+        for (query, tool) in [
+            ("comment", ActiveTool::StickyNote),
+            ("ajouter un commentaire", ActiveTool::StickyNote),
+            ("stabilo", ActiveTool::Highlight),
+            ("surligner", ActiveTool::Highlight),
+            ("fleche", ActiveTool::Shape),
+        ] {
+            palette.query = query.to_string();
+            assert_eq!(results(&palette)[0].command, PaletteCommand::SelectTool(tool), "{query}");
+        }
 
-        palette.query = "surligner".to_string();
-        let tool_results = palette.filtered_entries(&tabs, 5);
-        assert_eq!(tool_results.len(), 1);
-        assert_eq!(
-            tool_results[0].command,
-            PaletteCommand::SelectTool(ActiveTool::Highlight)
-        );
+        palette.query = "sauvegarder".to_string();
+        assert_eq!(results(&palette)[0].command, PaletteCommand::SaveAnnotatedPdf);
+
+        palette.query = "page 3".to_string();
+        assert_eq!(results(&palette)[0].command, PaletteCommand::JumpToPage(2));
     }
 
     #[test]

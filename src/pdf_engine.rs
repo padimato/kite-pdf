@@ -2,7 +2,9 @@ use crate::text_search::{PageTextLayer, PdfTopDownRect, PositionedChar};
 use anyhow::{Context, Result};
 use egui::ColorImage;
 use image::RgbImage;
+#[cfg(test)]
 use lopdf::content::{Content, Operation};
+#[cfg(test)]
 use lopdf::{dictionary, Document, Object, Stream};
 use pdfium_render::prelude::*;
 use std::path::{Path, PathBuf};
@@ -619,6 +621,7 @@ impl<'a> LoadedPdfDocument<'a> {
     }
 }
 
+#[cfg(test)]
 /// Génère un fichier PDF de démonstration personnalisé (titre, sous-titre, palette de couleur, nombre de pages).
 pub fn ensure_custom_sample_pdf(
     path: &Path,
@@ -864,6 +867,7 @@ pub fn ensure_custom_sample_pdf(
     Ok(())
 }
 
+#[cfg(test)]
 /// Génère le fichier PDF de démonstration par défaut.
 pub fn ensure_sample_pdf(path: &Path) -> Result<()> {
     ensure_custom_sample_pdf(path, "SUPER LECTEUR PDF", (0.10, 0.24, 0.48), 5)

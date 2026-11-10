@@ -845,6 +845,7 @@ impl AnnotationManager {
         self.items.iter().find(|a| a.id == id)
     }
 
+    #[cfg(test)]
     /// Génère un jeu complet d'annotations de démonstration ISO 32000 sur la page `page_index`
     /// couvrant tous les outils façon Adobe Acrobat : Highlight, FreeText, Ink, Shape/Flèche, StickyNote et Mesure.
     pub fn populate_demo_showcase(&mut self, page_index: usize) {
@@ -1096,6 +1097,7 @@ pub fn save_annotations_and_ocr_to_pdf(
     // Écriture dans un fichier voisin puis remplacement atomique : une panne en cours d'écriture
     // ne peut pas corrompre l'original, et les lectures PDFium en cours restent valides.
     let temp_path = dest_path.with_extension("superpdf-save.tmp");
+    forget_previous_revisions(&mut doc);
     doc.save(&temp_path).with_context(|| {
         format!(
             "Échec d'écriture du fichier PDF annoté : {}",
@@ -1112,8 +1114,39 @@ pub fn save_annotations_and_ocr_to_pdf(
     Ok(())
 }
 
+/// Le fichier est réécrit d'un seul tenant : garder `/Prev` ferait pointer sa table de références
+/// vers un décalage périmé, et Acrobat devrait réparer le PDF à chaque ouverture.
+fn forget_previous_revisions(doc: &mut Document) {
+    doc.trailer.remove(b"Prev");
+    doc.trailer.remove(b"XRefStm");
+    renew_document_id(doc);
+}
+
+/// Renouvelle le second identifiant de `/ID` (ISO 32000-1 §14.4 : il change à chaque enregistrement).
+/// Acrobat garde en cache la position du texte d'un document d'après son `/ID` : sans cela, sa
+/// recherche surligne la couche OCR à l'emplacement d'une version précédente du fichier.
+fn renew_document_id(doc: &mut Document) {
+    use std::hash::{BuildHasher, Hasher};
+    let mut fresh = Vec::with_capacity(16);
+    for _ in 0..2 {
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        if let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            hasher.write_u128(now.as_nanos());
+        }
+        fresh.extend_from_slice(&hasher.finish().to_be_bytes());
+    }
+    let fresh = Object::String(fresh, lopdf::StringFormat::Hexadecimal);
+    let permanent = match doc.trailer.get(b"ID").and_then(Object::as_array) {
+        Ok(ids) if !ids.is_empty() => ids[0].clone(),
+        _ => fresh.clone(),
+    };
+    doc.trailer.set("ID", Object::Array(vec![permanent, fresh]));
+}
+
 /// Chaîne de texte PDF : UTF-16BE avec BOM dès qu'un caractère sort de l'ASCII (ISO 32000-1 §7.9.2.2).
 fn pdf_text_string(text: &str) -> Object {
+    // Acrobat sépare les lignes par `\r` : un `\n` disparaît dans son panneau Commentaires.
+    let text = text.replace("\r\n", "\n").replace('\n', "\r");
     if text.is_ascii() {
         return Object::string_literal(text);
     }
@@ -1123,16 +1156,18 @@ fn pdf_text_string(text: &str) -> Object {
 }
 
 fn decode_pdf_text(bytes: &[u8]) -> String {
-    if let Some(utf16) = bytes.strip_prefix(&[0xFE, 0xFF]) {
+    let text = if let Some(utf16) = bytes.strip_prefix(&[0xFE, 0xFF]) {
         let units: Vec<u16> = utf16
             .chunks_exact(2)
             .map(|c| u16::from_be_bytes([c[0], c[1]]))
             .collect();
-        return String::from_utf16_lossy(&units);
-    }
-    // Les fichiers écrits par les versions précédentes contiennent de l'UTF-8 brut.
-    String::from_utf8(bytes.to_vec())
-        .unwrap_or_else(|_| bytes.iter().map(|&b| b as char).collect())
+        String::from_utf16_lossy(&units)
+    } else {
+        // Les fichiers écrits par les versions précédentes contiennent de l'UTF-8 brut.
+        String::from_utf8(bytes.to_vec())
+            .unwrap_or_else(|_| bytes.iter().map(|&b| b as char).collect())
+    };
+    text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 /// Largeur approximative d'un caractère Helvetica, en fraction de corps.
@@ -1326,7 +1361,7 @@ fn write_comment_thread(
         dict.set("C", Object::Array(color.clone()));
         dict.set("F", flags);
         dict.set("Name", Object::Name(b"Comment".to_vec()));
-        dict.set("Open", false);
+        // Pas de `/Open` ici : Acrobat ne reconnaît plus l'état de révision s'il est présent.
         dict.set("P", page_id);
         dict.set("IRT", parent_id);
         dict.set("NM", Object::string_literal(nm));
@@ -1450,15 +1485,12 @@ fn escape_xml(text: &str) -> String {
 
 /// Texte enrichi `/RC` : c'est lui qu'Acrobat recharge lorsqu'on réédite le bloc.
 fn freetext_rich_contents(text: &str, font_size: f32, color_hex: &str) -> String {
-    let paragraphs: String = text
-        .lines()
-        .map(|line| {
-            format!(
-                "<p dir=\"ltr\"><span style=\"font-family:Helvetica\">{}</span></p>",
-                escape_xml(line)
-            )
-        })
-        .collect();
+    // Un seul paragraphe avec `&#13;` : Acrobat colle les `<p>` successifs dans son panneau Commentaires.
+    let lines: Vec<String> = text.lines().map(escape_xml).collect();
+    let paragraphs = format!(
+        "<p dir=\"ltr\"><span style=\"font-family:Helvetica\">{}</span></p>",
+        lines.join("&#13;")
+    );
     format!(
         "<?xml version=\"1.0\"?><body xmlns=\"http://www.w3.org/1999/xhtml\" \
          xmlns:xfa=\"http://www.xfa.org/schema/xfa-data/1.0/\" xfa:APIVersion=\"Acrobat:11.0.0\" \
@@ -2400,6 +2432,38 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
+    fn test_full_rewrite_drops_links_to_previous_revisions() {
+        let mut doc = Document::with_version("1.7");
+        doc.trailer.set("Prev", 12586);
+        doc.trailer.set("XRefStm", 900);
+        doc.trailer.set("Size", 44);
+        forget_previous_revisions(&mut doc);
+        assert!(!doc.trailer.has(b"Prev") && !doc.trailer.has(b"XRefStm"));
+        assert!(doc.trailer.has(b"Size"));
+    }
+
+    #[test]
+    fn test_text_strings_use_acrobat_line_endings() {
+        for (input, expected) in [("a\nb", "a\rb"), ("a\r\nb", "a\rb"), ("é\nb", "é\rb")] {
+            let Object::String(bytes, _) = pdf_text_string(input) else {
+                panic!("Doit produire une chaîne PDF");
+            };
+            let raw = if input.is_ascii() {
+                String::from_utf8(bytes.clone()).unwrap()
+            } else {
+                let units: Vec<u16> = bytes[2..]
+                    .chunks_exact(2)
+                    .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                    .collect();
+                String::from_utf16(&units).unwrap()
+            };
+            assert_eq!(raw, expected);
+            assert_eq!(decode_pdf_text(&bytes), input.replace("\r\n", "\n"));
+        }
+        assert_eq!(decode_pdf_text(b"a\rb\r\nc"), "a\nb\nc");
+    }
+
+    #[test]
     fn test_annotations_undo_redo_and_translation() {
         let mut mgr = AnnotationManager::new();
         assert_eq!(mgr.items.len(), 0);
@@ -2703,6 +2767,10 @@ mod tests {
         let original = doc.get_object(highlight_id).and_then(|o| o.as_dict()).expect("Objet conservé");
         assert_eq!(decode_pdf_text(original.get(b"Contents").unwrap().as_str().unwrap()), "Avis modifié");
         assert_eq!(original.get(b"NM").unwrap().as_str().unwrap(), b"acrobat-uuid-1");
+        assert!(
+            !doc.objects.values().filter_map(|o| o.as_dict().ok()).any(|d| d.has(b"State") && d.has(b"Open")),
+            "Acrobat ignore un état de révision qui porte /Open"
+        );
 
         let reloaded = load_annotations_from_pdf(&path, &dims).expect("Doit relire");
         assert_eq!(reloaded.len(), 1);

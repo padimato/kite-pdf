@@ -3,22 +3,19 @@ mod app;
 mod memory_manager;
 mod ocr_engine;
 mod pdf_engine;
+mod recent_files;
 mod tabs;
 mod text_search;
 mod viewport;
 mod worker;
 
 use app::{AutomationConfig, InitialSidebarMode, SuperPdfApp};
-use pdf_engine::ensure_sample_pdf;
 use std::path::PathBuf;
 use tabs::ActiveTool;
 use text_search::PdfTopDownRect;
 
 fn parse_args() -> AutomationConfig {
-    let mut cfg = AutomationConfig {
-        initial_pdf: PathBuf::from("test_pdfs/demo_jalon1.pdf"),
-        ..Default::default()
-    };
+    let mut cfg = AutomationConfig::default();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -60,11 +57,8 @@ fn parse_args() -> AutomationConfig {
                     i += 1;
                 }
             }
-            "--demo-tabs" => {
-                if let Some(c) = args.get(i + 1).and_then(|s| s.parse::<usize>().ok()) {
-                    cfg.demo_tabs_count = Some(c);
-                    i += 1;
-                }
+            "--screenshot-visible" => {
+                cfg.screenshot_visible = true;
             }
             "--active-tab" => {
                 if let Some(t) = args.get(i + 1).and_then(|s| s.parse::<usize>().ok()) {
@@ -148,12 +142,6 @@ fn parse_args() -> AutomationConfig {
                     i += 1;
                 }
             }
-            "--demo-annotations" => {
-                cfg.demo_annotations = true;
-            }
-            "--hybrid-ocr-demo" => {
-                cfg.hybrid_ocr_demo = true;
-            }
             "--ocr-turbo" => {
                 cfg.ocr_turbo = true;
             }
@@ -179,7 +167,7 @@ fn parse_args() -> AutomationConfig {
                 }
             }
             arg if !arg.starts_with("--") => {
-                cfg.initial_pdf = PathBuf::from(arg);
+                cfg.initial_pdf = Some(PathBuf::from(arg));
             }
             _ => {}
         }
@@ -205,19 +193,20 @@ fn main() -> eframe::Result<()> {
     install_crash_log();
     let cfg = parse_args();
 
-    if cfg.demo_tabs_count.is_none() && cfg.initial_pdf == PathBuf::from("test_pdfs/demo_jalon1.pdf")
-    {
-        ensure_sample_pdf(&cfg.initial_pdf)
-            .expect("Impossible de générer le PDF de démonstration test_pdfs/demo_jalon1.pdf");
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("Super Lecteur PDF")
+        .with_inner_size([1280.0, 820.0])
+        .with_min_inner_size([640.0, 400.0]);
+    if cfg.screenshot_output.is_some() && !cfg.screenshot_visible {
+        // Capture automatisée : fenêtre hors écran, sans focus ni bouton dans la barre des tâches,
+        // pour ne pas déranger l'utilisateur qui travaille sur la machine.
+        viewport = viewport
+            .with_active(false)
+            .with_taskbar(false)
+            .with_position([-20000.0, -20000.0]);
     }
 
-    let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("Super Lecteur PDF")
-            .with_inner_size([1280.0, 820.0])
-            .with_min_inner_size([640.0, 400.0]),
-        ..Default::default()
-    };
+    let native_options = eframe::NativeOptions { viewport, ..Default::default() };
 
     eframe::run_native(
         "Super Lecteur PDF",

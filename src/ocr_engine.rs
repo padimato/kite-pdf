@@ -7,7 +7,9 @@ use lopdf::{dictionary, Document, Object, ObjectId, Stream};
 use oar_ocr::core::config::OrtSessionConfig;
 use oar_ocr::prelude::{OAROCRBuilder, TextRegion, OAROCR};
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+#[cfg(test)]
+use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
 /// Mode de fonctionnement de l'ordonnanceur OCR Hybride à 3 vitesses
@@ -100,6 +102,7 @@ impl TabOcrState {
     }
 }
 
+#[cfg(test)]
 /// Police matricielle 5x7 utilisée pour
 /// générer les graphiques matriciels RGB (`XObject /Subtype /Image`) du PDF de test, avec textes à 0°, +30°, -30°, +90°.
 pub fn glyph_bitmap_5x7(ch: char) -> Option<[u8; 7]> {
@@ -155,6 +158,7 @@ pub fn glyph_bitmap_5x7(ch: char) -> Option<[u8; 7]> {
     Some(rows)
 }
 
+#[cfg(test)]
 /// Paramètres géométriques de tracé et de reconnaissance pour un texte orienté dans une image
 #[derive(Debug, Clone)]
 pub struct OrientedImageLabelSpec {
@@ -166,6 +170,7 @@ pub struct OrientedImageLabelSpec {
     pub color_rgb: [u8; 3],
 }
 
+#[cfg(test)]
 /// Dessine une étiquette de texte orientée (`0°`, `+30°`, `-30°`, `-90°`/`+90°`) directement en pixels
 /// dans un buffer RGB (`width * height * 3`), avec un fond de contraste clair pour une lisibilité parfaite
 /// sur un graphique scientifique / industriel.
@@ -564,6 +569,7 @@ impl HybridOcrEngine {
     }
 }
 
+#[cfg(test)]
 /// Génère un fichier PDF Hybride "Word + Graphique JPG Multi-Orientations" (`test_pdfs/hybrid_word_jpg_ocr.pdf`) :
 /// - Contient du **texte natif Word** normal (paragraphes d'introduction et de conclusion).
 /// - Contient au centre un **vrai objet `XObject /Subtype /Image` (bitmap RGB 460x260 px)** représentant un graphique
@@ -967,23 +973,40 @@ pub fn append_invisible_ocr_layer_to_doc(
         // Mode de rendu de texte PDF 3 = Invisible (ni remplissage ni contour, 100 % sélectionnable et cherchable)
         ops.push(Operation::new("Tr", vec![3.into()]));
 
-        for (word_str, word_rect, start_rect, angle_deg) in words {
+        for (word_str, word_rect, _start_rect, angle_deg) in words {
+            // Une inclinaison de quelques degrés n'est que du bruit de détection : un mot presque droit
+            // est remis sur l'axe le plus proche, pour une surbrillance de recherche bien alignée.
+            let nearest_axis = (angle_deg / 90.0).round() * 90.0;
+            let angle_deg = if (angle_deg - nearest_axis).abs() < OCR_TILT_SNAP_DEG { nearest_axis } else { angle_deg };
+            let n_chars = (word_str.chars().count() as f32).max(1.0);
+            let (length, height) = oriented_word_size(&word_rect, angle_deg, n_chars);
+            if length <= 0.1 || height <= 0.1 {
+                continue;
+            }
+
+            // Sens de lecture et sens « vers le bas du texte », en coordonnées de la vue (y vers le bas).
+            let view_rad = angle_deg.to_radians();
+            let (dir_x, dir_y) = (view_rad.cos(), -view_rad.sin());
+            let (down_x, down_y) = (view_rad.sin(), view_rad.cos());
+            let (center_x, center_y) = word_rect.center();
+            let font_size = height * OCR_EM_PER_BOX_HEIGHT;
+            let baseline_drop = font_size * OCR_BASELINE_BELOW_CENTER;
+            let start_x = center_x - dir_x * length * 0.5 + down_x * baseline_drop;
+            let start_y = center_y - dir_y * length * 0.5 + down_y * baseline_drop;
+            let (tx, ty) = page_dim.view_to_pdf(start_x, start_y);
+
+            // La police suit la hauteur de la ligne détectée ; l'échelle horizontale `Tz` étire le mot
+            // sur sa largeur réelle, pour que la surbrillance d'une recherche tombe exactement dessus.
+            let stretch = (length / (n_chars * COURIER_ADVANCE_EM * font_size) * 100.0).clamp(10.0, 400.0);
             let rad = (angle_deg + page_dim.rotation_deg as f32).to_radians();
             let cos_a = rad.cos();
             let sin_a = rad.sin();
-
-            // Coordonnées PDF bottom-up exactes du 1er caractère du mot
-            let (tx, ty) = page_dim.view_to_pdf(start_rect.x_min, start_rect.y_max - 2.0);
-
-            // Calibrer la taille de police `Courier-Bold` (chasse 0.60 em) pour couvrir toute l'étendue géométrique du mot
-            let span_pt = word_rect.width().hypot(word_rect.height());
-            let n_chars = (word_str.chars().count() as f32).max(1.0);
-            let font_size = (span_pt / (n_chars * 0.65)).clamp(11.0, 22.0);
 
             ops.push(Operation::new(
                 "Tf",
                 vec!["F_OCR".into(), font_size.into()],
             ));
+            ops.push(Operation::new("Tz", vec![stretch.into()]));
             ops.push(Operation::new(
                 "Tm",
                 vec![
@@ -995,10 +1018,14 @@ pub fn append_invisible_ocr_layer_to_doc(
                     ty.into(),
                 ],
             ));
+            // L'espace final sépare les mots à l'extraction du texte (copier-coller, recherche de
+            // plusieurs mots à la suite).
+            let mut encoded_word = encode_win_ansi(&word_str);
+            encoded_word.push(b' ');
             ops.push(Operation::new(
                 "Tj",
                 vec![Object::String(
-                    encode_win_ansi(&word_str),
+                    encoded_word,
                     lopdf::StringFormat::Literal,
                 )],
             ));
@@ -1016,6 +1043,35 @@ pub fn append_invisible_ocr_layer_to_doc(
     }
 
     Ok(injected_words)
+}
+
+/// Chasse d'un caractère Courier, en fraction de la taille de police.
+const COURIER_ADVANCE_EM: f32 = 0.6;
+/// En dessous de cet écart à l'horizontale ou à la verticale, un mot est enregistré droit.
+const OCR_TILT_SNAP_DEG: f32 = 10.0;
+/// La boîte détectée déborde autour des lettres : le corps de police n'en occupe qu'une partie, sinon
+/// la surbrillance d'une recherche déborde sur les lignes voisines.
+const OCR_EM_PER_BOX_HEIGHT: f32 = 0.7;
+/// Distance entre le milieu des lettres et la ligne de base, en fraction du corps.
+const OCR_BASELINE_BELOW_CENTER: f32 = 0.28;
+
+/// Longueur et hauteur d'un mot incliné, retrouvées à partir de son rectangle englobant droit.
+fn oriented_word_size(bounds: &PdfTopDownRect, angle_deg: f32, n_chars: f32) -> (f32, f32) {
+    let rad = angle_deg.to_radians();
+    let (c, s) = (rad.cos().abs(), rad.sin().abs());
+    let (w, h) = (bounds.width(), bounds.height());
+    let det = c * c - s * s;
+    if det.abs() > 0.2 {
+        let length = (w * c - h * s) / det;
+        let height = (h * c - w * s) / det;
+        if length > 0.0 && height > 0.0 {
+            return (length, height);
+        }
+    }
+    // Près de 45°, les deux dimensions ne se séparent plus : on suppose des caractères deux fois plus hauts que larges.
+    let sum = (w + h) / (c + s).max(0.1);
+    let height = sum / (1.0 + 0.5 * n_chars);
+    (sum - height, height)
 }
 
 /// Encode une chaîne en WinAnsi pour les flux de contenu (caractères hors table remplacés par `?`).

@@ -8,8 +8,8 @@ use crate::memory_manager::{
     query_process_memory_bytes, LruTextureCache, MultiplicativeHighlightQuad, PageTextureKey,
     DEFAULT_TEXTURE_BUDGET_BYTES,
 };
-use crate::ocr_engine::ensure_hybrid_word_jpg_pdf;
-use crate::pdf_engine::{ensure_custom_sample_pdf, PdfEngine, TileRegion};
+use crate::pdf_engine::{PdfEngine, TileRegion};
+use crate::recent_files::RecentFiles;
 use crate::tabs::{
     ActiveTool, CommandPaletteState, DocumentTab, PaletteCommand, SidebarState, SIDEBAR_WIDTH,
 };
@@ -256,13 +256,12 @@ pub enum InitialSidebarMode {
 /// Configuration d'automatisation (utilisée par les sous-agents QA pour les tests visuels et captures d'écran)
 #[derive(Debug, Clone, Default)]
 pub struct AutomationConfig {
-    pub initial_pdf: PathBuf,
+    pub initial_pdf: Option<PathBuf>,
     pub extra_pdfs: Vec<PathBuf>,
     pub initial_zoom: Option<f32>,
     pub initial_page: Option<usize>,
     pub initial_scroll_x: Option<f32>,
     pub initial_scroll_y: Option<f32>,
-    pub demo_tabs_count: Option<usize>,
     pub active_tab_index: Option<usize>,
     pub sidebar_mode: InitialSidebarMode,
     pub open_palette_query: Option<String>,
@@ -272,13 +271,13 @@ pub struct AutomationConfig {
     pub initial_select_rect: Option<PdfTopDownRect>,
     pub initial_select_stream: Option<(usize, usize)>,
     pub initial_highlight_stream: Option<(usize, usize)>,
-    pub demo_annotations: bool,
-    pub hybrid_ocr_demo: bool,
     pub ocr_turbo: bool,
     pub save_annotated_output: Option<PathBuf>,
     pub screenshot_output: Option<PathBuf>,
     /// Délai avant la capture (permet à un script QA d'envoyer des événements à la fenêtre)
     pub screenshot_delay_ms: u64,
+    /// Capture automatisée dans une fenêtre visible au premier plan (sinon hors écran, sans focus).
+    pub screenshot_visible: bool,
 }
 
 pub struct SuperPdfApp {
@@ -296,6 +295,8 @@ pub struct SuperPdfApp {
     pub active_tool: ActiveTool,
     /// État de la palette de commandes flottante (`Ctrl+K`)
     pub command_palette: CommandPaletteState,
+    /// Historique des PDF ouverts, cherché par la barre centrale (`Ctrl+T`)
+    pub recent_files: RecentFiles,
     /// État du moteur de recherche `Ctrl+F`
     pub search_bar: SearchBarState,
     /// Gestionnaire de cache de textures GPU LRU à budget mémoire plafonné (48 Mo max)
@@ -331,6 +332,8 @@ pub struct SuperPdfApp {
     last_ink_stroke: Option<(u64, Instant)>,
     /// Dernière erreur éventuelle à afficher
     error_message: Option<String>,
+    /// Échec du dernier enregistrement, signalé dans une fenêtre sans masquer le document
+    save_error: Option<String>,
     /// Compteur de frames pour le mode capture d'écran automatisée
     frame_count: u64,
     /// Indique si la commande Screenshot a déjà été envoyée
@@ -363,24 +366,6 @@ const TAB_BADGE_COLORS: [(Color32, (f32, f32, f32)); 6] = [
     (Color32::from_rgb(235, 145, 55), (0.52, 0.28, 0.10)),
     (Color32::from_rgb(225, 85, 105), (0.48, 0.14, 0.20)),
     (Color32::from_rgb(80, 185, 225), (0.10, 0.36, 0.46)),
-];
-
-const DEMO_TAB_SPECS: [(&str, &str, usize); 15] = [
-    ("01_Architecture_Rust_GPU.pdf", "ARCHITECTURE RUST & GPU", 6),
-    ("02_Rapport_Graphiques_OCR.pdf", "RAPPORT GRAPHIQUES & OCR", 8),
-    ("03_Norme_ISO_32000_Annotations.pdf", "NORME ISO 32000 ANNOTATIONS", 10),
-    ("04_Analyse_Capteurs_ISEN.pdf", "ANALYSE CAPTEURS ISEN", 5),
-    ("05_Benchmark_RAM_15_Onglets.pdf", "BENCHMARK RAM 15 ONGLETS", 7),
-    ("06_Notes_Reunion_Projet.pdf", "NOTES REUNION PROJET", 4),
-    ("07_Schema_Electronique_PCB.pdf", "SCHEMA ELECTRONIQUE PCB", 6),
-    ("08_Publication_Traitement_Signal.pdf", "TRAITEMENT DU SIGNAL", 9),
-    ("09_Datasheet_Microcontroleur.pdf", "DATASHEET STM32 / ARM", 12),
-    ("10_Cahier_Charges_Systeme.pdf", "CAHIER DES CHARGES SYSTEME", 5),
-    ("11_Mesures_Thermiques_Labo.pdf", "MESURES THERMIQUES LABO", 6),
-    ("12_Protocole_Reseau_Temps_Reel.pdf", "PROTOCOLE TEMPS REEL", 8),
-    ("13_Algorithmes_Vision_ONNX.pdf", "ALGORITHMES VISION ONNX", 7),
-    ("14_Synthese_Budget_Materiel.pdf", "SYNTHESE BUDGET MATERIEL", 4),
-    ("15_Manuel_Validation_Qualite.pdf", "MANUEL VALIDATION QUALITE", 6),
 ];
 
 impl SuperPdfApp {
@@ -416,6 +401,12 @@ impl SuperPdfApp {
             sidebar,
             active_tool: automation.initial_tool.unwrap_or(ActiveTool::Select),
             command_palette: CommandPaletteState::default(),
+            // Les lancements automatisés (captures QA) ne doivent pas remplir l'historique réel.
+            recent_files: if automation.screenshot_output.is_some() {
+                RecentFiles::in_memory()
+            } else {
+                RecentFiles::load_default()
+            },
             search_bar: SearchBarState::default(),
             texture_cache: LruTextureCache::new(DEFAULT_TEXTURE_BUDGET_BYTES),
             process_working_set_bytes: ws_bytes,
@@ -437,6 +428,7 @@ impl SuperPdfApp {
             line_context_menu: None,
             last_ink_stroke: None,
             error_message: None,
+            save_error: None,
             frame_count: 0,
             screenshot_requested: false,
             automation: automation.clone(),
@@ -452,22 +444,15 @@ impl SuperPdfApp {
             observed_zoom_changed_at: Instant::now(),
         };
 
-        if automation.hybrid_ocr_demo {
-            let hybrid_path = PathBuf::from("test_pdfs/hybrid_word_jpg_ocr.pdf");
-            let _ = ensure_hybrid_word_jpg_pdf(&hybrid_path);
-            app.open_pdf_in_new_tab(&hybrid_path);
-            for extra in &automation.extra_pdfs {
-                app.open_pdf_in_new_tab(extra);
-            }
-        } else if let Some(count) = automation.demo_tabs_count {
-            for _ in 0..count.max(1) {
-                app.spawn_next_demo_tab();
-            }
-        } else {
-            app.open_pdf_in_new_tab(&automation.initial_pdf);
-            for extra in &automation.extra_pdfs {
-                app.open_pdf_in_new_tab(extra);
-            }
+        if let Some(initial) = &automation.initial_pdf {
+            app.open_pdf_in_new_tab(initial);
+        }
+        for extra in &automation.extra_pdfs {
+            app.open_pdf_in_new_tab(extra);
+        }
+        // Lancé sans fichier : la barre centrale propose directement les PDF récents.
+        if app.tabs.is_empty() && automation.open_palette_query.is_none() {
+            app.command_palette.open();
         }
 
         if let Some(target_tab) = automation.active_tab_index {
@@ -597,15 +582,6 @@ impl SuperPdfApp {
             }
         }
 
-        // Vitrine d'annotations ISO 32000 si demandée par CLI
-        if automation.demo_annotations {
-            if let Some(tab) = app.tabs.get_mut(app.active_tab) {
-                let target_page = automation.initial_page.unwrap_or(1).saturating_sub(1);
-                tab.annotations.populate_demo_showcase(target_page);
-                tab.is_modified = true;
-            }
-        }
-
         // Sauvegarde du PDF (Annotations ISO 32000 + Couche Texte OCR invisible `3 Tr`) si demandée par CLI
         if let Some(save_path) = &automation.save_annotated_output {
             if let Some(tab) = app.tabs.get_mut(app.active_tab) {
@@ -667,6 +643,7 @@ impl SuperPdfApp {
                 let id = self.next_tab_id;
                 self.next_tab_id += 1;
                 self.tabs.push(DocumentTab::new_active(id, doc, badge_color));
+                self.recent_files.record_open(path);
                 self.active_tab = self.tabs.len() - 1;
                 self.error_message = None;
                 self.render_zoom = 0.0;
@@ -675,20 +652,6 @@ impl SuperPdfApp {
                 self.error_message = Some(format!("{:#}", err));
             }
         }
-    }
-
-    pub fn spawn_next_demo_tab(&mut self) {
-        let idx = self.tabs.len();
-        let (filename, title, pages) = DEMO_TAB_SPECS[idx % DEMO_TAB_SPECS.len()];
-        let (_, rgb) = TAB_BADGE_COLORS[idx % TAB_BADGE_COLORS.len()];
-        let actual_filename = if idx < DEMO_TAB_SPECS.len() {
-            filename.to_string()
-        } else {
-            format!("{:02}_{}", idx + 1, filename)
-        };
-        let path = PathBuf::from("test_pdfs").join(actual_filename);
-        let _ = ensure_custom_sample_pdf(&path, title, rgb, pages);
-        self.open_pdf_in_new_tab(&path);
     }
 
     pub fn close_tab(&mut self, index: usize) {
@@ -753,9 +716,10 @@ impl SuperPdfApp {
                     tab.ocr.has_unsaved_ocr = false;
                     tab.annotations.saved_feedback_frames = 120;
                     self.error_message = None;
+                    self.save_error = None;
                 }
                 Err(e) => {
-                    self.error_message = Some(format!("Erreur sauvegarde PDF : {:#}", e));
+                    self.save_error = Some(format!("{:#}", e));
                 }
             }
         }
@@ -815,16 +779,22 @@ impl SuperPdfApp {
                     tab.pump_ocr(p, &self.workers);
                 }
             }
-            PaletteCommand::OpenHybridWordJpgDemo => {
-                let hybrid_path = PathBuf::from("test_pdfs/hybrid_word_jpg_ocr.pdf");
-                let _ = ensure_hybrid_word_jpg_pdf(&hybrid_path);
-                self.open_pdf_in_new_tab(&hybrid_path);
+            PaletteCommand::OpenRecent(path) => {
+                if path.is_file() {
+                    self.open_pdf_in_new_tab(&path);
+                } else {
+                    self.recent_files.remove(&path);
+                    self.error_message =
+                        Some(format!("Fichier introuvable : {}", path.display()));
+                }
             }
-            PaletteCommand::PopulateDemoAnnotations => {
+            PaletteCommand::OpenSearch => {
+                self.search_bar.open();
                 if let Some(tab) = self.tabs.get_mut(self.active_tab) {
                     let p = tab.viewport.current_page_index(viewport_size, &tab.page_dimensions);
-                    tab.annotations.populate_demo_showcase(p);
-                    tab.is_modified = true;
+                    tab.request_all_text(&self.workers);
+                    tab.start_turbo_ocr();
+                    tab.pump_ocr(p, &self.workers);
                 }
             }
             PaletteCommand::UndoAnnotation => {
@@ -841,15 +811,6 @@ impl SuperPdfApp {
                 if let Some(tab) = self.tabs.get_mut(self.active_tab) {
                     tab.annotations.delete_selected();
                 }
-            }
-            PaletteCommand::NewDemoTab => {
-                self.spawn_next_demo_tab();
-            }
-            PaletteCommand::Open15TabsBenchmark => {
-                while self.tabs.len() < 15 {
-                    self.spawn_next_demo_tab();
-                }
-                self.switch_to_tab(self.active_tab);
             }
             PaletteCommand::HibernateInactiveTabs => {
                 let current = self.active_tab;
@@ -997,7 +958,9 @@ impl SuperPdfApp {
                 self.command_palette.toggle();
             }
             if input.key_pressed(Key::Escape) {
-                if self.editing_freetext_id.is_some()
+                if self.save_error.is_some() {
+                    self.save_error = None;
+                } else if self.editing_freetext_id.is_some()
                     || self.line_context_menu.is_some()
                     || self.comment_edit.is_some()
                 {
@@ -1019,7 +982,7 @@ impl SuperPdfApp {
                 pending_commands.push(PaletteCommand::OpenFileDialog);
             }
             if ctrl && input.key_pressed(Key::T) {
-                pending_commands.push(PaletteCommand::NewDemoTab);
+                self.command_palette.toggle();
             }
             if ctrl && input.key_pressed(Key::W) {
                 pending_commands.push(PaletteCommand::CloseActiveTab);
@@ -1760,7 +1723,7 @@ impl eframe::App for SuperPdfApp {
             self.process_working_set_bytes = ws_bytes;
         }
 
-        if self.sidebar.step_animation(dt.max(0.016)) {
+        if self.sidebar.step_animation(dt) {
             ctx.request_repaint();
         }
 
@@ -1778,7 +1741,15 @@ impl eframe::App for SuperPdfApp {
                         .stroke(Stroke::new(1.0_f32, Color32::from_rgb(44, 50, 66))),
                 )
                 .show(ctx, |ui| {
-                    self.render_sidebar_contents(ui);
+                    // La place est réservée d'un coup (le document ne bouge qu'une fois) et le contenu
+                    // glisse à l'intérieur du panneau, coupé à son bord.
+                    let panel_rect = ui.max_rect();
+                    let slide = -SIDEBAR_WIDTH * (1.0 - self.sidebar.anim_progress);
+                    let mut content_ui = ui.new_child(
+                        egui::UiBuilder::new().max_rect(panel_rect.translate(Vec2::new(slide, 0.0))),
+                    );
+                    content_ui.set_clip_rect(panel_rect);
+                    self.render_sidebar_contents(&mut content_ui);
                 });
         }
 
@@ -1859,9 +1830,25 @@ impl eframe::App for SuperPdfApp {
                     SelectionGestureMode,
                 )> = None;
 
+                if self.tabs.is_empty() && !self.command_palette.is_open {
+                    painter.text(
+                        canvas_rect.center() - Vec2::new(0.0, 14.0),
+                        Align2::CENTER_CENTER,
+                        "Aucun PDF ouvert",
+                        FontId::proportional(20.0),
+                        Color32::from_rgb(170, 180, 200),
+                    );
+                    painter.text(
+                        canvas_rect.center() + Vec2::new(0.0, 16.0),
+                        Align2::CENTER_CENTER,
+                        "Ctrl+T : rouvrir un PDF récent      Ctrl+O : parcourir le disque",
+                        FontId::proportional(13.0),
+                        Color32::from_rgb(120, 130, 152),
+                    );
+                }
                 if let Some(err) = &self.error_message {
                     painter.text(
-                        canvas_rect.center(),
+                        canvas_rect.center() + Vec2::new(0.0, if self.tabs.is_empty() { 60.0 } else { 0.0 }),
                         Align2::CENTER_CENTER,
                         format!("Erreur : {}", err),
                         FontId::proportional(16.0),
@@ -2409,6 +2396,7 @@ impl eframe::App for SuperPdfApp {
                 self.render_freetext_editor(ctx, &visible_pages_info);
                 self.render_comment_panel(ctx, canvas_rect, &visible_pages_info);
                 self.render_line_context_menu(ctx);
+                self.render_save_error_popup(ctx);
 
                 // Barre de recherche flottante `Ctrl+F`
                 if self.search_bar.is_open {
@@ -3068,6 +3056,7 @@ impl SuperPdfApp {
         let mut header_drag = Vec2::ZERO;
         let mut reply_has_focus = false;
         let mut open_menu_at = None;
+        let mut header_buttons_left = f32::INFINITY;
 
         let area = egui::Area::new(egui::Id::new("superpdf_comment_panel").with(note_id))
             .fixed_pos(panel_pos)
@@ -3113,11 +3102,15 @@ impl SuperPdfApp {
                                 if more.clicked() {
                                     open_menu_at = Some(more.rect.left_bottom());
                                 }
+                                header_buttons_left = more.rect.left();
                             });
                         });
                         if annot.is_fixed_to_text() {
+                            // La zone de déplacement s'arrête avant les boutons, sinon elle avale leurs clics.
+                            let mut drag_rect = header.response.rect;
+                            drag_rect.max.x = drag_rect.max.x.min(header_buttons_left - 4.0);
                             let drag = ui.interact(
-                                header.response.rect,
+                                drag_rect,
                                 ui.id().with("comment_header"),
                                 Sense::drag(),
                             );
@@ -3183,6 +3176,12 @@ impl SuperPdfApp {
                             }
                         }
 
+                        // On ne répond qu'à un commentaire déjà écrit.
+                        let can_reply = editing != Some(CommentEditTarget::Main)
+                            && (!comment.trim().is_empty() || !annot.meta.replies.is_empty());
+                        if !can_reply {
+                            return;
+                        }
                         ui.add_space(4.0);
                         ui.horizontal(|ui| {
                             let field = ui.add(
@@ -3293,6 +3292,33 @@ impl SuperPdfApp {
         }
     }
 
+    /// Signale un enregistrement raté sans toucher à l'affichage du document.
+    fn render_save_error_popup(&mut self, ctx: &Context) {
+        let Some(reason) = &self.save_error else {
+            return;
+        };
+        let mut dismissed = false;
+        egui::Window::new("Enregistrement impossible")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .order(Order::Tooltip)
+            .show(ctx, |ui| {
+                ui.set_max_width(460.0);
+                ui.label("Le fichier n'a pas été enregistré (Ctrl+S). Vos annotations sont toujours là.");
+                ui.label("Il est probablement ouvert dans une autre application, comme Acrobat. Fermez-le là-bas puis réessayez.");
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(reason).size(11.0).weak());
+                ui.add_space(6.0);
+                if ui.button("OK").clicked() {
+                    dismissed = true;
+                }
+            });
+        if dismissed {
+            self.save_error = None;
+        }
+    }
+
     /// Menu du clic droit : attributs d'une flèche ou d'un bloc, actions d'un commentaire.
     fn render_line_context_menu(&mut self, ctx: &Context) {
         let Some(menu) = &self.line_context_menu else {
@@ -3375,7 +3401,7 @@ impl SuperPdfApp {
             .show(ctx, |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     if is_note {
-                        if ui.button("Répondre").clicked() {
+                        if ui.add_enabled(!annot.is_empty_comment(), egui::Button::new("Répondre")).clicked() {
                             reply_requested = true;
                         }
                         if ui.button("Modifier le commentaire").clicked() {
@@ -3482,6 +3508,7 @@ impl SuperPdfApp {
 
         let mut close_menu = false;
         if reply_requested {
+            self.comment_edit = None;
             self.comment_reply_focus_pending = true;
             close_menu = true;
         }
@@ -3801,21 +3828,14 @@ impl SuperPdfApp {
                             }
                         }
 
-                        if ui
-                            .small_button("⌘K")
-                            .on_hover_text("Palette de commandes rapide (Ctrl+K)")
-                            .clicked()
-                        {
-                            self.command_palette.toggle();
-                        }
                     });
                 });
 
                 ui.add_space(3.0);
 
-                // Barre de déclenchement rapide Ctrl+K
+                // Ouvre la barre centrale (Ctrl+T)
                 let search_btn = egui::Button::new(
-                    egui::RichText::new("🔍 Palette : onglet, outil, page... (Ctrl+K)")
+                    egui::RichText::new("🔍 PDF récent, outil, page…   Ctrl+T")
                         .size(11.5)
                         .color(Color32::from_rgb(175, 185, 208)),
                 )
@@ -3921,18 +3941,11 @@ impl SuperPdfApp {
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
-                            .small_button("⚡ 15 PDF")
-                            .on_hover_text("Ouvrir 15 PDF en simultané avec hibernation automatique")
-                            .clicked()
-                        {
-                            pending_cmd = Some(PaletteCommand::Open15TabsBenchmark);
-                        }
-                        if ui
                             .small_button("➕")
-                            .on_hover_text("Ouvrir un nouvel onglet de démonstration (Ctrl+T)")
+                            .on_hover_text("Rouvrir un PDF de l'historique (Ctrl+T)")
                             .clicked()
                         {
-                            pending_cmd = Some(PaletteCommand::NewDemoTab);
+                            self.command_palette.open();
                         }
                         if ui
                             .small_button("📂")
@@ -4454,6 +4467,10 @@ impl SuperPdfApp {
 
         egui::Area::new(egui::Id::new("superpdf_floating_sidebar_overlay"))
             .fixed_pos(overlay_rect.min)
+            // Sans cela egui ramène la zone dans l'écran et la fait apparaître en fondu : la barre
+            // surgissait en place au lieu de glisser depuis le bord.
+            .constrain(false)
+            .fade_in(false)
             .order(Order::Foreground)
             .show(ctx, |ui| {
                 egui::Frame::NONE
@@ -4547,37 +4564,48 @@ impl SuperPdfApp {
             });
     }
 
+    /// Barre centrale (`Ctrl+T`) : retrouve un PDF de l'historique, un onglet, une page ou un outil.
     fn render_command_palette(&mut self, ctx: &Context, canvas_rect: Rect) {
-        let tabs_info: Vec<(usize, String, usize, bool)> = self
+        let tabs_info: Vec<(usize, String, usize, PathBuf)> = self
             .tabs
             .iter()
             .enumerate()
-            .map(|(i, t)| (i, t.title.clone(), t.page_count(), t.is_hibernated()))
+            .map(|(i, t)| (i, t.title.clone(), t.page_count(), t.path.clone()))
             .collect();
         let active_pages = self
             .tabs
             .get(self.active_tab)
             .map(|t| t.page_count())
             .unwrap_or(0);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
 
-        let entries = self
-            .command_palette
-            .filtered_entries(&tabs_info, active_pages);
+        let entries = self.command_palette.filtered_entries(
+            &tabs_info,
+            active_pages,
+            &self.recent_files,
+            now,
+        );
         if self.command_palette.selected_index >= entries.len() {
             self.command_palette.selected_index = entries.len().saturating_sub(1);
         }
 
         let mut command_to_run: Option<PaletteCommand> = None;
         let mut should_close = false;
+        let mut selection_moved_by_keys = false;
 
         ctx.input(|input| {
             if input.key_pressed(Key::ArrowDown) && !entries.is_empty() {
                 self.command_palette.selected_index =
                     (self.command_palette.selected_index + 1) % entries.len();
+                selection_moved_by_keys = true;
             }
             if input.key_pressed(Key::ArrowUp) && !entries.is_empty() {
                 self.command_palette.selected_index =
                     (self.command_palette.selected_index + entries.len() - 1) % entries.len();
+                selection_moved_by_keys = true;
             }
             if input.key_pressed(Key::Enter) {
                 if let Some(chosen) = entries.get(self.command_palette.selected_index) {
@@ -4587,130 +4615,168 @@ impl SuperPdfApp {
             }
         });
 
-        let backdrop_painter = ctx.layer_painter(egui::LayerId::new(
+        let screen = ctx.screen_rect();
+        ctx.layer_painter(egui::LayerId::new(
             Order::Foreground,
             egui::Id::new("palette_backdrop"),
-        ));
-        backdrop_painter.rect_filled(
-            ctx.screen_rect(),
-            CornerRadius::ZERO,
-            Color32::from_rgba_unmultiplied(8, 10, 15, 150),
-        );
+        ))
+        .rect_filled(screen, CornerRadius::ZERO, Color32::from_rgba_unmultiplied(6, 8, 12, 170));
 
-        let palette_w = 560.0;
-        let palette_pos = Pos2::new(
-            ctx.screen_rect().center().x - palette_w * 0.5,
-            (ctx.screen_rect().min.y + 85.0).max(24.0),
+        let bar_w = 640.0_f32.min(screen.width() - 32.0);
+        let bar_pos = Pos2::new(
+            screen.center().x - bar_w * 0.5,
+            screen.min.y + (screen.height() * 0.2).max(24.0),
         );
+        let muted = Color32::from_rgb(135, 145, 168);
 
-        egui::Area::new(egui::Id::new("superpdf_command_palette_modal"))
-            .fixed_pos(palette_pos)
+        let area = egui::Area::new(egui::Id::new("superpdf_command_palette_modal"))
+            .fixed_pos(bar_pos)
             .order(Order::Tooltip)
             .show(ctx, |ui| {
                 egui::Frame::NONE
-                    .fill(Color32::from_rgb(26, 30, 42))
-                    .stroke(Stroke::new(1.5_f32, Color32::from_rgb(88, 138, 235)))
-                    .corner_radius(CornerRadius::same(12))
-                    .inner_margin(Margin::symmetric(14, 12))
+                    .fill(Color32::from_rgb(24, 28, 39))
+                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(70, 100, 170)))
+                    .corner_radius(CornerRadius::same(14))
+                    .shadow(egui::epaint::Shadow {
+                        offset: [0, 10],
+                        blur: 36,
+                        spread: 0,
+                        color: Color32::from_black_alpha(140),
+                    })
+                    .inner_margin(Margin::same(12))
                     .show(ui, |ui| {
-                        ui.set_width(palette_w);
+                        ui.set_width(bar_w - 24.0);
 
+                        // Champ de saisie, grand et sans cadre, comme une barre de recherche système.
                         ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new("⌘ PALETTE DE COMMANDES SUPER PDF")
-                                    .strong()
-                                    .size(12.0)
-                                    .color(Color32::from_rgb(130, 180, 255)),
-                            );
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if ui.small_button("Échap ✖").clicked() {
-                                        should_close = true;
-                                    }
-                                },
-                            );
+                            ui.label(egui::RichText::new("🔍").size(18.0).color(muted));
+                            let text_edit =
+                                egui::TextEdit::singleline(&mut self.command_palette.query)
+                                    .hint_text("Rechercher un PDF, un outil, une page…")
+                                    .font(FontId::proportional(18.0))
+                                    .frame(false)
+                                    .desired_width(ui.available_width());
+                            let resp = ui.add(text_edit);
+                            self.text_field_focused_now |= resp.has_focus();
+                            if self.command_palette.focus_requested {
+                                resp.request_focus();
+                                self.command_palette.focus_requested = false;
+                            }
+                            if resp.changed() {
+                                self.command_palette.selected_index = 0;
+                            }
                         });
-
-                        ui.add_space(6.0);
-
-                        let text_edit = egui::TextEdit::singleline(&mut self.command_palette.query)
-                            .hint_text("Tapez le nom d'un onglet, d'un outil (Surligner, Texte...) ou d'une page...")
-                            .desired_width(palette_w - 8.0);
-                        let resp = ui.add(text_edit);
-                        self.text_field_focused_now |= resp.has_focus();
-                        if self.command_palette.focus_requested {
-                            resp.request_focus();
-                            self.command_palette.focus_requested = false;
-                        }
 
                         ui.add_space(8.0);
                         ui.separator();
                         ui.add_space(4.0);
 
+                        if entries.is_empty() {
+                            ui.add_space(6.0);
+                            ui.label(
+                                egui::RichText::new("Aucun résultat dans l'historique ni les outils.")
+                                    .color(muted),
+                            );
+                            ui.add_space(6.0);
+                        } else if self.command_palette.query.trim().is_empty()
+                            && entries.iter().any(|e| e.category == "Récent")
+                        {
+                            ui.label(egui::RichText::new("RÉCENTS").size(10.5).strong().color(muted));
+                            ui.add_space(2.0);
+                        }
+
                         egui::ScrollArea::vertical()
-                            .max_height(290.0)
+                            .max_height(400.0)
+                            .auto_shrink([false, true])
                             .show(ui, |ui| {
-                                if entries.is_empty() {
-                                    ui.label(
-                                        egui::RichText::new("Aucune commande correspondante.")
-                                            .color(Color32::from_rgb(140, 150, 170)),
-                                    );
-                                }
+                                ui.spacing_mut().item_spacing.y = 2.0;
                                 for (idx, entry) in entries.iter().enumerate() {
                                     let is_selected = idx == self.command_palette.selected_index;
-                                    let row_fill = if is_selected {
-                                        Color32::from_rgb(50, 92, 185)
-                                    } else {
-                                        Color32::from_rgb(32, 37, 50)
-                                    };
-
-                                    egui::Frame::NONE
-                                        .fill(row_fill)
-                                        .corner_radius(CornerRadius::same(7))
+                                    let row = egui::Frame::NONE
+                                        .fill(if is_selected {
+                                            Color32::from_rgb(45, 78, 150)
+                                        } else {
+                                            Color32::TRANSPARENT
+                                        })
+                                        .corner_radius(CornerRadius::same(8))
                                         .inner_margin(Margin::symmetric(10, 6))
                                         .show(ui, |ui| {
+                                            ui.set_width(ui.available_width());
                                             ui.horizontal(|ui| {
-                                                ui.colored_label(
-                                                    Color32::from_rgb(150, 200, 255),
-                                                    format!("[{}]", entry.category),
-                                                );
-                                                if ui
-                                                    .add(
-                                                        egui::Button::new(
-                                                            egui::RichText::new(&entry.label)
-                                                                .color(Color32::WHITE)
-                                                                .size(12.5),
-                                                        )
-                                                        .frame(false),
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    command_to_run = Some(entry.command.clone());
-                                                    should_close = true;
-                                                }
+                                                let (icon, icon_color) = palette_entry_icon(entry);
+                                                ui.label(egui::RichText::new(icon).size(16.0).color(icon_color));
+                                                ui.vertical(|ui| {
+                                                    ui.label(
+                                                        egui::RichText::new(&entry.label)
+                                                            .size(14.0)
+                                                            .color(Color32::WHITE),
+                                                    );
+                                                    if !entry.detail.is_empty() {
+                                                        ui.label(
+                                                            egui::RichText::new(&entry.detail)
+                                                                .size(11.0)
+                                                                .color(if is_selected {
+                                                                    Color32::from_rgb(190, 205, 235)
+                                                                } else {
+                                                                    muted
+                                                                }),
+                                                        );
+                                                    }
+                                                });
                                                 ui.with_layout(
-                                                    egui::Layout::right_to_left(
-                                                        egui::Align::Center,
-                                                    ),
+                                                    egui::Layout::right_to_left(egui::Align::Center),
                                                     |ui| {
                                                         ui.label(
                                                             egui::RichText::new(entry.shortcut)
                                                                 .monospace()
                                                                 .size(11.0)
-                                                                .color(Color32::from_rgb(
-                                                                    180, 220, 180,
-                                                                )),
+                                                                .color(muted),
                                                         );
                                                     },
                                                 );
                                             });
-                                        });
-                                    ui.add_space(3.0);
+                                        })
+                                        .response;
+                                    let row = ui.interact(
+                                        row.rect,
+                                        egui::Id::new(("palette_row", idx)),
+                                        Sense::click(),
+                                    );
+                                    if row.hovered() && ui.input(|i| i.pointer.delta() != Vec2::ZERO) {
+                                        self.command_palette.selected_index = idx;
+                                    }
+                                    if row.clicked() {
+                                        command_to_run = Some(entry.command.clone());
+                                        should_close = true;
+                                    }
+                                    if is_selected && selection_moved_by_keys {
+                                        row.scroll_to_me(None);
+                                    }
                                 }
                             });
+
+                        ui.add_space(6.0);
+                        let hint = Color32::from_rgb(105, 115, 138);
+                        ui.horizontal(|ui| {
+                            // Les flèches n'existent que dans la police à chasse fixe d'egui.
+                            ui.label(egui::RichText::new("↑↓").monospace().size(11.0).color(hint));
+                            ui.label(
+                                egui::RichText::new("choisir   ·   Entrée ouvrir   ·   Échap fermer")
+                                    .size(10.5)
+                                    .color(hint),
+                            );
+                        });
                     });
             });
+
+        // Un clic hors de la barre la ferme.
+        let clicked_outside = ctx.input(|i| {
+            i.pointer.any_pressed()
+                && i.pointer.interact_pos().is_some_and(|p| !area.response.rect.contains(p))
+        });
+        if clicked_outside {
+            should_close = true;
+        }
 
         if should_close {
             self.command_palette.close();
@@ -4718,5 +4784,16 @@ impl SuperPdfApp {
         if let Some(cmd) = command_to_run {
             self.execute_palette_command(cmd, canvas_rect.size());
         }
+    }
+}
+
+/// Icône et couleur d'une ligne de la barre centrale selon sa nature.
+fn palette_entry_icon(entry: &crate::tabs::PaletteEntry) -> (&'static str, Color32) {
+    match entry.category {
+        "Récent" => ("📄", Color32::from_rgb(235, 120, 110)),
+        "Onglet" => ("📑", Color32::from_rgb(120, 190, 255)),
+        "Page" => ("↪", Color32::from_rgb(140, 220, 170)),
+        "Outil" => ("🛠", Color32::from_rgb(250, 205, 110)),
+        _ => ("⚡", Color32::from_rgb(170, 160, 250)),
     }
 }
