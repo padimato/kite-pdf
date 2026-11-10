@@ -1,3 +1,4 @@
+use crate::ocr_engine::{parse_ocr_scanned_pages, OCR_SCANNED_PAGES_INFO_KEY};
 use crate::text_search::{PageTextLayer, PdfTopDownRect, PositionedChar};
 use anyhow::{Context, Result};
 use egui::ColorImage;
@@ -108,6 +109,8 @@ pub struct LoadedPdfDocument<'a> {
     has_form_widgets: bool,
     /// Au moins une annotation que l'application reprend à son compte
     pub has_app_drawn_annotations: bool,
+    /// Pages déjà passées à l'OCR lors d'un enregistrement précédent (marqueur du dictionnaire `/Info`)
+    pub ocr_scanned_pages: Vec<bool>,
     doc: PdfDocument<'a>,
 }
 
@@ -164,6 +167,7 @@ impl PdfEngine {
             page_dimensions: Vec::new(),
             has_form_widgets: false,
             has_app_drawn_annotations: false,
+            ocr_scanned_pages: Vec::new(),
             doc,
         })
     }
@@ -207,14 +211,45 @@ impl PdfEngine {
             .unwrap_or("Document.pdf")
             .to_string();
 
+        let ocr_scanned_pages = parse_ocr_scanned_pages(
+            &self
+                .read_info_text(path, OCR_SCANNED_PAGES_INFO_KEY)
+                .unwrap_or_default(),
+            page_dimensions.len(),
+        );
+
         Ok(LoadedPdfDocument {
             path: path.to_path_buf(),
             title,
             page_dimensions,
             has_form_widgets,
             has_app_drawn_annotations,
+            ocr_scanned_pages,
             doc,
         })
+    }
+
+    /// Lit une entrée quelconque du dictionnaire `/Info` (pdfium-render n'expose que les clés standard).
+    /// PDFium n'analyse que la table des références et le trailer : l'appel reste instantané.
+    /// À appeler verrou PDFium tenu.
+    fn read_info_text(&self, path: &Path, key: &str) -> Option<String> {
+        let bindings = self.pdfium.bindings();
+        let handle = bindings.FPDF_LoadDocument(path.to_str()?, None);
+        if handle.is_null() {
+            return None;
+        }
+        let len = bindings.FPDF_GetMetaText(handle, key, std::ptr::null_mut(), 0);
+        let mut buffer = vec![0u8; len as usize];
+        if len > 2 {
+            bindings.FPDF_GetMetaText(handle, key, buffer.as_mut_ptr().cast(), len);
+        }
+        bindings.FPDF_CloseDocument(handle);
+        let units: Vec<u16> = buffer
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .take_while(|&u| u != 0)
+            .collect();
+        (!units.is_empty()).then(|| String::from_utf16_lossy(&units))
     }
 }
 

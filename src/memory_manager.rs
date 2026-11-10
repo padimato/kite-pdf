@@ -1,5 +1,6 @@
 use egui::{Color32, ColorImage, Context, TextureHandle, TextureOptions};
 use std::collections::HashMap;
+#[cfg(test)]
 use std::ffi::c_void;
 use std::hash::{Hash, Hasher};
 
@@ -154,6 +155,7 @@ impl LruTextureCache {
         }
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -363,6 +365,7 @@ impl LruTextureCache {
     }
 }
 
+#[cfg(test)]
 #[repr(C)]
 #[allow(non_snake_case)]
 struct PROCESS_MEMORY_COUNTERS {
@@ -378,6 +381,7 @@ struct PROCESS_MEMORY_COUNTERS {
     PeakPagefileUsage: usize,
 }
 
+#[cfg(test)]
 extern "system" {
     fn GetCurrentProcess() -> *mut c_void;
     fn K32GetProcessMemoryInfo(
@@ -387,6 +391,7 @@ extern "system" {
     ) -> i32;
 }
 
+#[cfg(test)]
 /// Retourne la consommation RAM réelle du processus Windows courant `(WorkingSetSize, PrivatePagefileUsage)` en octets.
 pub fn query_process_memory_bytes() -> (usize, usize) {
     unsafe {

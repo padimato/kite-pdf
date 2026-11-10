@@ -1,11 +1,11 @@
 use crate::annotations::{
-    line_ending_outline, line_stop_point, save_annotations_and_ocr_to_pdf, unit_direction,
+    line_ending_outline, line_stop_point, save_pdf_with_ocr_state, unit_direction,
     AnnotHandle, AnnotationKind, LineEnding, PdfAnnotation, ShapeKind, ARROW_LINE_WIDTH,
     default_author, format_pdf_date, pdf_date_now, CommentReply, ReviewState,
     FREETEXT_DEFAULT_FILL, FREETEXT_TEXT_RGB, PALETTE_COLORS, REVIEW_STATES,
 };
 use crate::memory_manager::{
-    query_process_memory_bytes, LruTextureCache, MultiplicativeHighlightQuad, PageTextureKey,
+    LruTextureCache, MultiplicativeHighlightQuad, PageTextureKey,
     DEFAULT_TEXTURE_BUDGET_BYTES,
 };
 use crate::pdf_engine::{PdfEngine, TileRegion};
@@ -20,13 +20,11 @@ use egui::{
     Align2, Color32, Context, CornerRadius, FontId, Key, Margin, Order, Pos2, Rect, Sense, Stroke,
     StrokeKind, Vec2, ViewportCommand,
 };
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::os::windows::process::CommandExt;
 use std::time::{Duration, Instant};
 
-/// Fenêtre glissante du compteur d'images : assez longue pour qu'un gel reste visible.
-const FRAME_STATS_WINDOW: Duration = Duration::from_secs(3);
 /// Délai minimal entre deux recherches relancées par l'arrivée de nouvelles pages.
 const SEARCH_REFRESH_INTERVAL: Duration = Duration::from_millis(150);
 /// Part du budget de textures utilisable par les pages visibles et préchargées.
@@ -297,12 +295,14 @@ pub struct SuperPdfApp {
     pub command_palette: CommandPaletteState,
     /// Historique des PDF ouverts, cherché par la barre centrale (`Ctrl+T`)
     pub recent_files: RecentFiles,
+    /// Fichiers des onglets fermés, du plus ancien au plus récent (`Ctrl+Maj+T`)
+    closed_tabs: Vec<PathBuf>,
+    /// Taille de la zone du document à l'image précédente (navigation depuis la barre latérale)
+    canvas_size: Vec2,
     /// État du moteur de recherche `Ctrl+F`
     pub search_bar: SearchBarState,
     /// Gestionnaire de cache de textures GPU LRU à budget mémoire plafonné (48 Mo max)
     pub texture_cache: LruTextureCache,
-    /// Consommation RAM réelle du processus Windows (Working Set en octets)
-    pub process_working_set_bytes: usize,
     /// Déplacement ou redimensionnement d'annotation en cours
     annotation_drag: Option<AnnotationDrag>,
     /// Bloc FreeText en cours d'édition directement sur la page
@@ -342,8 +342,6 @@ pub struct SuperPdfApp {
     automation: AutomationConfig,
     /// Mesure du temps de frame / FPS
     last_frame_instant: Instant,
-    /// Durées des images de la fenêtre glissante, avec leur horodatage
-    recent_frames: VecDeque<(Instant, f32)>,
     /// Threads de rendu, de texte et d'OCR
     workers: BackgroundWorkers,
     /// Pages dont le rendu a échoué : on ne les redemande pas à chaque image
@@ -391,8 +389,6 @@ impl SuperPdfApp {
             }
         }
 
-        let (ws_bytes, _) = query_process_memory_bytes();
-
         let mut app = Self {
             engine,
             tabs: Vec::new(),
@@ -402,6 +398,8 @@ impl SuperPdfApp {
             active_tool: automation.initial_tool.unwrap_or(ActiveTool::Select),
             command_palette: CommandPaletteState::default(),
             // Les lancements automatisés (captures QA) ne doivent pas remplir l'historique réel.
+            closed_tabs: Vec::new(),
+            canvas_size: Vec2::new(1000.0, 800.0),
             recent_files: if automation.screenshot_output.is_some() {
                 RecentFiles::in_memory()
             } else {
@@ -409,7 +407,6 @@ impl SuperPdfApp {
             },
             search_bar: SearchBarState::default(),
             texture_cache: LruTextureCache::new(DEFAULT_TEXTURE_BUDGET_BYTES),
-            process_working_set_bytes: ws_bytes,
             annotation_drag: None,
             editing_freetext_id: None,
             freetext_focus_pending: false,
@@ -433,7 +430,6 @@ impl SuperPdfApp {
             screenshot_requested: false,
             automation: automation.clone(),
             last_frame_instant: Instant::now(),
-            recent_frames: VecDeque::new(),
             workers: BackgroundWorkers::spawn(cc.egui_ctx.clone(), engine),
             failed_renders: HashSet::new(),
             search_refresh_pending: false,
@@ -585,20 +581,18 @@ impl SuperPdfApp {
         // Sauvegarde du PDF (Annotations ISO 32000 + Couche Texte OCR invisible `3 Tr`) si demandée par CLI
         if let Some(save_path) = &automation.save_annotated_output {
             if let Some(tab) = app.tabs.get_mut(app.active_tab) {
-                let _ = save_annotations_and_ocr_to_pdf(
+                let _ = save_pdf_with_ocr_state(
                     &tab.path,
                     save_path,
                     &tab.annotations.items,
                     &tab.text_layers,
                     &tab.page_dimensions,
+                    &tab.ocr.page_scanned,
                 );
                 tab.annotations.saved_feedback_frames = 120;
                 tab.ocr.has_unsaved_ocr = false;
             }
         }
-
-        let (ws_after, _) = query_process_memory_bytes();
-        app.process_working_set_bytes = ws_after;
 
         app
     }
@@ -659,6 +653,8 @@ impl SuperPdfApp {
             return;
         }
         let removed = self.tabs.remove(index);
+        self.closed_tabs.retain(|p| p != &removed.path);
+        self.closed_tabs.push(removed.path.clone());
         self.texture_cache.evict_tab(removed.id);
         self.workers.forget_tab(removed.id);
 
@@ -700,12 +696,13 @@ impl SuperPdfApp {
             // Relâcher temporairement le handle PDFium sur Windows pour écrire dans le fichier en place
             let tab_id = tab.id;
             tab.hibernate(&mut self.texture_cache);
-            let res = save_annotations_and_ocr_to_pdf(
+            let res = save_pdf_with_ocr_state(
                 &tab.path,
                 &tab.path,
                 &tab.annotations.items,
                 &tab.text_layers,
                 &tab.page_dimensions,
+                &tab.ocr.page_scanned,
             );
             let _ = tab.ensure_awake(self.engine);
             self.texture_cache.evict_tab(tab_id);
@@ -714,6 +711,9 @@ impl SuperPdfApp {
                 Ok(()) => {
                     tab.is_modified = false;
                     tab.ocr.has_unsaved_ocr = false;
+                    // Le texte reconnu fait maintenant partie du fichier : un nouvel enregistrement
+                    // ne doit pas réécrire sa couche invisible une seconde fois.
+                    tab.mark_ocr_text_as_saved();
                     tab.annotations.saved_feedback_frames = 120;
                     self.error_message = None;
                     self.save_error = None;
@@ -786,6 +786,14 @@ impl SuperPdfApp {
                     self.recent_files.remove(&path);
                     self.error_message =
                         Some(format!("Fichier introuvable : {}", path.display()));
+                }
+            }
+            PaletteCommand::ReopenClosedTab => {
+                while let Some(path) = self.closed_tabs.pop() {
+                    if path.is_file() {
+                        self.open_pdf_in_new_tab(&path);
+                        break;
+                    }
                 }
             }
             PaletteCommand::OpenSearch => {
@@ -982,7 +990,11 @@ impl SuperPdfApp {
                 pending_commands.push(PaletteCommand::OpenFileDialog);
             }
             if ctrl && input.key_pressed(Key::T) {
-                self.command_palette.toggle();
+                if shift {
+                    pending_commands.push(PaletteCommand::ReopenClosedTab);
+                } else {
+                    self.command_palette.toggle();
+                }
             }
             if ctrl && input.key_pressed(Key::W) {
                 pending_commands.push(PaletteCommand::CloseActiveTab);
@@ -1707,21 +1719,8 @@ impl eframe::App for SuperPdfApp {
         let now = Instant::now();
         let dt = now.duration_since(self.last_frame_instant).as_secs_f32();
         self.last_frame_instant = now;
-        self.recent_frames.push_back((now, dt));
-        while self
-            .recent_frames
-            .front()
-            .is_some_and(|(t, _)| now.duration_since(*t) > FRAME_STATS_WINDOW)
-        {
-            self.recent_frames.pop_front();
-        }
 
         self.process_worker_events(ctx);
-
-        if self.frame_count <= 3 || self.frame_count % 15 == 0 {
-            let (ws_bytes, _) = query_process_memory_bytes();
-            self.process_working_set_bytes = ws_bytes;
-        }
 
         if self.sidebar.step_animation(dt) {
             ctx.request_repaint();
@@ -1757,6 +1756,7 @@ impl eframe::App for SuperPdfApp {
             .frame(egui::Frame::NONE.fill(Color32::from_rgb(18, 20, 26)))
             .show(ctx, |ui| {
                 let canvas_rect = ui.max_rect();
+                self.canvas_size = canvas_rect.size();
                 let _response = ui.allocate_rect(canvas_rect, Sense::click_and_drag());
 
                 self.handle_inputs(ctx, canvas_rect);
@@ -1822,13 +1822,6 @@ impl eframe::App for SuperPdfApp {
                 }
 
                 let painter = ui.painter_at(canvas_rect);
-                let mut selection_toolbar_anchor: Option<(
-                    Pos2,
-                    String,
-                    usize,
-                    bool,
-                    SelectionGestureMode,
-                )> = None;
 
                 if self.tabs.is_empty() && !self.command_palette.is_open {
                     painter.text(
@@ -2325,21 +2318,6 @@ impl eframe::App for SuperPdfApp {
                             // Le fond des boîtes sélectionnées est teinté par mélange multiplicatif (/BM /Multiply),
                             // ce qui laisse le texte noir 100 % net et lisible !
 
-                            if tab.text_selection.has_selection() {
-                                if let Some(last_b) = tab.text_selection.highlight_boxes.last() {
-                                    let sb = last_b.to_screen_rect(page_rect, page_dim);
-                                    selection_toolbar_anchor = Some((
-                                        Pos2::new(
-                                            sb.min.x.max(canvas_rect.min.x + 16.0),
-                                            (sb.max.y + 8.0).min(canvas_rect.max.y - 78.0),
-                                        ),
-                                        tab.text_selection.selected_text.clone(),
-                                        tab.text_selection.selected_text.chars().count(),
-                                        tab.text_selection.copied_feedback_frames > 0,
-                                        tab.text_selection.mode,
-                                    ));
-                                }
-                            }
                         }
 
                         painter.rect_stroke(
@@ -2378,20 +2356,6 @@ impl eframe::App for SuperPdfApp {
                     }
                 }
 
-                // Barre flottante d'action sur le texte sélectionné (`📋 Copier Ctrl+C` + `✒ Surligner H`)
-                // Masquée pendant le glissé : elle se retrouverait sous le pointeur au moment du relâchement.
-                if let Some((anchor_pos, sel_text, char_count, copied_ok, sel_mode)) =
-                    selection_toolbar_anchor.filter(|_| !ctx.input(|i| i.pointer.primary_down()))
-                {
-                    self.render_selection_floating_bar(
-                        ctx,
-                        anchor_pos,
-                        &sel_text,
-                        char_count,
-                        copied_ok,
-                        sel_mode,
-                    );
-                }
 
                 self.render_freetext_editor(ctx, &visible_pages_info);
                 self.render_comment_panel(ctx, canvas_rect, &visible_pages_info);
@@ -2407,7 +2371,6 @@ impl eframe::App for SuperPdfApp {
                     self.render_autohide_sidebar_overlay(ctx, canvas_rect);
                 }
 
-                self.render_status_pill(ui, canvas_rect);
 
                 if self.command_palette.is_open {
                     self.render_command_palette(ctx, canvas_rect);
@@ -3543,127 +3506,6 @@ impl SuperPdfApp {
     }
 
     /// Dessine la barre flottante de copie (`Ctrl+C`) et de surlignage direct (`✒ Surligner H`)
-    fn render_selection_floating_bar(
-        &mut self,
-        ctx: &Context,
-        pos: Pos2,
-        sel_text: &str,
-        char_count: usize,
-        copied_ok: bool,
-        sel_mode: SelectionGestureMode,
-    ) {
-        let preview: String = if sel_text.chars().count() > 34 {
-            let s: String = sel_text.chars().take(32).collect();
-            format!("\"{}...\"", s)
-        } else {
-            format!("\"{}\"", sel_text)
-        };
-        let mode_badge = match sel_mode {
-            SelectionGestureMode::StreamIBeam => "Curseur I (Flux)",
-            SelectionGestureMode::RectangularBlock => "Bloc (Alt+Glisser)",
-        };
-
-        let mut create_highlight = false;
-        let mut create_note = false;
-
-        egui::Area::new(egui::Id::new("superpdf_text_selection_bar"))
-            .fixed_pos(pos)
-            .order(Order::Foreground)
-            .show(ctx, |ui| {
-                egui::Frame::NONE
-                    .fill(Color32::from_rgba_unmultiplied(20, 26, 40, 248))
-                    .stroke(Stroke::new(1.5_f32, Color32::from_rgb(75, 145, 255)))
-                    .corner_radius(CornerRadius::same(10))
-                    .inner_margin(Margin::symmetric(10, 6))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            let btn_label = if copied_ok {
-                                "✅ Copié !"
-                            } else {
-                                "📋 Copier (Ctrl+C)"
-                            };
-                            if ui.small_button(btn_label).clicked() {
-                                ctx.copy_text(sel_text.to_string());
-                                if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-                                    tab.text_selection.copied_feedback_frames = 90;
-                                }
-                            }
-                            if ui
-                                .small_button("✒ Surligner (H)")
-                                .on_hover_text(
-                                    "Convertir la sélection en annotation /Highlight ISO 32000",
-                                )
-                                .clicked()
-                            {
-                                create_highlight = true;
-                            }
-                            if ui
-                                .small_button("💬 Note (N)")
-                                .on_hover_text("Attacher une note à ce texte")
-                                .clicked()
-                            {
-                                create_note = true;
-                            }
-                            ui.separator();
-                            ui.colored_label(
-                                Color32::from_rgb(135, 195, 255),
-                                format!("[{}]", mode_badge),
-                            );
-                            ui.label(
-                                egui::RichText::new(format!("{} car. : {}", char_count, preview))
-                                    .size(11.5)
-                                    .color(Color32::from_rgb(215, 228, 255)),
-                            );
-                            if ui.small_button("✖").clicked() {
-                                if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-                                    tab.text_selection.clear();
-                                }
-                            }
-                        });
-                    });
-            });
-
-        if create_note {
-            if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-                if let Some(page_index) = tab.text_selection.page_index {
-                    let quads = tab.text_selection.highlight_boxes.clone();
-                    if !quads.is_empty() {
-                        let color = tab.annotations.active_color_rgb;
-                        let page_dim = tab.page_dimensions[page_index];
-                        let note = PdfAnnotation::new_text_note(page_index, quads, color, page_dim);
-                        let new_id = tab.annotations.add_annotation(note);
-                        tab.is_modified = true;
-                        tab.text_selection.clear();
-                        self.comment_edit = Some((new_id, CommentEditTarget::Main));
-                        self.comment_focus_pending = true;
-                    }
-                }
-            }
-        }
-
-        if create_highlight {
-            if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-                if let Some(page_index) = tab.text_selection.page_index {
-                    let quads = tab.text_selection.highlight_boxes.clone();
-                    if let Some(first) = quads.first() {
-                        let union_rect = quads.iter().fold(*first, |acc, q| acc.union(q));
-                        let color = tab.annotations.active_color_rgb;
-                        tab.annotations.add_annotation(PdfAnnotation {
-                            meta: Default::default(),
-                            id: 0,
-                            page_index,
-                            rect: union_rect,
-                            color_rgb: color,
-                            kind: AnnotationKind::Highlight { quads },
-                        });
-                        tab.is_modified = true;
-                        tab.text_selection.clear();
-                    }
-                }
-            }
-        }
-    }
-
     fn render_floating_search_bar(&mut self, ctx: &Context, canvas_rect: Rect) {
         let bar_w = 430.0;
         let bar_pos = Pos2::new(
@@ -3926,19 +3768,8 @@ impl SuperPdfApp {
 
                 ui.add_space(4.0);
 
-                // 3. En-tête de la liste verticale des onglets
-                let hibernated_count = self.tabs.iter().filter(|t| t.is_hibernated()).count();
+                // 3. Boutons d'ouverture, au-dessus de la liste des onglets
                 ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "ONGLETS ({} | {} 💤)",
-                            self.tabs.len(),
-                            hibernated_count
-                        ))
-                        .size(10.5)
-                        .strong()
-                        .color(Color32::from_rgb(120, 132, 158)),
-                    );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
                             .small_button("➕")
@@ -3967,9 +3798,9 @@ impl SuperPdfApp {
             .and_then(|t| t.annotations.selected())
             .is_some();
         let tabs_reserved_bottom = if has_search_drawer || has_annot_inspector {
-            285.0
+            230.0
         } else {
-            155.0
+            100.0
         };
         let available_h = (ui.available_height() - tabs_reserved_bottom).max(85.0);
 
@@ -4268,143 +4099,107 @@ impl SuperPdfApp {
 
         ui.separator();
 
-        // 5. Jauge Mémoire Temps Réel + Contrôles Page/Zoom
+        // 5. Navigation : page, zoom et ajustement. L'état de l'OCR n'apparaît que pendant son travail.
         egui::Frame::NONE
-            .inner_margin(Margin::symmetric(10, 5))
+            .inner_margin(Margin::symmetric(10, 6))
             .show(ui, |ui| {
-                let ram_mb = self.process_working_set_bytes as f32 / (1024.0 * 1024.0);
-                let cache_mb = self.texture_cache.allocated_bytes as f32 / (1024.0 * 1024.0);
-                let budget_mb = self.texture_cache.max_budget_bytes as f32 / (1024.0 * 1024.0);
-                let cache_ratio = (cache_mb / budget_mb).clamp(0.0, 1.0);
+                let muted = Color32::from_rgb(140, 150, 172);
+                let viewport_size = self.canvas_size;
+                let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+                    return;
+                };
+
+                if let Some(reason) = &tab.ocr.unavailable_reason {
+                    ui.label(egui::RichText::new("OCR indisponible").size(10.5).color(muted))
+                        .on_hover_text(reason.as_str());
+                    ui.add_space(2.0);
+                } else if let Some(page) = tab.ocr.in_flight_page {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new().size(11.0).color(muted));
+                        ui.label(
+                            egui::RichText::new(format!("Lecture des images, page {}", page + 1))
+                                .size(10.5)
+                                .color(muted),
+                        );
+                    });
+                    ui.add_space(2.0);
+                }
+
+                let pages = tab.page_dimensions.clone();
+                let page_count = pages.len();
+                let current_page = tab.viewport.current_page_index(viewport_size, &pages) + 1;
 
                 ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(current_page > 1, egui::Button::new("◀").small())
+                        .on_hover_text("Page précédente")
+                        .clicked()
+                    {
+                        tab.viewport.jump_to_page(current_page - 2, viewport_size, &pages);
+                    }
                     ui.label(
-                        egui::RichText::new(format!("⚡ RAM Processus : {:.1} Mo", ram_mb))
-                            .size(11.0)
-                            .strong()
-                            .color(Color32::from_rgb(125, 225, 165)),
+                        egui::RichText::new(format!("{current_page} / {page_count}"))
+                            .size(12.0)
+                            .color(Color32::WHITE),
                     );
+                    if ui
+                        .add_enabled(current_page < page_count, egui::Button::new("▶").small())
+                        .on_hover_text("Page suivante")
+                        .clicked()
+                    {
+                        tab.viewport.jump_to_page(current_page, viewport_size, &pages);
+                    }
+
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("+").on_hover_text("Zoom avant").clicked() {
+                            tab.viewport.apply_zoom_around_anchor(
+                                1.2,
+                                viewport_size * 0.5,
+                                viewport_size,
+                                &pages,
+                            );
+                        }
                         if ui
-                            .small_button("💤 Purger")
-                            .on_hover_text(
-                                "Vider le cache de textures et hiberner les onglets inactifs",
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new(format!("{:.0} %", tab.viewport.zoom * 100.0))
+                                        .size(11.5),
+                                )
+                                .frame(false),
                             )
+                            .on_hover_text("Revenir à 100 %")
                             .clicked()
                         {
-                            pending_cmd = Some(PaletteCommand::HibernateInactiveTabs);
+                            pending_cmd = Some(PaletteCommand::ZoomReset100);
+                        }
+                        if ui.small_button("−").on_hover_text("Zoom arrière").clicked() {
+                            tab.viewport.apply_zoom_around_anchor(
+                                1.0 / 1.2,
+                                viewport_size * 0.5,
+                                viewport_size,
+                                &pages,
+                            );
                         }
                     });
                 });
 
-                ui.label(
-                    egui::RichText::new(format!(
-                        "Cache LRU : {:.1}/{:.0} Mo ({} p. | {} évic.)",
-                        cache_mb,
-                        budget_mb,
-                        self.texture_cache.len(),
-                        self.texture_cache.total_evictions
-                    ))
-                    .size(10.5)
-                    .color(Color32::from_rgb(160, 175, 200)),
-                );
-
-                if let Some(tab) = self.tabs.get(self.active_tab) {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "👁 {} ({})",
-                                tab.ocr.status_summary,
-                                tab.ocr.mode.badge_label()
-                            ))
-                            .size(10.0)
-                            .color(Color32::from_rgb(245, 175, 220)),
-                        );
-                    });
-                }
-
-                let bar_w = SIDEBAR_WIDTH - 24.0;
-                let (bar_rect, _) =
-                    ui.allocate_exact_size(Vec2::new(bar_w, 5.0), Sense::hover());
-                ui.painter().rect_filled(
-                    bar_rect,
-                    CornerRadius::same(2),
-                    Color32::from_rgb(35, 40, 54),
-                );
-                let fill_w = (bar_w * cache_ratio).max(3.0);
-                ui.painter().rect_filled(
-                    Rect::from_min_size(bar_rect.min, Vec2::new(fill_w, 5.0)),
-                    CornerRadius::same(2),
-                    Color32::from_rgb(72, 165, 245),
-                );
-
-                ui.add_space(3.0);
-
-                if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-                    let pages = tab.page_dimensions.clone();
-                    let page_count = pages.len();
-                    let est_vp = Vec2::new(1000.0, 800.0);
-                    let current_page = tab.viewport.current_page_index(est_vp, &pages) + 1;
-
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add_enabled(current_page > 1, egui::Button::new("◀").small())
-                            .clicked()
-                        {
-                            tab.viewport
-                                .jump_to_page(current_page - 2, est_vp, &pages);
-                        }
-                        ui.label(
-                            egui::RichText::new(format!("Page {} / {}", current_page, page_count))
-                                .strong()
-                                .size(11.5)
-                                .color(Color32::WHITE),
-                        );
-                        if ui
-                            .add_enabled(
-                                current_page < page_count,
-                                egui::Button::new("▶").small(),
-                            )
-                            .clicked()
-                        {
-                            tab.viewport.jump_to_page(current_page, est_vp, &pages);
-                        }
-
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.small_button("➕").clicked() {
-                                tab.viewport.apply_zoom_around_anchor(
-                                    1.2,
-                                    est_vp * 0.5,
-                                    est_vp,
-                                    &pages,
-                                );
-                            }
-                            ui.label(
-                                egui::RichText::new(format!("{:.0}%", tab.viewport.zoom * 100.0))
-                                    .monospace()
-                                    .size(11.0)
-                                    .color(Color32::from_rgb(130, 220, 170)),
-                            );
-                            if ui.small_button("➖").clicked() {
-                                tab.viewport.apply_zoom_around_anchor(
-                                    1.0 / 1.2,
-                                    est_vp * 0.5,
-                                    est_vp,
-                                    &pages,
-                                );
-                            }
-                        });
-                    });
-
-                    ui.horizontal(|ui| {
-                        if ui.small_button("↔ Largeur (Ctrl+9)").clicked() {
-                            pending_cmd = Some(PaletteCommand::FitToWidth);
-                        }
-                        if ui.small_button("↕ Page (Ctrl+0)").clicked() {
-                            pending_cmd = Some(PaletteCommand::FitToPage);
-                        }
-                    });
-                }
+                ui.horizontal(|ui| {
+                    let half = (ui.available_width() - ui.spacing().item_spacing.x) * 0.5;
+                    if ui
+                        .add_sized([half, 20.0], egui::Button::new("↔ Largeur"))
+                        .on_hover_text("Ajuster à la largeur (Ctrl+9)")
+                        .clicked()
+                    {
+                        pending_cmd = Some(PaletteCommand::FitToWidth);
+                    }
+                    if ui
+                        .add_sized([half, 20.0], egui::Button::new("↕ Page entière"))
+                        .on_hover_text("Afficher la page entière (Ctrl+0)")
+                        .clicked()
+                    {
+                        pending_cmd = Some(PaletteCommand::FitToPage);
+                    }
+                });
             });
 
         if let Some((idx, action)) = tab_menu_action {
@@ -4418,10 +4213,10 @@ impl SuperPdfApp {
         }
         if let Some(m_idx) = match_to_select {
             self.search_bar.current_match_index = m_idx;
-            self.scroll_to_current_search_match(Vec2::new(1000.0, 800.0));
+            self.scroll_to_current_search_match(self.canvas_size);
         }
         if let Some(cmd) = pending_cmd {
-            self.execute_palette_command(cmd, Vec2::new(1000.0, 800.0));
+            self.execute_palette_command(cmd, self.canvas_size);
         }
     }
 
@@ -4439,23 +4234,6 @@ impl SuperPdfApp {
         );
 
         if self.sidebar.anim_progress < 0.05 {
-            egui::Area::new(egui::Id::new("superpdf_collapsed_trigger_pill"))
-                .fixed_pos(Pos2::new(10.0, 12.0))
-                .order(Order::Foreground)
-                .show(ctx, |ui| {
-                    let btn = egui::Button::new(
-                        egui::RichText::new("▶ Barre latérale (Survol / Ctrl+B)")
-                            .size(11.0)
-                            .color(Color32::from_rgb(190, 210, 250)),
-                    )
-                    .fill(Color32::from_rgba_unmultiplied(24, 28, 40, 220))
-                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(65, 95, 160)))
-                    .corner_radius(CornerRadius::same(14));
-
-                    if ui.add(btn).clicked() {
-                        self.sidebar.pinned = true;
-                    }
-                });
             return;
         }
 
@@ -4481,85 +4259,6 @@ impl SuperPdfApp {
                         ui.set_width(SIDEBAR_WIDTH);
                         ui.set_height(overlay_rect.height());
                         self.render_sidebar_contents(ui);
-                    });
-            });
-    }
-
-    fn render_status_pill(&mut self, ui: &mut egui::Ui, canvas_rect: Rect) {
-        let Some(tab) = self.tabs.get(self.active_tab) else {
-            return;
-        };
-        let pages = &tab.page_dimensions;
-        let viewport_size = canvas_rect.size();
-        let current_page = tab.viewport.current_page_index(viewport_size, pages) + 1;
-        let page_count = pages.len();
-        let (tool_icon, tool_name, tool_key) = self.active_tool.icon_and_label();
-        let hibernated_count = self.tabs.iter().filter(|t| t.is_hibernated()).count();
-        let ram_mb = self.process_working_set_bytes as f32 / (1024.0 * 1024.0);
-        let annot_count = tab.annotations.items.len();
-        // Moyenne réelle sur la fenêtre : un gel de plusieurs secondes fait chuter le chiffre.
-        let window_secs: f32 = self.recent_frames.iter().map(|(_, dt)| *dt).sum();
-        let fps = self.recent_frames.len() as f32 / window_secs.max(0.001);
-        let worst_frame_ms = self
-            .recent_frames
-            .iter()
-            .map(|(_, dt)| *dt * 1000.0)
-            .fold(0.0_f32, f32::max);
-
-        let pill_pos = Pos2::new(
-            (canvas_rect.max.x - 690.0).max(canvas_rect.min.x + 12.0),
-            canvas_rect.max.y - 40.0,
-        );
-
-        egui::Area::new(egui::Id::new("status_pill_jalon5"))
-            .fixed_pos(pill_pos)
-            .order(Order::Foreground)
-            .show(ui.ctx(), |ui| {
-                egui::Frame::NONE
-                    .fill(Color32::from_rgba_unmultiplied(22, 26, 36, 235))
-                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(56, 66, 88)))
-                    .corner_radius(CornerRadius::same(16))
-                    .inner_margin(Margin::symmetric(12, 5))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 7.0;
-                            ui.colored_label(
-                                Color32::from_rgb(130, 185, 255),
-                                format!("{} {} ({})", tool_icon, tool_name, tool_key),
-                            );
-                            ui.separator();
-                            let saved_tag = if tab.annotations.saved_feedback_frames > 0 {
-                                "✅ ISO 32000 + Tr3 Enregistré"
-                            } else if tab.ocr.recognized_ocr_chars_count > 0 {
-                                "⚡ OCR JPG Actif"
-                            } else {
-                                ""
-                            };
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "Onglet {}/{} ({} 💤) • P.{}/{} • {} Annot. {}",
-                                    self.active_tab + 1,
-                                    self.tabs.len(),
-                                    hibernated_count,
-                                    current_page,
-                                    page_count,
-                                    annot_count,
-                                    saved_tag
-                                ))
-                                .strong()
-                                .size(11.5)
-                                .color(Color32::WHITE),
-                            );
-                            ui.separator();
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "RAM {:.1} Mo | {:.0} FPS | pire image {:.0} ms",
-                                    ram_mb, fps, worst_frame_ms
-                                ))
-                                .size(11.0)
-                                .color(Color32::from_rgb(130, 225, 175)),
-                            );
-                        });
                     });
             });
     }

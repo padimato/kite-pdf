@@ -24,16 +24,6 @@ pub enum OcrSpeedMode {
     TurboSearch,
 }
 
-impl OcrSpeedMode {
-    pub fn badge_label(&self) -> &'static str {
-        match self {
-            OcrSpeedMode::InstantOpen => "Vitesse 1 : Instantané (0 ms)",
-            OcrSpeedMode::EcoBackground => "Vitesse 2 : Éco Tâche de fond",
-            OcrSpeedMode::TurboSearch => "Vitesse 3 : TURBO Ctrl+F",
-        }
-    }
-}
-
 /// Métadonnées d'une image embarquée (`XObject /Subtype /Image`) détectée dans une page PDF
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -1043,6 +1033,56 @@ pub fn append_invisible_ocr_layer_to_doc(
     }
 
     Ok(injected_words)
+}
+
+/// Clé privée du dictionnaire `/Info` listant les pages déjà passées à l'OCR, avec ou sans texte trouvé.
+/// À la réouverture, ces pages ne sont pas rescannées : leur texte est déjà dans le fichier.
+pub const OCR_SCANNED_PAGES_INFO_KEY: &str = "SuperPdfOcrPages";
+
+/// Encode les pages scannées sous la forme « nombre de pages:plages », par exemple `23:1-5,7,9-23`.
+/// Le nombre de pages permet d'ignorer un marqueur devenu faux (pages ajoutées ou retirées ailleurs).
+pub fn format_ocr_scanned_pages(scanned: &[bool]) -> String {
+    let mut ranges: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < scanned.len() {
+        if !scanned[i] {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i + 1 < scanned.len() && scanned[i + 1] {
+            i += 1;
+        }
+        ranges.push(if start == i {
+            format!("{}", start + 1)
+        } else {
+            format!("{}-{}", start + 1, i + 1)
+        });
+        i += 1;
+    }
+    format!("{}:{}", scanned.len(), ranges.join(","))
+}
+
+/// Relit un marqueur écrit par [`format_ocr_scanned_pages`]. Tout est faux si le nombre de pages diffère
+/// ou si le texte est illisible.
+pub fn parse_ocr_scanned_pages(marker: &str, page_count: usize) -> Vec<bool> {
+    let mut scanned = vec![false; page_count];
+    let Some((count, ranges)) = marker.trim().split_once(':') else {
+        return scanned;
+    };
+    if count.trim().parse::<usize>().ok() != Some(page_count) {
+        return scanned;
+    }
+    for range in ranges.split(',').map(str::trim).filter(|r| !r.is_empty()) {
+        let (a, b) = range.split_once('-').unwrap_or((range, range));
+        let (Ok(a), Ok(b)) = (a.trim().parse::<usize>(), b.trim().parse::<usize>()) else {
+            continue;
+        };
+        for page in a.max(1)..=b.min(page_count) {
+            scanned[page - 1] = true;
+        }
+    }
+    scanned
 }
 
 /// Chasse d'un caractère Courier, en fraction de la taille de police.

@@ -1,3 +1,4 @@
+use crate::ocr_engine::{format_ocr_scanned_pages, OCR_SCANNED_PAGES_INFO_KEY};
 use crate::ocr_engine::{append_invisible_ocr_layer_to_doc, encode_win_ansi};
 use crate::pdf_engine::PageDimensions;
 use crate::text_search::{PageTextLayer, PdfTopDownRect};
@@ -1001,6 +1002,19 @@ pub fn save_annotations_and_ocr_to_pdf(
     text_layers: &[PageTextLayer],
     page_dimensions: &[PageDimensions],
 ) -> Result<()> {
+    save_pdf_with_ocr_state(source_path, dest_path, annotations, text_layers, page_dimensions, &[])
+}
+
+/// Comme [`save_annotations_and_ocr_to_pdf`], en notant en plus dans le fichier les pages déjà
+/// passées à l'OCR (`ocr_scanned_pages`, vide pour laisser le marqueur existant tel quel).
+pub fn save_pdf_with_ocr_state(
+    source_path: &Path,
+    dest_path: &Path,
+    annotations: &[PdfAnnotation],
+    text_layers: &[PageTextLayer],
+    page_dimensions: &[PageDimensions],
+    ocr_scanned_pages: &[bool],
+) -> Result<()> {
     let mut doc = Document::load(source_path).with_context(|| {
         format!(
             "Impossible de charger le PDF source pour sauvegarde : {}",
@@ -1093,6 +1107,9 @@ pub fn save_annotations_and_ocr_to_pdf(
     if !text_layers.is_empty() {
         let _ = append_invisible_ocr_layer_to_doc(&mut doc, &pages_map, text_layers, page_dimensions);
     }
+    if ocr_scanned_pages.iter().any(|&s| s) {
+        record_ocr_scanned_pages(&mut doc, ocr_scanned_pages);
+    }
 
     // Écriture dans un fichier voisin puis remplacement atomique : une panne en cours d'écriture
     // ne peut pas corrompre l'original, et les lectures PDFium en cours restent valides.
@@ -1112,6 +1129,27 @@ pub fn save_annotations_and_ocr_to_pdf(
         )
     })?;
     Ok(())
+}
+
+/// Note dans le dictionnaire `/Info` les pages déjà passées à l'OCR (clé privée, ignorée des autres lecteurs).
+fn record_ocr_scanned_pages(doc: &mut Document, scanned: &[bool]) {
+    let value = Object::string_literal(format_ocr_scanned_pages(scanned));
+    let info_ref = match doc.trailer.get(b"Info") {
+        Ok(Object::Reference(id)) => Some(*id),
+        _ => None,
+    };
+    if let Some(id) = info_ref {
+        if let Ok(info) = doc.get_object_mut(id).and_then(Object::as_dict_mut) {
+            info.set(OCR_SCANNED_PAGES_INFO_KEY, value);
+            return;
+        }
+    }
+    if let Ok(Object::Dictionary(info)) = doc.trailer.get_mut(b"Info") {
+        info.set(OCR_SCANNED_PAGES_INFO_KEY, value);
+        return;
+    }
+    let id = doc.add_object(dictionary! { OCR_SCANNED_PAGES_INFO_KEY => value });
+    doc.trailer.set("Info", Object::Reference(id));
 }
 
 /// Le fichier est réécrit d'un seul tenant : garder `/Prev` ferait pointer sa table de références
@@ -2544,6 +2582,30 @@ mod tests {
         assert!((ink.rect.width() / ink.rect.height() - 2.0).abs() < 1e-3);
         assert!((ink.rect.x_min - 100.0).abs() < 1e-3 && (ink.rect.y_min - 100.0).abs() < 1e-3);
         assert!((ink.rect.x_max - 200.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn test_ocr_scanned_pages_survive_save_and_reopen() {
+        use crate::ocr_engine::{format_ocr_scanned_pages, parse_ocr_scanned_pages};
+        assert_eq!(format_ocr_scanned_pages(&[true, true, false, true, true, true]), "6:1-2,4-6");
+        assert_eq!(parse_ocr_scanned_pages("6:1-2,4-6", 6), vec![true, true, false, true, true, true]);
+        // Nombre de pages différent : le marqueur est ignoré.
+        assert_eq!(parse_ocr_scanned_pages("6:1-6", 5), vec![false; 5]);
+
+        let src = PathBuf::from("test_pdfs/unit_test_ocr_marker_src.pdf");
+        let dst = PathBuf::from("test_pdfs/unit_test_ocr_marker_saved.pdf");
+        ensure_sample_pdf(&src).expect("Doit créer le PDF");
+        let engine = PdfEngine::instance();
+        let dims = engine.load_document(&src).expect("Doit charger").page_dimensions.clone();
+        assert!(engine.load_document(&src).unwrap().ocr_scanned_pages.iter().all(|s| !s));
+
+        let scanned = vec![true, false, true, true, true];
+        save_pdf_with_ocr_state(&src, &dst, &[], &[], &dims, &scanned).expect("Doit enregistrer");
+        assert_eq!(engine.load_document(&dst).unwrap().ocr_scanned_pages, scanned);
+
+        // Un enregistrement sans état OCR garde le marqueur du fichier.
+        save_annotations_and_ocr_to_pdf(&dst, &dst, &[], &[], &dims).expect("Doit enregistrer");
+        assert_eq!(engine.load_document(&dst).unwrap().ocr_scanned_pages, scanned);
     }
 
     #[test]

@@ -170,6 +170,10 @@ impl DocumentTab {
         let page_count = page_dimensions.len();
         let mut ocr = TabOcrState::default();
         ocr.ensure_initialized(page_count);
+        // Pages scannées lors d'un enregistrement précédent : leur texte est déjà dans le fichier.
+        for (scanned, already) in ocr.page_scanned.iter_mut().zip(&doc.ocr_scanned_pages) {
+            *scanned |= *already;
+        }
         Self {
             id,
             path,
@@ -190,6 +194,15 @@ impl DocumentTab {
 
     pub fn page_count(&self) -> usize {
         self.page_dimensions.len()
+    }
+
+    /// Après un enregistrement : le texte OCR est désormais une couche du fichier, comme du texte natif.
+    pub fn mark_ocr_text_as_saved(&mut self) {
+        for layer in &mut self.text_layers {
+            for c in &mut layer.chars {
+                c.is_ocr = false;
+            }
+        }
     }
 
     /// Scanne les objets `XObject Image` embarqués sur une page donnée (`page_index`) avec le moteur OCR Hybride Multi-Orientation.
@@ -489,6 +502,7 @@ impl DocumentTab {
 pub enum PaletteCommand {
     SwitchTab(usize),
     OpenRecent(PathBuf),
+    ReopenClosedTab,
     ToggleSidebarPin,
     OpenFileDialog,
     OpenSearch,
@@ -583,6 +597,7 @@ fn action_specs() -> Vec<ActionSpec> {
         ActionSpec::new("Annotations", "Rétablir", "Refaire la modification annulée", "retablir redo refaire", "Ctrl+Y", C::RedoAnnotation),
         ActionSpec::new("Annotations", "Supprimer l'annotation sélectionnée", "", "supprimer effacer enlever retirer delete", "Suppr", C::DeleteSelectedAnnotation),
         ActionSpec::new("Onglet", "Fermer l'onglet actif", "", "fermer onglet close", "Ctrl+W", C::CloseActiveTab),
+        ActionSpec::new("Onglet", "Rouvrir le dernier onglet fermé", "", "rouvrir dernier onglet ferme restaurer annuler fermeture", "Ctrl+Maj+T", C::ReopenClosedTab),
         ActionSpec::new("Affichage", "Ajuster à la largeur", "", "ajuster largeur zoom fit", "Ctrl+9", C::FitToWidth),
         ActionSpec::new("Affichage", "Afficher la page entière", "", "ajuster page entiere hauteur zoom fit", "Ctrl+0", C::FitToPage),
         ActionSpec::new("Affichage", "Zoom à 100 %", "", "zoom 100 taille reelle reinitialiser", "100%", C::ZoomReset100),
