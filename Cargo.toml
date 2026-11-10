@@ -2,6 +2,8 @@
 name = "super_pdf_reader"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+repository = "https://github.com/padimato/super-lecteur-pdf"
 description = "Lecteur PDF ultra-performant et économe en RAM pour Windows (Style Arc, OCR Hybride, ISO 32000)"
 
 [dependencies]
