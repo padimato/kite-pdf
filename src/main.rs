@@ -1,11 +1,13 @@
 mod annotations;
 mod bench;
 mod deps;
+mod settings;
 mod setup;
 mod app;
 mod memory_manager;
 mod ocr_engine;
 mod pdf_engine;
+mod print;
 mod recent_files;
 mod tabs;
 mod text_search;
@@ -157,6 +159,42 @@ fn parse_args() -> AutomationConfig {
             "--ocr-turbo" => {
                 cfg.ocr_turbo = true;
             }
+            "--password" => {
+                if let Some(pw) = args.get(i + 1) {
+                    cfg.initial_password = Some(pw.clone());
+                    i += 1;
+                }
+            }
+            "--print-to-pdf" => {
+                if let Some(out) = args.get(i + 1) {
+                    cfg.print_to_pdf = Some(PathBuf::from(out));
+                    i += 1;
+                }
+            }
+            "--form-fill" => {
+                if let Some(pair) = args.get(i + 1) {
+                    if let Some((name, value)) = pair.split_once('=') {
+                        cfg.form_fills.push((name.to_string(), value.to_string()));
+                    }
+                    i += 1;
+                }
+            }
+            "--sidebar-width" => {
+                if let Some(w) = args.get(i + 1).and_then(|s| s.parse::<f32>().ok()) {
+                    cfg.sidebar_width = Some(w);
+                    i += 1;
+                }
+            }
+            "--outline" => {
+                cfg.outline_open = true;
+            }
+            "--outline-entry" => {
+                if let Some(n) = args.get(i + 1).and_then(|s| s.parse::<usize>().ok()) {
+                    cfg.outline_open = true;
+                    cfg.outline_entry = Some(n);
+                    i += 1;
+                }
+            }
             "--deep-ocr-dialog" => {
                 cfg.deep_ocr_dialog = true;
             }
@@ -227,6 +265,12 @@ impl eframe::App for Root {
             Root::Ready(app) => app.update(ctx, frame),
         }
     }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if let Root::Ready(app) = self {
+            app.save_session();
+        }
+    }
 }
 
 /// Instant du lancement du processus (mesure du temps jusqu'à la première page affichée).
@@ -261,6 +305,16 @@ fn main() -> eframe::Result<()> {
         .with_title("Super Lecteur PDF")
         .with_inner_size([1280.0, 820.0])
         .with_min_inner_size([640.0, 400.0]);
+    // Fenêtre rouverte à la même place et à la même taille (sauf captures automatisées).
+    if settings::persistence_enabled(cfg.screenshot_output.is_some()) {
+        let saved = settings::Settings::load();
+        if saved.window_is_plausible() {
+            if let Some([x, y, w, h]) = saved.window {
+                viewport = viewport.with_position([x, y]).with_inner_size([w, h]);
+            }
+        }
+        viewport = viewport.with_maximized(saved.maximized);
+    }
     if cfg.screenshot_output.is_some() && !cfg.screenshot_visible {
         // Capture automatisée : fenêtre hors écran, sans focus ni bouton dans la barre des tâches,
         // pour ne pas déranger l'utilisateur qui travaille sur la machine.

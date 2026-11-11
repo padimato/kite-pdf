@@ -1019,7 +1019,7 @@ pub fn save_annotations_and_ocr_to_pdf(
     text_layers: &[PageTextLayer],
     page_dimensions: &[PageDimensions],
 ) -> Result<()> {
-    save_pdf_with_ocr_state(source_path, dest_path, annotations, text_layers, page_dimensions, &[], &[])
+    save_pdf_with_ocr_state(source_path, dest_path, annotations, text_layers, page_dimensions, &[], &[], &[])
 }
 
 /// Comme [`save_annotations_and_ocr_to_pdf`], en notant en plus dans le fichier les pages déjà
@@ -1033,6 +1033,7 @@ pub fn save_pdf_with_ocr_state(
     page_dimensions: &[PageDimensions],
     ocr_scanned_pages: &[bool],
     deep_ocr_pages: &[bool],
+    form_edits: &[(String, FormEdit)],
 ) -> Result<()> {
     let mut doc = Document::load(source_path).with_context(|| {
         format!(
@@ -1040,6 +1041,15 @@ pub fn save_pdf_with_ocr_state(
             source_path.display()
         )
     })?;
+    strip_usage_rights(&mut doc);
+    // La bibliothèque d'écriture ne sait pas reprotéger le fichier : l'enregistrer retirerait la
+    // protection sans prévenir.
+    if doc.is_encrypted() {
+        anyhow::bail!(
+            "Ce PDF est protégé (mot de passe ou restrictions) : l'enregistrement des modifications \
+             n'est pas encore pris en charge pour ces documents."
+        );
+    }
 
     // Police Helvetica standard pour les flux d'apparence /FreeText
     let helv_font_id = doc.add_object(dictionary! {
@@ -1132,6 +1142,7 @@ pub fn save_pdf_with_ocr_state(
     if deep_ocr_pages.iter().any(|&s| s) {
         record_ocr_pages(&mut doc, OCR_DEEP_PAGES_INFO_KEY, deep_ocr_pages);
     }
+    apply_form_edits(&mut doc, form_edits);
 
     // Écriture dans un fichier voisin puis remplacement atomique : une panne en cours d'écriture
     // ne peut pas corrompre l'original, et les lectures PDFium en cours restent valides.
@@ -1151,6 +1162,207 @@ pub fn save_pdf_with_ocr_state(
         )
     })?;
     Ok(())
+}
+
+/// Retire les « droits d'utilisation étendus » d'Adobe (`/Perms /UR3`) : cette signature ne vaut que
+/// pour le fichier d'origine. Une fois le fichier modifié, Acrobat la trouve invalide et verrouille le
+/// formulaire. Sans elle, Acrobat (Reader compris) laisse remplir et enregistrer normalement.
+fn strip_usage_rights(doc: &mut Document) {
+    let Ok(catalog_id) = doc.trailer.get(b"Root").and_then(Object::as_reference) else { return };
+    let perms = match doc.get_object(catalog_id).and_then(Object::as_dict).and_then(|c| c.get(b"Perms")) {
+        Ok(Object::Reference(id)) => Some(*id),
+        Ok(Object::Dictionary(_)) => None,
+        _ => return,
+    };
+    let remaining = {
+        let dict = match perms {
+            Some(id) => doc.get_object_mut(id).and_then(Object::as_dict_mut),
+            None => doc
+                .get_object_mut(catalog_id)
+                .and_then(Object::as_dict_mut)
+                .and_then(|c| c.get_mut(b"Perms"))
+                .and_then(Object::as_dict_mut),
+        };
+        let Ok(dict) = dict else { return };
+        dict.remove(b"UR3");
+        dict.remove(b"UR");
+        dict.len()
+    };
+    if remaining == 0 {
+        remove_dict_entry(doc, catalog_id, b"Perms");
+    }
+}
+
+/// Valeur saisie dans un champ de formulaire, pas encore enregistrée.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FormEdit {
+    /// Champ texte ou liste déroulante
+    Text(String),
+    Checked(bool),
+    /// Bouton radio sélectionné, par sa position dans le groupe
+    Radio(u32),
+}
+
+/// Écrit les valeurs saisies dans les champs du formulaire. Les apparences des champs modifiés sont
+/// retirées et `/NeedAppearances` demande aux lecteurs (PDFium, Acrobat) de les redessiner.
+fn apply_form_edits(doc: &mut Document, edits: &[(String, FormEdit)]) {
+    if edits.is_empty() {
+        return;
+    }
+    let Some(acroform_id) = acroform_id(doc) else { return };
+    let mut fields: Vec<(String, ObjectId)> = Vec::new();
+    let roots: Vec<Object> = doc
+        .get_object(acroform_id)
+        .and_then(Object::as_dict)
+        .and_then(|d| d.get(b"Fields"))
+        .and_then(|f| match f {
+            Object::Reference(id) => doc.get_object(*id).and_then(Object::as_array).cloned(),
+            other => other.as_array().cloned(),
+        })
+        .unwrap_or_default();
+    for root in roots {
+        if let Object::Reference(id) = root {
+            collect_fields(doc, id, String::new(), &mut fields, 0);
+        }
+    }
+    for (name, edit) in edits {
+        let Some(&(_, field_id)) = fields.iter().find(|(n, _)| n == name) else { continue };
+        let widgets = field_widgets(doc, field_id);
+        match edit {
+            FormEdit::Text(value) => {
+                set_dict_entry(doc, field_id, "V", pdf_text_string(value));
+                for widget in &widgets {
+                    remove_dict_entry(doc, *widget, b"AP");
+                }
+                remove_dict_entry(doc, field_id, b"AP");
+            }
+            FormEdit::Checked(checked) => {
+                let on = widgets.first().map(|w| on_state_name(doc, *w)).unwrap_or_else(|| "Yes".into());
+                let state = if *checked { on.clone() } else { "Off".to_string() };
+                set_dict_entry(doc, field_id, "V", Object::Name(state.clone().into_bytes()));
+                for widget in &widgets {
+                    let widget_on = on_state_name(doc, *widget);
+                    let widget_state = if *checked { widget_on } else { "Off".to_string() };
+                    set_dict_entry(doc, *widget, "AS", Object::Name(widget_state.into_bytes()));
+                }
+            }
+            FormEdit::Radio(index) => {
+                let Some(&chosen) = widgets.get(*index as usize) else { continue };
+                let on = on_state_name(doc, chosen);
+                set_dict_entry(doc, field_id, "V", Object::Name(on.clone().into_bytes()));
+                for widget in &widgets {
+                    let state = if *widget == chosen { on_state_name(doc, *widget) } else { "Off".to_string() };
+                    set_dict_entry(doc, *widget, "AS", Object::Name(state.into_bytes()));
+                }
+            }
+        }
+    }
+    set_dict_entry(doc, acroform_id, "NeedAppearances", Object::Boolean(true));
+    // Formulaire « hybride » : Acrobat lirait d'abord sa description XFA, qui garde les anciennes
+    // valeurs. Sans elle, il lit les champs remplis ici, comme tous les autres lecteurs.
+    remove_dict_entry(doc, acroform_id, b"XFA");
+}
+
+/// `/AcroForm` du catalogue, rendu indirect s'il était écrit en place.
+fn acroform_id(doc: &mut Document) -> Option<ObjectId> {
+    let catalog_id = doc.trailer.get(b"Root").and_then(Object::as_reference).ok()?;
+    let acroform = doc.get_object(catalog_id).and_then(Object::as_dict).ok()?.get(b"AcroForm").ok()?.clone();
+    match acroform {
+        Object::Reference(id) => Some(id),
+        Object::Dictionary(dict) => {
+            let id = doc.add_object(dict);
+            set_dict_entry(doc, catalog_id, "AcroForm", Object::Reference(id));
+            Some(id)
+        }
+        _ => None,
+    }
+}
+
+/// Champs terminaux (ceux qui portent une valeur) avec leur nom complet `parent.enfant`.
+fn collect_fields(doc: &Document, id: ObjectId, parent: String, out: &mut Vec<(String, ObjectId)>, depth: usize) {
+    if depth > 32 {
+        return;
+    }
+    let Ok(dict) = doc.get_object(id).and_then(Object::as_dict) else { return };
+    let partial = dict.get(b"T").ok().and_then(|t| match t {
+        Object::String(bytes, _) => Some(decode_pdf_text(bytes)),
+        _ => None,
+    });
+    let name = match (&partial, parent.is_empty()) {
+        (Some(p), true) => p.clone(),
+        (Some(p), false) => format!("{parent}.{p}"),
+        (None, _) => parent.clone(),
+    };
+    let named_kids: Vec<ObjectId> = dict
+        .get(b"Kids")
+        .and_then(Object::as_array)
+        .map(|kids| {
+            kids.iter()
+                .filter_map(|k| k.as_reference().ok())
+                .filter(|k| doc.get_object(*k).and_then(Object::as_dict).is_ok_and(|d| d.has(b"T")))
+                .collect()
+        })
+        .unwrap_or_default();
+    if named_kids.is_empty() {
+        if partial.is_some() {
+            out.push((name, id));
+        }
+    } else {
+        for kid in named_kids {
+            collect_fields(doc, kid, name.clone(), out, depth + 1);
+        }
+    }
+}
+
+/// Emplacements (widgets) d'un champ : ses enfants sans nom, ou le champ lui-même.
+fn field_widgets(doc: &Document, field_id: ObjectId) -> Vec<ObjectId> {
+    let kids: Vec<ObjectId> = doc
+        .get_object(field_id)
+        .and_then(Object::as_dict)
+        .and_then(|d| d.get(b"Kids"))
+        .and_then(Object::as_array)
+        .map(|kids| kids.iter().filter_map(|k| k.as_reference().ok()).collect())
+        .unwrap_or_default();
+    if kids.is_empty() {
+        vec![field_id]
+    } else {
+        kids
+    }
+}
+
+/// Nom de l'état « coché » d'un widget : la clé de `/AP /N` autre que `Off`.
+fn on_state_name(doc: &Document, widget: ObjectId) -> String {
+    let normal = doc
+        .get_object(widget)
+        .and_then(Object::as_dict)
+        .and_then(|d| d.get(b"AP"))
+        .and_then(|ap| match ap {
+            Object::Reference(id) => doc.get_object(*id),
+            other => Ok(other),
+        })
+        .and_then(Object::as_dict)
+        .and_then(|ap| ap.get(b"N"))
+        .and_then(|n| match n {
+            Object::Reference(id) => doc.get_object(*id),
+            other => Ok(other),
+        })
+        .and_then(Object::as_dict);
+    normal
+        .ok()
+        .and_then(|n| n.iter().map(|(k, _)| String::from_utf8_lossy(k).into_owned()).find(|k| k != "Off"))
+        .unwrap_or_else(|| "Yes".to_string())
+}
+
+fn set_dict_entry(doc: &mut Document, id: ObjectId, key: &str, value: Object) {
+    if let Ok(dict) = doc.get_object_mut(id).and_then(Object::as_dict_mut) {
+        dict.set(key, value);
+    }
+}
+
+fn remove_dict_entry(doc: &mut Document, id: ObjectId, key: &[u8]) {
+    if let Ok(dict) = doc.get_object_mut(id).and_then(Object::as_dict_mut) {
+        dict.remove(key);
+    }
 }
 
 /// Note dans le dictionnaire `/Info` une liste de pages traitées par l'OCR (clé privée, ignorée des
@@ -2610,6 +2822,101 @@ mod tests {
     }
 
     #[test]
+    fn test_form_fields_are_filled_saved_and_read_back() {
+        use crate::pdf_engine::FormWidgetKind;
+        // Formulaire minimal : un champ texte, une case à cocher, un groupe de deux boutons radio.
+        let src = PathBuf::from("test_pdfs/unit_test_form_src.pdf");
+        let blank = PathBuf::from("test_pdfs/unit_test_form_blank.pdf");
+        let filled = PathBuf::from("test_pdfs/unit_test_form_filled.pdf");
+        ensure_sample_pdf(&src).expect("Doit créer le PDF");
+        let mut doc = Document::load(&src).expect("Doit charger");
+        let page_id = doc.get_pages()[&1];
+        let font_id = doc.add_object(dictionary! { "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica" });
+        let mut appearance = || {
+            doc.add_object(Stream::new(
+                dictionary! { "Type" => "XObject", "Subtype" => "Form", "BBox" => vec![0.into(), 0.into(), 12.into(), 12.into()] },
+                Vec::new(),
+            ))
+        };
+        let (yes, off, a, a_off, b, b_off) = (appearance(), appearance(), appearance(), appearance(), appearance(), appearance());
+        let text_id = doc.add_object(dictionary! {
+            "Type" => "Annot", "Subtype" => "Widget", "FT" => "Tx", "T" => Object::string_literal("nom"),
+            "Rect" => vec![100.into(), 700.into(), 300.into(), 720.into()], "P" => page_id,
+            "DA" => Object::string_literal("/Helv 10 Tf 0 g"), "V" => Object::string_literal(""),
+        });
+        let checkbox_id = doc.add_object(dictionary! {
+            "Type" => "Annot", "Subtype" => "Widget", "FT" => "Btn", "T" => Object::string_literal("accord"),
+            "Rect" => vec![100.into(), 660.into(), 112.into(), 672.into()], "P" => page_id,
+            "AP" => dictionary! { "N" => dictionary! { "Yes" => yes, "Off" => off } }, "AS" => "Off", "V" => "Off",
+        });
+        let radio_id = doc.new_object_id();
+        let kid = |doc: &mut Document, x: i64, on: &str, on_ap: ObjectId, off_ap: ObjectId| {
+            let mut normal = lopdf::Dictionary::new();
+            normal.set(on, on_ap);
+            normal.set("Off", off_ap);
+            doc.add_object(dictionary! {
+                "Type" => "Annot", "Subtype" => "Widget", "Parent" => radio_id, "P" => page_id,
+                "Rect" => vec![x.into(), 620.into(), (x + 12).into(), 632.into()],
+                "AP" => dictionary! { "N" => normal }, "AS" => "Off",
+            })
+        };
+        let kid_a = kid(&mut doc, 100, "A", a, a_off);
+        let kid_b = kid(&mut doc, 140, "B", b, b_off);
+        doc.objects.insert(radio_id, Object::Dictionary(dictionary! {
+            "FT" => "Btn", "Ff" => 49152, "T" => Object::string_literal("choix"),
+            "Kids" => vec![kid_a.into(), kid_b.into()], "V" => "Off",
+        }));
+        let annots = vec![text_id.into(), checkbox_id.into(), kid_a.into(), kid_b.into()];
+        doc.get_object_mut(page_id).and_then(Object::as_dict_mut).unwrap().set("Annots", Object::Array(annots));
+        let acroform = doc.add_object(dictionary! {
+            "Fields" => vec![text_id.into(), checkbox_id.into(), radio_id.into()],
+            "DR" => dictionary! { "Font" => dictionary! { "Helv" => font_id } },
+            "DA" => Object::string_literal("/Helv 0 Tf 0 g"),
+        });
+        let catalog = doc.trailer.get(b"Root").and_then(Object::as_reference).unwrap();
+        doc.get_object_mut(catalog).and_then(Object::as_dict_mut).unwrap().set("AcroForm", acroform);
+        // Droits d'utilisation Adobe, comme sur les formulaires officiels (W-9...).
+        let usage_rights = doc.add_object(dictionary! { "Type" => "Sig", "Filter" => "Adobe.PPKLite" });
+        let perms = doc.add_object(dictionary! { "UR3" => usage_rights });
+        doc.get_object_mut(catalog).and_then(Object::as_dict_mut).unwrap().set("Perms", perms);
+        doc.save(&blank).expect("Doit enregistrer le formulaire vide");
+
+        let engine = PdfEngine::instance();
+        let loaded = engine.load_document(&blank).expect("Doit charger");
+        let widgets = loaded.page_form_widgets(0);
+        assert_eq!(widgets.len(), 4, "{widgets:?}");
+        assert!(widgets.iter().any(|w| w.name == "nom" && matches!(w.kind, FormWidgetKind::Text { .. })));
+        let dims = loaded.page_dimensions.clone();
+        drop(loaded);
+
+        let edits = vec![
+            ("nom".to_string(), FormEdit::Text("Jeanne Dupont".to_string())),
+            ("accord".to_string(), FormEdit::Checked(true)),
+            ("choix".to_string(), FormEdit::Radio(1)),
+        ];
+        save_pdf_with_ocr_state(&blank, &filled, &[], &[], &dims, &[], &[], &edits).expect("Doit enregistrer");
+
+        let reloaded = engine.load_document(&filled).expect("Doit recharger");
+        let widgets = reloaded.page_form_widgets(0);
+        let find = |name: &str, index: Option<u32>| {
+            widgets
+                .iter()
+                .find(|w| w.name == name && index.is_none_or(|i| w.kind == FormWidgetKind::Radio { index: i }))
+                .unwrap_or_else(|| panic!("champ {name} absent : {widgets:?}"))
+                .clone()
+        };
+        assert_eq!(find("nom", None).value, "Jeanne Dupont");
+        // Les droits d'utilisation, invalides après modification, sont retirés (sinon Acrobat
+        // verrouille le formulaire).
+        let saved = Document::load(&filled).expect("Doit relire");
+        let catalog = saved.trailer.get(b"Root").and_then(Object::as_reference).unwrap();
+        assert!(!saved.get_object(catalog).and_then(Object::as_dict).unwrap().has(b"Perms"));
+        assert!(find("accord", None).checked);
+        assert!(!find("choix", Some(0)).checked);
+        assert!(find("choix", Some(1)).checked);
+    }
+
+    #[test]
     fn test_ocr_scanned_pages_survive_save_and_reopen() {
         use crate::ocr_engine::{format_ocr_scanned_pages, parse_ocr_scanned_pages};
         assert_eq!(format_ocr_scanned_pages(&[true, true, false, true, true, true]), "6:1-2,4-6");
@@ -2626,7 +2933,7 @@ mod tests {
 
         let scanned = vec![true, false, true, true, true];
         let deep = vec![false, false, true, false, false];
-        save_pdf_with_ocr_state(&src, &dst, &[], &[], &dims, &scanned, &deep).expect("Doit enregistrer");
+        save_pdf_with_ocr_state(&src, &dst, &[], &[], &dims, &scanned, &deep, &[]).expect("Doit enregistrer");
         assert_eq!(engine.load_document(&dst).unwrap().ocr_scanned_pages, scanned);
         assert_eq!(engine.load_document(&dst).unwrap().deep_ocr_pages, deep);
 

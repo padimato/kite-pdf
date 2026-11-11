@@ -208,10 +208,7 @@ fn show_item(ui: &mut egui::Ui, item: &InstallItem, muted: Color32) {
 
 /// Empreintes des versions non testées que l'utilisateur ne veut plus voir signalées.
 fn ignored_versions_file() -> PathBuf {
-    std::env::var_os("APPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
-        .join("SuperLecteurPDF")
+    crate::settings::app_data_dir()
         .join("ignored_deps.txt")
 }
 

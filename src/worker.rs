@@ -131,6 +131,11 @@ pub enum WorkerEvent {
         page: usize,
         segments: Vec<RecognizedOcrSegment>,
     },
+    /// Sommaire lu en tâche de fond (avec la position des titres).
+    OutlineReady {
+        tab_id: u64,
+        entries: Vec<crate::pdf_engine::OutlineEntry>,
+    },
     /// Annotations relues du fichier en tâche de fond.
     AnnotationsLoaded {
         tab_id: u64,
@@ -345,6 +350,21 @@ impl BackgroundWorkers {
                 finish(error);
             });
         progress
+    }
+
+    /// Lit le sommaire et la position de ses titres en tâche de fond.
+    pub fn load_outline(&self, tab_id: u64, path: PathBuf) {
+        let (engine, tx, ctx) = (self.engine, self.sender.clone(), self.ctx.clone());
+        let _ = std::thread::Builder::new().name("superpdf-outline".into()).spawn(move || {
+            let Ok(doc) = engine.load_document(&path) else { return };
+            let entries = doc.outline_with_positions();
+            {
+                let _lock = PdfEngine::lock_guard();
+                drop(doc);
+            }
+            let _ = tx.send(WorkerEvent::OutlineReady { tab_id, entries });
+            ctx.request_repaint();
+        });
     }
 
     /// Relit les annotations du fichier en tâche de fond (gros document).

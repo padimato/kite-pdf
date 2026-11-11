@@ -16,7 +16,8 @@ pub const HOVER_TRIGGER_EDGE_PX: f32 = 18.0;
 const SIDEBAR_ANIM_SPEED: f32 = 16.0;
 /// Pas de temps maximal pris en compte par image pour l'animation, en secondes.
 const SIDEBAR_ANIM_MAX_STEP_S: f32 = 1.0 / 30.0;
-pub const HOVER_KEEP_OPEN_PX: f32 = SIDEBAR_WIDTH + 18.0;
+/// Marge au-delà du bord de la barre déployée au survol avant qu'elle ne se replie.
+pub const HOVER_KEEP_OPEN_MARGIN_PX: f32 = 18.0;
 
 /// Outils disponibles dans la grille supérieure de la barre latérale (et activables à 1 touche)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,7 +70,19 @@ pub struct SidebarState {
     pub hover_revealed: bool,
     /// Progression d'animation fluide entre 0.0 (masquée) et 1.0 (déployée)
     pub anim_progress: f32,
+    /// Largeur choisie par l'utilisateur (bord droit étirable)
+    pub width: f32,
+    /// Hauteur du tiroir du bas (sommaire, résultats de recherche, inspecteur)
+    pub drawer_height: f32,
+    /// Le bord est en train d'être étiré : la barre déployée au survol ne doit pas se replier
+    /// quand la souris, plus rapide que le bord, sort de la barre.
+    pub resizing: bool,
 }
+
+/// Bornes de la largeur de la barre latérale.
+pub const SIDEBAR_WIDTH_RANGE: std::ops::RangeInclusive<f32> = 200.0..=560.0;
+/// Hauteur par défaut du tiroir du bas de la barre latérale.
+pub const DRAWER_DEFAULT_HEIGHT: f32 = 230.0;
 
 impl Default for SidebarState {
     fn default() -> Self {
@@ -77,6 +90,9 @@ impl Default for SidebarState {
             pinned: true,
             hover_revealed: false,
             anim_progress: 1.0,
+            width: SIDEBAR_WIDTH,
+            drawer_height: DRAWER_DEFAULT_HEIGHT,
+            resizing: false,
         }
     }
 }
@@ -97,10 +113,13 @@ impl SidebarState {
             self.hover_revealed = false;
             return;
         }
+        if self.resizing {
+            return;
+        }
         if let Some(x) = pointer_x {
             if !self.hover_revealed && x <= HOVER_TRIGGER_EDGE_PX {
                 self.hover_revealed = true;
-            } else if self.hover_revealed && x > HOVER_KEEP_OPEN_PX {
+            } else if self.hover_revealed && x > self.width + HOVER_KEEP_OPEN_MARGIN_PX {
                 self.hover_revealed = false;
             }
         }
@@ -155,6 +174,16 @@ pub struct DocumentTab {
     pub found_form_widgets: bool,
     /// Pour chaque page : sa couche de texte native a été extraite (même vide)
     pub text_received: Vec<bool>,
+    /// Sommaire du document, lu à la première ouverture du panneau
+    pub outline: Option<Vec<crate::pdf_engine::OutlineEntry>>,
+    /// Lecture du sommaire demandée en tâche de fond
+    pub outline_requested: bool,
+    /// Le document a un formulaire
+    pub has_form: bool,
+    /// Champs de formulaire de chaque page, lus quand la page s'affiche
+    pub form_widgets: Vec<Option<Vec<crate::pdf_engine::FormWidget>>>,
+    /// Valeurs saisies dans les champs, pas encore enregistrées (par nom de champ)
+    pub form_edits: std::collections::HashMap<String, crate::annotations::FormEdit>,
     pub found_app_annotations: bool,
 }
 
@@ -176,6 +205,7 @@ impl DocumentTab {
         let supports_tiled_rendering = !doc.has_form_fields();
         let page_count = page_dimensions.len();
         let page_details_known = vec![doc.page_details_complete; page_count];
+        let has_form = doc.declares_form();
         let mut ocr = TabOcrState::default();
         ocr.ensure_initialized(page_count);
         // Pages scannées lors d'un enregistrement précédent : leur texte est déjà dans le fichier.
@@ -202,9 +232,54 @@ impl DocumentTab {
             supports_tiled_rendering,
             page_details_known,
             text_received: vec![false; page_count],
+            outline: None,
+            outline_requested: false,
+            has_form,
+            form_widgets: vec![None; page_count],
+            form_edits: Default::default(),
             found_form_widgets: false,
             found_app_annotations: false,
         }
+    }
+
+    /// Lit les champs de formulaire d'une page affichée (une seule fois).
+    pub fn ensure_form_widgets(&mut self, page: usize, engine: &'static PdfEngine) {
+        if !self.has_form || self.form_widgets.get(page).is_none_or(|w| w.is_some()) {
+            return;
+        }
+        if self.ensure_awake(engine).is_err() {
+            return;
+        }
+        let widgets = self.document.as_ref().map(|doc| doc.page_form_widgets(page)).unwrap_or_default();
+        self.form_widgets[page] = Some(widgets);
+    }
+
+    /// Valeur affichée d'un champ (saisie en cours, sinon celle du fichier) : texte et case cochée.
+    pub fn form_value(&self, widget: &crate::pdf_engine::FormWidget) -> (String, bool) {
+        use crate::annotations::FormEdit;
+        use crate::pdf_engine::FormWidgetKind;
+        match (self.form_edits.get(&widget.name), &widget.kind) {
+            (Some(FormEdit::Text(text)), _) => (text.clone(), false),
+            (Some(FormEdit::Checked(checked)), _) => (String::new(), *checked),
+            (Some(FormEdit::Radio(chosen)), FormWidgetKind::Radio { index }) => (String::new(), chosen == index),
+            _ => (widget.value.clone(), widget.checked),
+        }
+    }
+
+    pub fn set_form_edit(&mut self, name: &str, edit: crate::annotations::FormEdit) {
+        self.form_edits.insert(name.to_string(), edit);
+        self.is_modified = true;
+    }
+
+    /// Valeurs saisies, pour l'enregistrement.
+    pub fn form_edit_list(&self) -> Vec<(String, crate::annotations::FormEdit)> {
+        self.form_edits.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+    }
+
+    /// Après un enregistrement : les valeurs sont dans le fichier, les champs sont relus.
+    pub fn forget_saved_form_edits(&mut self) {
+        self.form_edits.clear();
+        self.form_widgets = vec![None; self.page_count()];
     }
 
     /// Toutes les pages ont été lues en détail.
@@ -629,6 +704,8 @@ pub enum PaletteCommand {
     OpenSearch,
     OpenDeepOcrDialog,
     SaveAnnotatedPdf,
+    SaveAs,
+    Print,
     HibernateInactiveTabs,
     UndoAnnotation,
     RedoAnnotation,
@@ -639,6 +716,8 @@ pub enum PaletteCommand {
     FitToPage,
     ZoomReset100,
     JumpToPage(usize),
+    /// Page et hauteur dans la page (points depuis le haut) : le titre visé arrive en haut de l'écran
+    JumpToPageAt(usize, f32),
     /// Zoom en pourcent
     SetZoomPercent(u32),
 }
@@ -665,10 +744,7 @@ pub struct NumberHistory {
 
 impl NumberHistory {
     pub fn load_default() -> Self {
-        let storage = std::env::var_os("APPDATA")
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir)
-            .join("SuperLecteurPDF")
+        let storage = crate::settings::app_data_dir()
             .join("palette_numbers.txt");
         let recent = std::fs::read_to_string(&storage)
             .map(|text| {
@@ -793,6 +869,8 @@ fn action_specs() -> Vec<ActionSpec> {
     let mut actions = vec![
         ActionSpec::new("Fichier", "Ouvrir un PDF depuis le disque…", "Choisir un fichier dans l'explorateur", "ouvrir fichier parcourir", "Ctrl+O", C::OpenFileDialog),
         ActionSpec::new("Fichier", "Enregistrer le PDF", "Annotations et texte reconnu par l'OCR inclus", "enregistrer sauvegarder", "Ctrl+S", C::SaveAnnotatedPdf),
+        ActionSpec::new("Fichier", "Enregistrer sous…", "Garder l'original et écrire une copie", "enregistrer sauvegarder copie", "Ctrl+Maj+S", C::SaveAs),
+        ActionSpec::new("Fichier", "Imprimer…", "", "imprimer impression imprimante", "Ctrl+P", C::Print),
         ActionSpec::new("Document", "Rechercher dans le PDF", "Trouver un mot dans le document ouvert", "rechercher chercher trouver", "Ctrl+F", C::OpenSearch),
         ActionSpec::new("Document", "OCR approfondi…", "Lit le texte scanné ou dessiné, page par page (lent)", "ocr approfondi scan scanner", "OCR", C::OpenDeepOcrDialog),
         ActionSpec::new("Annotations", "Annuler", "Défaire la dernière modification d'annotation", "annuler", "Ctrl+Z", C::UndoAnnotation),
@@ -986,6 +1064,15 @@ mod tests {
 
         sidebar.update_hover_hysteresis(Some(340.0));
         assert!(!sidebar.hover_revealed);
+        assert!(!sidebar.is_expanded());
+
+        // Bord étiré vite vers la droite : la souris sort de la barre, qui reste pourtant ouverte.
+        sidebar.update_hover_hysteresis(Some(8.0));
+        sidebar.resizing = true;
+        sidebar.update_hover_hysteresis(Some(700.0));
+        assert!(sidebar.is_expanded());
+        sidebar.resizing = false;
+        sidebar.update_hover_hysteresis(Some(700.0));
         assert!(!sidebar.is_expanded());
     }
 

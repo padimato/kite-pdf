@@ -1552,7 +1552,7 @@ mod tests {
         let mut layer = PageTextLayer::new(0, Vec::new());
         HybridOcrEngine::merge_segments_into_layer(&mut layer, &segments);
         drop(doc);
-        save_pdf_with_ocr_state(&src_path, &saved_path, &[], &[layer], &dims, &[true], &[true])
+        save_pdf_with_ocr_state(&src_path, &saved_path, &[], &[layer], &dims, &[true], &[true], &[])
             .expect("Doit enregistrer");
 
         // Réouverture : le texte fait partie du fichier et la page est marquée comme lue.

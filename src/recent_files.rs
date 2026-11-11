@@ -15,6 +15,8 @@ pub struct RecentFile {
     /// Dernière ouverture, en secondes depuis l'époque Unix.
     pub last_opened: u64,
     pub open_count: u32,
+    /// Page (index) et zoom à la dernière fermeture, pour reprendre la lecture au même endroit
+    pub reading: Option<(usize, f32)>,
 }
 
 impl RecentFile {
@@ -53,10 +55,7 @@ pub struct RecentFiles {
 impl RecentFiles {
     /// Charge l'historique depuis le profil de l'utilisateur ; les fichiers disparus sont ignorés.
     pub fn load_default() -> Self {
-        let storage = std::env::var_os("APPDATA")
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir)
-            .join("SuperLecteurPDF")
+        let storage = crate::settings::app_data_dir()
             .join("recent.tsv");
         let mut recent = Self::load_from(&storage);
         recent.items.retain(|f| f.path.is_file());
@@ -84,18 +83,42 @@ impl RecentFiles {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let previous_count = self
+        let (previous_count, reading) = self
             .items
             .iter()
             .position(|f| same_path(&f.path, &path))
-            .map(|i| self.items.remove(i).open_count)
-            .unwrap_or(0);
+            .map(|i| {
+                let previous = self.items.remove(i);
+                (previous.open_count, previous.reading)
+            })
+            .unwrap_or((0, None));
         self.items.insert(
             0,
-            RecentFile { path, last_opened: now, open_count: previous_count.saturating_add(1) },
+            RecentFile { path, last_opened: now, open_count: previous_count.saturating_add(1), reading },
         );
         self.items.truncate(MAX_RECENT_FILES);
         self.save();
+    }
+
+    /// Note l'endroit où l'utilisateur s'est arrêté dans un fichier de l'historique.
+    pub fn remember_reading(&mut self, path: &Path, page: usize, zoom: f32) {
+        let Some(item) = self.find_mut(path) else { return };
+        if item.reading == Some((page, zoom)) {
+            return;
+        }
+        item.reading = Some((page, zoom));
+        self.save();
+    }
+
+    /// Page et zoom à la dernière fermeture de ce fichier.
+    pub fn reading_for(&self, path: &Path) -> Option<(usize, f32)> {
+        let canonical = canonical(path);
+        self.items.iter().find(|f| same_path(&f.path, &canonical))?.reading
+    }
+
+    fn find_mut(&mut self, path: &Path) -> Option<&mut RecentFile> {
+        let canonical = canonical(path);
+        self.items.iter_mut().find(|f| same_path(&f.path, &canonical))
     }
 
     pub fn remove(&mut self, path: &Path) {
@@ -107,7 +130,18 @@ impl RecentFiles {
         let Some(storage) = &self.storage else { return };
         let mut text = String::new();
         for f in &self.items {
-            text.push_str(&format!("{}\t{}\t{}\n", f.last_opened, f.open_count, f.path.display()));
+            let (page, zoom) = match f.reading {
+                Some((page, zoom)) => (page.to_string(), format!("{zoom:.3}")),
+                None => ("-".to_string(), "-".to_string()),
+            };
+            text.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{}\n",
+                f.last_opened,
+                f.open_count,
+                page,
+                zoom,
+                f.path.display()
+            ));
         }
         if let Some(dir) = storage.parent() {
             let _ = std::fs::create_dir_all(dir);
@@ -138,12 +172,26 @@ impl RecentFiles {
     }
 }
 
+/// `date  ouvertures  page  zoom  chemin` (ou l'ancien format `date  ouvertures  chemin`).
 fn parse_line(line: &str) -> Option<RecentFile> {
-    let mut parts = line.splitn(3, '\t');
-    let last_opened = parts.next()?.trim().parse().ok()?;
-    let open_count = parts.next()?.trim().parse().ok()?;
-    let path = parts.next()?.trim();
-    (!path.is_empty()).then(|| RecentFile { path: PathBuf::from(path), last_opened, open_count })
+    let parts: Vec<&str> = line.split('\t').collect();
+    let last_opened = parts.first()?.trim().parse().ok()?;
+    let open_count = parts.get(1)?.trim().parse().ok()?;
+    let (reading, path) = match parts.len() {
+        3 => (None, parts[2]),
+        5 => {
+            let page = parts[2].trim().parse::<usize>().ok();
+            let zoom = parts[3].trim().parse::<f32>().ok();
+            (page.zip(zoom), parts[4])
+        }
+        _ => return None,
+    };
+    let path = path.trim();
+    (!path.is_empty()).then(|| RecentFile { path: PathBuf::from(path), last_opened, open_count, reading })
+}
+
+fn canonical(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).map(strip_verbatim_prefix).unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
@@ -275,7 +323,7 @@ mod tests {
     use super::*;
 
     fn file(path: &str, age_days: u64, count: u32) -> RecentFile {
-        RecentFile { path: PathBuf::from(path), last_opened: 1_000_000 - age_days * 86_400, open_count: count }
+        RecentFile { path: PathBuf::from(path), last_opened: 1_000_000 - age_days * 86_400, open_count: count, reading: None }
     }
 
     #[test]
@@ -322,10 +370,18 @@ mod tests {
         recent.record_open(&b);
         recent.record_open(&a);
 
+        recent.remember_reading(&b, 41, 1.5);
         let reloaded = RecentFiles::load_from(&storage);
         assert_eq!(reloaded.items.len(), 2);
         assert_eq!(reloaded.items[0].file_name(), "a.pdf");
         assert_eq!(reloaded.items[0].open_count, 2);
+        // L'endroit où l'on s'est arrêté survit au rechargement et à une réouverture.
+        assert_eq!(reloaded.reading_for(&b), Some((41, 1.5)));
+        let mut reopened = reloaded.clone();
+        reopened.record_open(&b);
+        assert_eq!(reopened.reading_for(&b), Some((41, 1.5)));
+        // L'ancien format (sans page ni zoom) reste lisible.
+        assert_eq!(parse_line("100\t3\tC:\\x.pdf").map(|f| f.open_count), Some(3));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

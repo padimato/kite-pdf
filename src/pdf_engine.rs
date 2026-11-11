@@ -13,10 +13,101 @@ use std::sync::{Mutex, OnceLock};
 
 static PDFIUM_SINGLETON: OnceLock<PdfEngine> = OnceLock::new();
 
+/// Mots de passe saisis pendant la session, par fichier. Jamais écrits sur le disque. PDFium les
+/// garde le temps de vie du document : ils sont conservés jusqu'à la fin du processus.
+static PASSWORDS: OnceLock<Mutex<std::collections::HashMap<String, &'static str>>> = OnceLock::new();
+
+fn password_key(path: &Path) -> String {
+    std::fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .to_lowercase()
+}
+
+/// Mot de passe à utiliser pour ce fichier (saisi plus tôt dans la session).
+pub fn set_document_password(path: &Path, password: &str) {
+    let leaked: &'static str = Box::leak(password.to_string().into_boxed_str());
+    PASSWORDS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(password_key(path), leaked);
+}
+
+fn document_password(path: &Path) -> Option<&'static str> {
+    PASSWORDS
+        .get()?
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&password_key(path))
+        .copied()
+}
+
+/// Le document est protégé : mot de passe absent ou faux.
+#[derive(Debug)]
+pub struct PasswordRequired {
+    pub wrong_password: bool,
+}
+
+impl std::fmt::Display for PasswordRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.wrong_password {
+            write!(f, "mot de passe incorrect")
+        } else {
+            write!(f, "ce document est protégé par un mot de passe")
+        }
+    }
+}
+
+impl std::error::Error for PasswordRequired {}
+
 /// Au-delà, l'ouverture ne charge plus chaque page : charger une page coûte environ 25 ms
 /// (analyse de son contenu), soit plus de 10 s pour 460 pages. Les détails des pages (annotations,
 /// rotation, champs de formulaire) sont alors lus en tâche de fond.
 pub const FULL_SCAN_MAX_PAGES: usize = 40;
+
+/// Nature d'un champ de formulaire que l'application sait remplir.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FormWidgetKind {
+    Text { multiline: bool },
+    Checkbox,
+    /// Bouton radio : position de ce bouton dans son groupe
+    Radio { index: u32 },
+    /// Liste déroulante
+    Choice { options: Vec<String> },
+}
+
+/// Un champ de formulaire tel qu'il apparaît sur une page (un même champ peut avoir plusieurs
+/// emplacements, par exemple les boutons d'un groupe radio).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FormWidget {
+    /// Nom complet du champ (`parent.enfant`)
+    pub name: String,
+    pub kind: FormWidgetKind,
+    /// Emplacement en coordonnées de la page affichée
+    pub rect: PdfTopDownRect,
+    /// Valeur enregistrée dans le fichier (texte, choix)
+    pub value: String,
+    /// Case cochée / bouton radio sélectionné
+    pub checked: bool,
+    pub read_only: bool,
+}
+
+/// Entrée du sommaire (signets) d'un document.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutlineEntry {
+    pub title: String,
+    /// Page de destination, si le signet en a une dans ce document
+    pub page: Option<usize>,
+    /// Hauteur visée dans la page (points, depuis le haut de la page affichée), si le signet la précise
+    pub y: Option<f32>,
+    /// Profondeur dans l'arborescence (0 = premier niveau)
+    pub depth: usize,
+}
+
+/// Au-delà, le sommaire est tronqué (documents mal formés aux signets en boucle).
+const MAX_OUTLINE_ENTRIES: usize = 5000;
+const MAX_OUTLINE_DEPTH: usize = 16;
 
 /// Ce que l'ouverture apprend d'une page en la chargeant.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -168,12 +259,22 @@ impl PdfEngine {
     }
 
     /// Ouvre un document sans lire les dimensions de chaque page (ouvertures répétées des threads d'arrière-plan).
+    /// Ouvre le fichier avec le mot de passe saisi dans la session, s'il y en a un.
+    /// À appeler verrou PDFium tenu.
+    fn open_with_password<'a>(&'a self, path: &Path) -> Result<PdfDocument<'a>> {
+        let password = document_password(path);
+        match self.pdfium.load_pdf_from_file(path, password) {
+            Ok(doc) => Ok(doc),
+            Err(PdfiumError::PdfiumLibraryInternalError(PdfiumInternalError::PasswordError)) => {
+                Err(anyhow::Error::new(PasswordRequired { wrong_password: password.is_some() }))
+            }
+            Err(e) => Err(e).with_context(|| format!("Échec d'ouverture du fichier PDF : {}", path.display())),
+        }
+    }
+
     pub fn open_lightweight<'a>(&'a self, path: &Path) -> Result<LoadedPdfDocument<'a>> {
         let _lock = PDFIUM_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-        let doc = self
-            .pdfium
-            .load_pdf_from_file(path, None)
-            .with_context(|| format!("Échec d'ouverture du fichier PDF : {}", path.display()))?;
+        let doc = self.open_with_password(path)?;
         Ok(LoadedPdfDocument {
             path: path.to_path_buf(),
             title: String::new(),
@@ -191,10 +292,7 @@ impl PdfEngine {
     /// Charge un document PDF depuis le disque et extrait uniquement les métadonnées légères des pages.
     pub fn load_document<'a>(&'a self, path: &Path) -> Result<LoadedPdfDocument<'a>> {
         let _lock = PDFIUM_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-        let doc = self
-            .pdfium
-            .load_pdf_from_file(path, None)
-            .with_context(|| format!("Échec d'ouverture du fichier PDF : {}", path.display()))?;
+        let doc = self.open_with_password(path)?;
 
         let pages = doc.pages();
         let page_count = pages.len();
@@ -256,12 +354,34 @@ impl PdfEngine {
         })
     }
 
+    /// Ouvre le fichier avec l'API brute de PDFium, le temps de `work` (impression).
+    pub fn with_raw_document<R>(
+        &self,
+        path: &Path,
+        work: impl FnOnce(&RawDocument<'_>) -> std::result::Result<R, String>,
+    ) -> std::result::Result<R, String> {
+        let render = render_page_to_dc_fn().ok_or("FPDF_RenderPage absent de pdfium.dll")?;
+        let path_text = path.to_str().ok_or("chemin de fichier illisible")?;
+        let handle = {
+            let _lock = PDFIUM_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+            self.pdfium.bindings().FPDF_LoadDocument(path_text, document_password(path))
+        };
+        if handle.is_null() {
+            return Err(format!("impossible d'ouvrir {}", path.display()));
+        }
+        let document = RawDocument { engine: self, handle, render };
+        let result = work(&document);
+        let _lock = PDFIUM_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        self.pdfium.bindings().FPDF_CloseDocument(handle);
+        result
+    }
+
     /// Lit une entrée quelconque du dictionnaire `/Info` (pdfium-render n'expose que les clés standard).
     /// PDFium n'analyse que la table des références et le trailer : l'appel reste instantané.
     /// À appeler verrou PDFium tenu.
     fn read_info_text(&self, path: &Path, key: &str) -> Option<String> {
         let bindings = self.pdfium.bindings();
-        let handle = bindings.FPDF_LoadDocument(path.to_str()?, None);
+        let handle = bindings.FPDF_LoadDocument(path.to_str()?, document_password(path));
         if handle.is_null() {
             return None;
         }
@@ -278,6 +398,77 @@ impl PdfEngine {
             .collect();
         (!units.is_empty()).then(|| String::from_utf16_lossy(&units))
     }
+}
+
+/// `FPDF_RenderPage` (Windows) : dessine une page sur un contexte graphique, ici une imprimante.
+/// pdfium-render ne l'expose qu'avec une dépendance lourde : on le prend directement dans pdfium.dll.
+type RenderPageToDc = unsafe extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, i32, i32, i32, i32, i32, i32);
+
+fn render_page_to_dc_fn() -> Option<RenderPageToDc> {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetModuleHandleW(name: *const u16) -> *mut std::ffi::c_void;
+        fn GetProcAddress(module: *mut std::ffi::c_void, name: *const u8) -> *mut std::ffi::c_void;
+    }
+    let module_name: Vec<u16> = "pdfium.dll".encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        let module = GetModuleHandleW(module_name.as_ptr());
+        if module.is_null() {
+            return None;
+        }
+        let address = GetProcAddress(module, b"FPDF_RenderPage\0".as_ptr());
+        (!address.is_null()).then(|| std::mem::transmute::<*mut std::ffi::c_void, RenderPageToDc>(address))
+    }
+}
+
+/// Document ouvert avec l'API brute de PDFium (voir [`PdfEngine::with_raw_document`]).
+pub struct RawDocument<'a> {
+    engine: &'a PdfEngine,
+    handle: FPDF_DOCUMENT,
+    render: RenderPageToDc,
+}
+
+impl RawDocument<'_> {
+    /// Dessine la page sur le contexte d'imprimante `dc`, centrée et agrandie au maximum dans la zone
+    /// imprimable (`area_w` x `area_h` pixels). Une page en paysage sur une feuille en portrait (et
+    /// inversement) est tournée d'un quart de tour pour occuper la feuille.
+    pub fn render_page_to_dc(
+        &self,
+        page_index: usize,
+        dc: *mut std::ffi::c_void,
+        area_w: i32,
+        area_h: i32,
+        flags: i32,
+    ) -> std::result::Result<(), String> {
+        let _lock = PDFIUM_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let bindings = self.engine.pdfium.bindings();
+        let page = bindings.FPDF_LoadPage(self.handle, page_index as i32);
+        if page.is_null() {
+            return Err(format!("page {} illisible", page_index + 1));
+        }
+        let (w, h) = (bindings.FPDF_GetPageWidthF(page), bindings.FPDF_GetPageHeightF(page));
+        let (rotate, page_w, page_h) = if (w > h) != (area_w > area_h) { (1, h, w) } else { (0, w, h) };
+        let scale = (area_w as f32 / page_w.max(1.0)).min(area_h as f32 / page_h.max(1.0));
+        let (size_x, size_y) = ((page_w * scale) as i32, (page_h * scale) as i32);
+        let (x, y) = ((area_w - size_x) / 2, (area_h - size_y) / 2);
+        unsafe { (self.render)(dc, page.cast(), x, y, size_x, size_y, rotate, flags) };
+        bindings.FPDF_ClosePage(page);
+        Ok(())
+    }
+}
+
+/// Haut (points) de la première ligne de la page qui contient `title`, espaces ignorés.
+fn find_title_top(layer: &PageTextLayer, title: &str) -> Option<f32> {
+    let compact = |c: char| !c.is_whitespace();
+    let wanted: Vec<char> = title.chars().filter(|c| compact(*c)).flat_map(char::to_lowercase).collect();
+    if wanted.len() < 2 {
+        return None;
+    }
+    let chars: Vec<&PositionedChar> = layer.chars.iter().filter(|c| compact(c.ch)).collect();
+    let text: Vec<char> = chars.iter().map(|c| c.ch.to_lowercase().next().unwrap_or(c.ch)).collect();
+    (0..text.len().saturating_sub(wanted.len() - 1))
+        .find(|&start| text[start..start + wanted.len()] == wanted[..])
+        .map(|start| chars[start].rect.y_min)
 }
 
 fn page_details(page: &PdfPage<'_>, declares_form: bool) -> PageDetails {
@@ -534,6 +725,139 @@ impl<'a> LoadedPdfDocument<'a> {
     /// Les champs de formulaire ne peuvent pas être dessinés dans une tuile (limite de PDFium).
     pub fn has_form_fields(&self) -> bool {
         self.has_form_widgets
+    }
+
+    /// Le document déclare un formulaire.
+    pub fn declares_form(&self) -> bool {
+        self.declares_form || self.doc.form().is_some()
+    }
+
+    /// Champs de formulaire de la page que l'application sait remplir.
+    pub fn page_form_widgets(&self, page_index: usize) -> Vec<FormWidget> {
+        let _lock = PDFIUM_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(page) = self.doc.pages().get(page_index as u16) else {
+            return Vec::new();
+        };
+        let dims = page_view_dimensions(&page);
+        let mut widgets = Vec::new();
+        for annotation in page.annotations().iter() {
+            let PdfPageAnnotation::Widget(widget) = &annotation else { continue };
+            let Some(field) = widget.form_field() else { continue };
+            let Ok(bounds) = annotation.bounds() else { continue };
+            let (x0, y0) = dims.pdf_to_view(bounds.left().value, bounds.bottom().value);
+            let (x1, y1) = dims.pdf_to_view(bounds.right().value, bounds.top().value);
+            let rect = PdfTopDownRect {
+                x_min: x0.min(x1),
+                y_min: y0.min(y1),
+                x_max: x0.max(x1),
+                y_max: y0.max(y1),
+                angle_deg: 0.0,
+            };
+            let (kind, value, checked) = if let Some(text) = field.as_text_field() {
+                (FormWidgetKind::Text { multiline: text.is_multiline() }, text.value().unwrap_or_default(), false)
+            } else if let Some(checkbox) = field.as_checkbox_field() {
+                (FormWidgetKind::Checkbox, String::new(), checkbox.is_checked().unwrap_or(false))
+            } else if let Some(radio) = field.as_radio_button_field() {
+                (
+                    FormWidgetKind::Radio { index: radio.index_in_group() },
+                    String::new(),
+                    radio.is_checked().unwrap_or(false),
+                )
+            } else if let Some(combo) = field.as_combo_box_field() {
+                let options = combo.options();
+                let labels = (0..options.len())
+                    .filter_map(|i| options.get(i).ok().and_then(|o| o.label().cloned()))
+                    .collect();
+                (FormWidgetKind::Choice { options: labels }, combo.value().unwrap_or_default(), false)
+            } else {
+                continue; // listes à choix multiples, boutons, signatures : non pris en charge
+            };
+            widgets.push(FormWidget {
+                name: field.name().unwrap_or_default(),
+                kind,
+                rect,
+                value,
+                checked,
+                read_only: field.is_read_only(),
+            });
+        }
+        widgets
+    }
+
+    /// Sommaire avec, pour les signets qui ne donnent que leur page, la hauteur de leur titre
+    /// retrouvée dans le texte de cette page. Lit le texte des pages concernées : à appeler hors du
+    /// thread de l'interface.
+    pub fn outline_with_positions(&self) -> Vec<OutlineEntry> {
+        let mut entries = self.outline();
+        let mut pages: std::collections::HashMap<usize, PageTextLayer> = std::collections::HashMap::new();
+        for entry in entries.iter_mut().filter(|e| e.y.is_none()) {
+            let Some(page) = entry.page else { continue };
+            let layer = pages.entry(page).or_insert_with(|| self.extract_single_page_text_layer(page));
+            entry.y = find_title_top(layer, &entry.title);
+        }
+        entries
+    }
+
+    /// Sommaire du document, à plat, dans l'ordre de lecture.
+    pub fn outline(&self) -> Vec<OutlineEntry> {
+        let _lock = PDFIUM_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let bookmarks = self.doc.bookmarks();
+        let mut entries = Vec::new();
+        // Parcours en profondeur : (signet, profondeur), le premier enfant avant le suivant.
+        let mut stack: Vec<(PdfBookmark<'_>, usize)> = bookmarks.root().map(|b| (b, 0)).into_iter().collect();
+        while let Some((bookmark, depth)) = stack.pop() {
+            if entries.len() >= MAX_OUTLINE_ENTRIES {
+                break;
+            }
+            // Page et hauteur du titre visé : sans la hauteur, plusieurs parties d'une même page
+            // renverraient toutes en haut de la page.
+            let target = |d: &PdfDestination<'_>| {
+                let page = d.page_index().ok().map(|p| p as usize);
+                let top = match d.view_settings().ok() {
+                    Some(PdfDestinationViewSettings::SpecificCoordinatesAndZoom(_, y, _)) => y,
+                    Some(PdfDestinationViewSettings::FitPageHorizontallyToWindow(y)) => y,
+                    Some(PdfDestinationViewSettings::FitBoundsHorizontallyToWindow(y)) => y,
+                    _ => None,
+                };
+                (page, top)
+            };
+            let (page, top) = match bookmark.destination() {
+                Some(d) => target(&d),
+                None => bookmark
+                    .action()
+                    .and_then(|action| {
+                        let d = action.as_local_destination_action()?.destination().ok()?;
+                        Some(target(&d))
+                    })
+                    .unwrap_or((None, None)),
+            };
+            let y = page.zip(top).and_then(|(p, top)| {
+                let dims = self.page_dimensions.get(p)?;
+                Some(dims.pdf_to_view(dims.box_left, top.value).1.clamp(0.0, dims.height_pt))
+            });
+            entries.push(OutlineEntry {
+                y,
+                // Espaces typographiques (U+2002…) absents de la police : ramenés à des espaces simples.
+                title: bookmark
+                    .title()
+                    .unwrap_or_default()
+                    .split(char::is_whitespace)
+                    .filter(|w| !w.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                page,
+                depth,
+            });
+            if let Some(sibling) = bookmark.next_sibling() {
+                stack.push((sibling, depth));
+            }
+            if depth < MAX_OUTLINE_DEPTH {
+                if let Some(child) = bookmark.first_child() {
+                    stack.push((child, depth + 1));
+                }
+            }
+        }
+        entries
     }
 
     /// Charge une page pour en lire la rotation, la zone visible, les annotations et les champs.
@@ -961,6 +1285,56 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_outline_is_read_in_reading_order_with_depth() {
+        let path = PathBuf::from("test_pdfs/unit_test_outline.pdf");
+        ensure_sample_pdf(&path).expect("Doit créer le PDF");
+        // Signets : « Introduction » (p. 1) > « Contexte » (p. 2), puis « Résultats » (p. 4).
+        let mut doc = Document::load(&path).expect("Doit charger");
+        let pages = doc.get_pages();
+        let page_ref = |n: u32| Object::Reference(pages[&n]);
+        let outlines_id = doc.new_object_id();
+        let intro_id = doc.new_object_id();
+        let context_id = doc.new_object_id();
+        let results_id = doc.new_object_id();
+        let dest = |n: u32| Object::Array(vec![page_ref(n), "XYZ".into(), 0.into(), 600.into(), Object::Null]);
+        doc.objects.insert(context_id, Object::Dictionary(dictionary! {
+            "Title" => Object::string_literal("Contexte"), "Parent" => intro_id, "Dest" => dest(2),
+        }));
+        doc.objects.insert(intro_id, Object::Dictionary(dictionary! {
+            "Title" => Object::string_literal("Introduction"), "Parent" => outlines_id, "Dest" => dest(1),
+            "First" => context_id, "Last" => context_id, "Count" => 1, "Next" => results_id,
+        }));
+        doc.objects.insert(results_id, Object::Dictionary(dictionary! {
+            "Title" => Object::String(b"R\xE9sultats".to_vec(), lopdf::StringFormat::Literal), "Parent" => outlines_id, "Dest" => dest(4),
+            "Prev" => intro_id,
+        }));
+        doc.objects.insert(outlines_id, Object::Dictionary(dictionary! {
+            "Type" => "Outlines", "First" => intro_id, "Last" => results_id, "Count" => 3,
+        }));
+        let catalog_id = doc.trailer.get(b"Root").and_then(Object::as_reference).expect("Racine");
+        doc.get_object_mut(catalog_id)
+            .and_then(Object::as_dict_mut)
+            .expect("Catalogue")
+            .set("Outlines", Object::Reference(outlines_id));
+        let with_outline = PathBuf::from("test_pdfs/unit_test_outline_marks.pdf");
+        doc.save(&with_outline).expect("Doit enregistrer");
+
+        let loaded = PdfEngine::instance().load_document(&with_outline).expect("Doit charger");
+        let outline: Vec<(String, Option<usize>, usize)> =
+            loaded.outline().into_iter().map(|e| (e.title, e.page, e.depth)).collect();
+        // Titre visé à 600 pt du bas, soit 242 pt du haut d'une page A4.
+        assert!(loaded.outline().iter().all(|e| e.y.is_some_and(|y| (y - 242.0).abs() < 1.0)));
+        assert_eq!(
+            outline,
+            vec![
+                ("Introduction".to_string(), Some(0), 0),
+                ("Contexte".to_string(), Some(1), 1),
+                ("Résultats".to_string(), Some(3), 0),
+            ]
+        );
+    }
+
+    #[test]
     fn test_large_document_opens_with_sizes_then_reads_details_lazily() {
         use crate::annotations::{save_annotations_and_ocr_to_pdf, AnnotationKind, PdfAnnotation};
         let src = PathBuf::from("test_pdfs/unit_test_large_src.pdf");
@@ -1174,4 +1548,3 @@ mod tests {
         assert!(!word_boxes.is_empty());
     }
 }
-

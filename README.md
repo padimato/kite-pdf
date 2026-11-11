@@ -10,15 +10,18 @@ Lecteur PDF pour Windows écrit en Rust : rapide, économe en mémoire, avec ann
 - **Recherche `Ctrl+F`** dans le texte du document, y compris le texte des figures et des scans grâce à l'OCR.
 - **OCR des images** (PaddleOCR PP-OCRv5, ONNX Runtime) en tâche de fond. Le texte reconnu est enregistré dans le PDF sous forme de couche invisible : il devient cherchable dans Acrobat, et les pages déjà analysées ne le sont plus à la réouverture.
 - **Pavé tactile** : défilement fluide et zoom par pincement centré sur le pointeur.
+- **Usage courant** : sommaire du document (signets), formulaires à remplir (texte, cases, boutons radio, listes), impression, PDF protégés par mot de passe, reprise de la lecture à la page et au zoom où on l'avait laissée.
 
 ## Raccourcis
 
 | Raccourci | Action |
 |---|---|
-| `Ctrl+T` / `Ctrl+K` | Barre centrale (PDF récents, outils, pages) |
+| `Ctrl+T` / `Ctrl+K` | Barre centrale (PDF récents, outils, page ou zoom) |
 | `Ctrl+Maj+T` | Rouvrir le dernier onglet fermé |
-| `Ctrl+O` | Ouvrir un fichier |
-| `Ctrl+S` | Enregistrer (annotations et texte OCR) |
+| `Ctrl+O` | Ouvrir un fichier (ou glisser-déposer un PDF dans la fenêtre) |
+| `Ctrl+S` | Enregistrer (annotations, formulaire et texte OCR) |
+| `Ctrl+Maj+S` | Enregistrer sous (l'original reste intact) |
+| `Ctrl+P` | Imprimer |
 | `Ctrl+F` | Rechercher dans le document |
 | `Ctrl+W` / `Ctrl+Tab` | Fermer / changer d'onglet |
 | `Ctrl+B` | Épingler ou masquer la barre latérale |
