@@ -254,7 +254,7 @@ impl PdfEngine {
             }
         }
         Pdfium::bind_to_system_library().context(
-            "Impossible de charger pdfium.dll : lancez `super_pdf_reader --fetch-deps` pour l'installer.",
+            "Impossible de charger pdfium.dll : lancez `kite-pdf --fetch-deps` pour l'installer.",
         )
     }
 

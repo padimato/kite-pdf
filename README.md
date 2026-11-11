@@ -1,6 +1,16 @@
-# Super Lecteur PDF
+<p align="center"><img src="assets/icon/kite-256.png" width="96" alt=""></p>
+
+# Kite PDF
 
 Lecteur PDF pour Windows écrit en Rust : rapide, économe en mémoire, avec annotations compatibles Adobe Acrobat et OCR des images intégrées.
+
+## Installation
+
+Téléchargez `KitePDF-Setup-x.y.z.exe` dans les [Releases](https://github.com/padimato/kite-pdf/releases) et lancez-le. L'installation se fait pour votre compte, sans droits administrateur. Elle ajoute Kite PDF au menu Démarrer et à « Ouvrir avec » pour les fichiers PDF ; une case de la dernière page ouvre les Paramètres de Windows pour en faire le lecteur par défaut.
+
+Au premier lancement, l'application télécharge PDFium et l'OCR depuis leur source officielle (voir [Composants](#compilation)). L'exécutable n'est pas signé : Windows SmartScreen peut afficher « Windows a protégé votre ordinateur » ; cliquez sur « Informations complémentaires » puis « Exécuter quand même ».
+
+Une seule fenêtre est ouverte à la fois : un PDF ouvert depuis l'Explorateur arrive dans un nouvel onglet. L'application signale discrètement les nouvelles versions publiées (une vérification par jour au plus, rien n'est installé sans vous).
 
 ## Fonctionnalités
 
@@ -34,8 +44,8 @@ Lecteur PDF pour Windows écrit en Rust : rapide, économe en mémoire, avec ann
 Prérequis : Windows 10 ou 11 (x64) et [Rust](https://rustup.rs) stable.
 
 ```bash
-git clone https://github.com/padimato/super-lecteur-pdf.git
-cd super-lecteur-pdf
+git clone https://github.com/padimato/kite-pdf.git
+cd kite-pdf
 cargo build --release
 ```
 
@@ -53,7 +63,7 @@ Cette commande installe dans le dossier courant les fichiers manquants :
 | `assets/models/onnxruntime.dll` | [ONNX Runtime, Microsoft](https://github.com/microsoft/onnxruntime/releases) |
 | `assets/models/*.onnx`, `ppocrv5_latin_dict.txt` | modèles PaddleOCR PP-OCRv5 au format ONNX, [publiés par oar-ocr](https://github.com/GreatV/oar-ocr/releases/tag/v0.3.0) |
 
-Sans cette étape, l'application télécharge elle-même ces fichiers au premier lancement, dans `%LOCALAPPDATA%\SuperLecteurPDF\deps` : l'écran d'installation attend PDFium, l'OCR peut être installé plus tard. La variable d'environnement `SUPERPDF_DEPS_DIR` désigne un autre dossier (installation portable).
+Sans cette étape, l'application télécharge elle-même ces fichiers au premier lancement, dans `%LOCALAPPDATA%\KitePDF\deps` : l'écran d'installation attend PDFium, l'OCR peut être installé plus tard. La variable d'environnement `KITE_DEPS_DIR` désigne un autre dossier (installation portable).
 
 **Autre version** : un fichier différent de la version testée est accepté. L'application affiche alors un avertissement qui indique la version testée et où la télécharger, en cas de problème. Pour adopter une nouvelle version, mettez à jour `deps.toml` puis lancez `cargo test`.
 
@@ -65,7 +75,7 @@ Sans les modèles, l'application fonctionne normalement ; seul l'OCR est désact
 cargo run --release -- chemin/vers/document.pdf
 ```
 
-Sans argument, l'application s'ouvre sur la barre centrale et propose les PDF récents. L'historique est conservé dans `%APPDATA%\SuperLecteurPDF\recent.tsv`.
+Sans argument, l'application s'ouvre sur la barre centrale et propose les PDF récents. L'historique est conservé dans `%APPDATA%\KitePDF\recent.tsv`.
 
 ## Tests
 
@@ -81,9 +91,19 @@ Les tests créent leurs PDF dans `test_pdfs/` (ignoré par git). Les tests OCR d
 |---|---|
 | `--fetch-deps [dossier]` | Installe PDFium et l'OCR (voir plus haut) |
 | `--bench fichier.pdf` | Mesure le temps de chaque étape : ouverture, rendu, texte, OCR (à lancer en `--release`) |
-| `SUPERPDF_TIMING=1` | Affiche le temps entre le lancement et la première page affichée |
-| `SUPERPDF_DEPS_DIR` | Dossier des dépendances (installation portable, essais) |
-| `SUPERPDF_QA=1` | Active dans une compilation `--release` les options de test (`--screenshot`, `--page`, `--search`…), toujours actives en compilation de développement |
+| `KITE_TIMING=1` | Affiche le temps entre le lancement et la première page affichée |
+| `KITE_DEPS_DIR` | Dossier des dépendances (installation portable, essais) |
+| `KITE_DATA_DIR` | Dossier des réglages et de l'historique (installation portable, essais) |
+| `KITE_QA=1` | Active dans une compilation `--release` les options de test (`--screenshot`, `--page`, `--search`…), toujours actives en compilation de développement |
+
+## Publier une version
+
+1. Mettre à jour `version` dans `Cargo.toml`, puis commiter.
+2. `git tag v1.2.3` puis `git push origin v1.2.3`.
+
+L'action GitHub [`release.yml`](.github/workflows/release.yml) compile, lance les tests, construit l'installateur avec [Inno Setup](https://jrsoftware.org/isinfo.php) (script [`installer/kite-pdf.iss`](installer/kite-pdf.iss)) et le publie dans les Releases. Pour le construire en local : `cargo build --release` puis `iscc installer\kite-pdf.iss` ; le résultat est dans `target\installer\`.
+
+L'icône est générée par [`assets/icon/generate_icon.py`](assets/icon/generate_icon.py) (Pillow).
 
 ## Licence
 

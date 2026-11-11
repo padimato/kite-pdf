@@ -1,10 +1,10 @@
 [package]
-name = "super_pdf_reader"
+name = "kite-pdf"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/padimato/super-lecteur-pdf"
-description = "Lecteur PDF ultra-performant et économe en RAM pour Windows (Style Arc, OCR Hybride, ISO 32000)"
+repository = "https://github.com/padimato/kite-pdf"
+description = "Kite PDF : lecteur PDF rapide et léger pour Windows (OCR, annotations, formulaires)"
 
 [dependencies]
 eframe = { version = "0.31", default-features = false, features = ["glow", "default_fonts"] }
@@ -26,8 +26,14 @@ flate2 = "1"
 tar = "0.4"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+# Réponse de GitHub pour la vérification des nouvelles versions.
+serde_json = "1"
 
 # Le code applicatif reste débogable, mais les dépendances (image, egui, ONNX) sont optimisées même en debug.
+[build-dependencies]
+# Icône et informations de version intégrées à l'exécutable Windows.
+winresource = "0.1"
+
 [profile.dev]
 opt-level = 1
 

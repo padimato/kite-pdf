@@ -1,5 +1,5 @@
 //! Réglages gardés d'un lancement à l'autre : position et taille de la fenêtre, barre latérale.
-//! Fichier texte `clé=valeur` dans `%APPDATA%\SuperLecteurPDF\settings.txt`.
+//! Fichier texte `clé=valeur` dans `%APPDATA%\KitePDF\settings.txt`.
 
 use std::path::PathBuf;
 
@@ -14,18 +14,41 @@ pub struct Settings {
 }
 
 /// Variable d'environnement : dossier des réglages et de l'historique à la place de
-/// `%APPDATA%\SuperLecteurPDF` (essais automatisés, installation portable).
-pub const DATA_DIR_ENV: &str = "SUPERPDF_DATA_DIR";
+/// `%APPDATA%\KitePDF` (essais automatisés, installation portable).
+pub const DATA_DIR_ENV: &str = "KITE_DATA_DIR";
+
+/// Nom des dossiers de l'application dans `%APPDATA%` et `%LOCALAPPDATA%`.
+pub const APP_DIR_NAME: &str = "KitePDF";
+/// Nom des dossiers avant que l'application s'appelle Kite PDF.
+const LEGACY_APP_DIR_NAME: &str = "SuperLecteurPDF";
+
+fn known_folder(var: &str) -> PathBuf {
+    std::env::var_os(var).map(PathBuf::from).unwrap_or_else(std::env::temp_dir)
+}
 
 /// Dossier des réglages, de l'historique et des préférences de l'utilisateur.
 pub fn app_data_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os(DATA_DIR_ENV) {
         return PathBuf::from(dir);
     }
-    std::env::var_os("APPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
-        .join("SuperLecteurPDF")
+    known_folder("APPDATA").join(APP_DIR_NAME)
+}
+
+/// Dossier local (non synchronisé) : composants téléchargés.
+pub fn local_data_dir() -> PathBuf {
+    known_folder("LOCALAPPDATA").join(APP_DIR_NAME)
+}
+
+/// Reprend les dossiers de l'ancien nom (« Super Lecteur PDF ») : historique, réglages et composants
+/// déjà téléchargés restent ainsi disponibles après le changement de nom.
+pub fn migrate_legacy_dirs() {
+    for var in ["APPDATA", "LOCALAPPDATA"] {
+        let base = known_folder(var);
+        let (old, new) = (base.join(LEGACY_APP_DIR_NAME), base.join(APP_DIR_NAME));
+        if old.is_dir() && !new.exists() {
+            let _ = std::fs::rename(&old, &new);
+        }
+    }
 }
 
 /// Les captures automatisées n'écrivent pas dans les réglages réels, sauf dossier de réglages dédié.

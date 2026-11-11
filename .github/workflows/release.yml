@@ -1,0 +1,50 @@
+# Publication d'une version : pousser un tag `vX.Y.Z` (identique à la version de Cargo.toml)
+# compile, teste, construit l'installateur et le publie dans les Releases GitHub.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Version du tag = version de Cargo.toml
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}".TrimStart('v')
+          $version = (Select-String Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          if ($tag -ne $version) { throw "Le tag $tag ne correspond pas à la version $version de Cargo.toml" }
+          "APP_VERSION=$version" >> $env:GITHUB_ENV
+
+      - name: Compilation
+        run: cargo build --release --locked
+
+      - name: Composants pour les tests (PDFium, ONNX Runtime, modèles OCR)
+        run: target\release\kite-pdf.exe --fetch-deps
+
+      - name: Tests
+        run: cargo test --release --locked
+
+      - name: Installateur
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DAppVersion=$env:APP_VERSION installer\kite-pdf.iss
+
+      - name: Publication
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Kite PDF ${{ env.APP_VERSION }}
+          files: target/installer/KitePDF-Setup-${{ env.APP_VERSION }}.exe
+          generate_release_notes: true

@@ -15,7 +15,7 @@ const MANIFEST: &str = include_str!("../deps.toml");
 
 /// Variable d'environnement qui remplace le dossier des dépendances de l'utilisateur
 /// (installation portable, tests).
-pub const DEPS_DIR_ENV: &str = "SUPERPDF_DEPS_DIR";
+pub const DEPS_DIR_ENV: &str = "KITE_DEPS_DIR";
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct Dependency {
@@ -70,11 +70,7 @@ pub fn user_deps_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os(DEPS_DIR_ENV) {
         return PathBuf::from(dir);
     }
-    std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
-        .join("SuperLecteurPDF")
-        .join("deps")
+    crate::settings::local_data_dir().join("deps")
 }
 
 /// Dossiers fouillés, dans l'ordre : celui de l'exécutable et ses parents (installation, `cargo run`),
@@ -198,7 +194,7 @@ pub fn install(
 fn fetch(url: &str, to: &Path, progress: &mut dyn FnMut(u64, Option<u64>)) -> Result<()> {
     let agent = ureq::AgentBuilder::new()
         .try_proxy_from_env(true)
-        .user_agent(concat!("super-lecteur-pdf/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("kite-pdf/", env!("CARGO_PKG_VERSION")))
         .build();
     let response = agent.get(url).call().context("téléchargement impossible")?;
     let total = response
@@ -323,7 +319,7 @@ mod tests {
 
     #[test]
     fn test_extract_member_from_zip_and_hash() {
-        let dir = std::env::temp_dir().join("superpdf_deps_test");
+        let dir = std::env::temp_dir().join("kite_deps_test");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let archive = dir.join("a.zip");

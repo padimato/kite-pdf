@@ -1,4 +1,4 @@
-# Dépendances natives de Super Lecteur PDF, téléchargées depuis leur source officielle.
+# Dépendances natives de Kite PDF, téléchargées depuis leur source officielle.
 #
 # Elles ne sont pas dans le dépôt git. Pour les installer après un `git clone` :
 #     cargo run --release -- --fetch-deps

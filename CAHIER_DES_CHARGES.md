@@ -1,4 +1,4 @@
-# Cahier des Charges — Super Lecteur PDF (Windows / Rust)
+# Cahier des Charges — Kite PDF (Windows / Rust)
 
 ## 1. Vision & Objectifs du Projet
 

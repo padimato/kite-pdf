@@ -1,5 +1,7 @@
-mod annotations;
-mod bench;
+// Version distribuée : pas de fenêtre de console à côté de l'application.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+mod annotations;mod bench;
 mod deps;
 mod settings;
 mod setup;
@@ -9,19 +11,24 @@ mod ocr_engine;
 mod pdf_engine;
 mod print;
 mod recent_files;
+mod single_instance;
 mod tabs;
 mod text_search;
+mod updates;
 mod viewport;
 mod worker;
 
-use app::{AutomationConfig, InitialSidebarMode, SuperPdfApp};
+use app::{AutomationConfig, InitialSidebarMode, KiteApp};
 use std::path::PathBuf;
 use tabs::ActiveTool;
 use text_search::PdfTopDownRect;
 
 /// Variable d'environnement qui active les options de test (`--screenshot`, `--page`...) dans une
 /// compilation optimisée. Une compilation de développement les accepte toujours.
-const QA_ENV: &str = "SUPERPDF_QA";
+const QA_ENV: &str = "KITE_QA";
+
+/// Nom de l'application (barre de titre, messages).
+pub const APP_NAME: &str = "Kite PDF";
 
 fn parse_args() -> AutomationConfig {
     let mut cfg = AutomationConfig::default();
@@ -233,13 +240,13 @@ fn parse_args() -> AutomationConfig {
     cfg
 }
 
-/// Écrit toute panique dans `super_pdf_crash.log` (dossier temporaire) : une fenêtre qui disparaît laisse ainsi une trace.
+/// Écrit toute panique dans `kite_pdf_crash.log` (dossier temporaire) : une fenêtre qui disparaît laisse ainsi une trace.
 fn install_crash_log() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let backtrace = std::backtrace::Backtrace::force_capture();
         let report = format!("{info}\n{backtrace}\n");
-        let log_path = std::env::temp_dir().join("super_pdf_crash.log");
+        let log_path = std::env::temp_dir().join("kite_pdf_crash.log");
         let _ = std::fs::write(log_path, report);
         default_hook(info);
     }));
@@ -248,7 +255,7 @@ fn install_crash_log() {
 /// Écran d'installation tant que PDFium manque, puis l'application elle-même.
 enum Root {
     Setup { screen: setup::SetupScreen, cfg: Option<AutomationConfig> },
-    Ready(Box<SuperPdfApp>),
+    Ready(Box<KiteApp>),
 }
 
 impl eframe::App for Root {
@@ -258,7 +265,7 @@ impl eframe::App for Root {
                 screen.show(ctx);
                 if screen.ready() {
                     let cfg = cfg.take().unwrap_or_default();
-                    *self = Root::Ready(Box::new(SuperPdfApp::new(ctx, cfg)));
+                    *self = Root::Ready(Box::new(KiteApp::new(ctx, cfg)));
                     ctx.request_repaint();
                 }
             }
@@ -276,12 +283,37 @@ impl eframe::App for Root {
 /// Instant du lancement du processus (mesure du temps jusqu'à la première page affichée).
 pub static PROCESS_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
+/// Sans console propre (version distribuée), les commandes en ligne écrivent dans celle du terminal
+/// qui les a lancées.
+fn attach_parent_console() {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn AttachConsole(process_id: u32) -> i32;
+    }
+    const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
+    if !cfg!(debug_assertions) {
+        // SAFETY: appel sans pointeur ; échoue sans effet s'il n'y a pas de console parente.
+        unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
+    }
+}
+
+/// Icône de la barre de titre et de la barre des tâches.
+fn window_icon() -> Option<egui::IconData> {
+    let image = image::load_from_memory(include_bytes!("../assets/icon/kite-256.png")).ok()?.into_rgba8();
+    let (width, height) = image.dimensions();
+    Some(egui::IconData { rgba: image.into_raw(), width, height })
+}
+
 fn main() -> eframe::Result<()> {
     PROCESS_START.get_or_init(std::time::Instant::now);
     install_crash_log();
+    settings::migrate_legacy_dirs();
 
     // `--fetch-deps [dossier]` : installe PDFium et l'OCR (dossier courant par défaut) puis quitte.
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--fetch-deps" || a == "--bench") || std::env::var_os(QA_ENV).is_some() {
+        attach_parent_console();
+    }
     if let Some(pos) = args.iter().position(|a| a == "--fetch-deps") {
         let root = args
             .get(pos + 1)
@@ -293,7 +325,7 @@ fn main() -> eframe::Result<()> {
 
     if let Some(pos) = args.iter().position(|a| a == "--bench") {
         let Some(pdf) = args.get(pos + 1) else {
-            eprintln!("Usage : super_pdf_reader --bench <fichier.pdf>");
+            eprintln!("Usage : kite-pdf --bench <fichier.pdf>");
             std::process::exit(2);
         };
         std::process::exit(bench::run(std::path::Path::new(pdf)));
@@ -301,12 +333,24 @@ fn main() -> eframe::Result<()> {
 
     let cfg = parse_args();
 
+    // Déjà ouverte : le PDF part dans un onglet de la fenêtre existante (captures automatisées exceptées).
+    let automated = cfg.screenshot_output.is_some();
+    if !automated {
+        let paths: Vec<PathBuf> = cfg.initial_pdf.iter().cloned().collect();
+        if let single_instance::Role::Forwarded = single_instance::acquire(&paths) {
+            return Ok(());
+        }
+    }
+
     let mut viewport = egui::ViewportBuilder::default()
-        .with_title("Super Lecteur PDF")
+        .with_title(APP_NAME)
         .with_inner_size([1280.0, 820.0])
         .with_min_inner_size([640.0, 400.0]);
     // Fenêtre rouverte à la même place et à la même taille (sauf captures automatisées).
-    if settings::persistence_enabled(cfg.screenshot_output.is_some()) {
+    if let Some(icon) = window_icon() {
+        viewport = viewport.with_icon(std::sync::Arc::new(icon));
+    }
+    if settings::persistence_enabled(automated) {
         let saved = settings::Settings::load();
         if saved.window_is_plausible() {
             if let Some([x, y, w, h]) = saved.window {
@@ -327,14 +371,19 @@ fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions { viewport, ..Default::default() };
 
     eframe::run_native(
-        "Super Lecteur PDF",
+        APP_NAME,
         native_options,
         Box::new(move |cc| {
+            single_instance::set_repaint_context(&cc.egui_ctx);
+            // Version distribuée seulement : une compilation de développement ne consulte pas GitHub.
+            if !automated && !cfg!(debug_assertions) {
+                updates::check_in_background(cc.egui_ctx.clone());
+            }
             let pdfium_installed = deps::by_file_name("pdfium.dll")
                 .and_then(|d| deps::locate(&d))
                 .is_some();
             let root = if pdfium_installed {
-                Root::Ready(Box::new(SuperPdfApp::new(&cc.egui_ctx, cfg)))
+                Root::Ready(Box::new(KiteApp::new(&cc.egui_ctx, cfg)))
             } else {
                 Root::Setup { screen: setup::SetupScreen::new(&cc.egui_ctx), cfg: Some(cfg) }
             };

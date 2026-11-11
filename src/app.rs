@@ -396,7 +396,7 @@ pub struct AutomationConfig {
     pub screenshot_visible: bool,
 }
 
-pub struct SuperPdfApp {
+pub struct KiteApp {
     /// Moteur PDFium singleton
     engine: &'static PdfEngine,
     /// Liste des onglets PDF ouverts dans la barre verticale (avec support d'hibernation)
@@ -423,11 +423,17 @@ pub struct SuperPdfApp {
     /// Dernier enregistrement de la session (fait régulièrement, pas seulement à la fermeture :
     /// une application arrêtée de force ne perd ainsi presque rien)
     last_session_save: Instant,
+    /// Titre affiché dans la barre de titre et la barre des tâches (document actif)
+    window_title: String,
     /// Fichiers des onglets fermés, du plus ancien au plus récent (`Ctrl+Maj+T`)
     closed_tabs: Vec<PathBuf>,
     /// Dépendances installées dans une version non testée (rempli par un thread au démarrage)
     dependency_warnings: std::sync::Arc<std::sync::Mutex<Option<Vec<crate::deps::UntestedVersion>>>>,
     dependency_warning_closed: bool,
+    /// Bandeau « nouvelle version » fermé pour cette session
+    update_banner_closed: bool,
+    /// Logo affiché en haut de la barre latérale
+    logo: Option<egui::TextureHandle>,
     first_render_reported: bool,
     /// Dernière page vue en cours de lecture des images (onglet, page), pour l'afficher entre deux pages
     last_image_ocr_page: Option<(u64, usize)>,
@@ -513,7 +519,7 @@ const TAB_BADGE_COLORS: [(Color32, (f32, f32, f32)); 6] = [
     (Color32::from_rgb(80, 185, 225), (0.10, 0.36, 0.46)),
 ];
 
-impl SuperPdfApp {
+impl KiteApp {
     pub fn new(egui_ctx: &Context, automation: AutomationConfig) -> Self {
         let engine = PdfEngine::instance();
 
@@ -567,6 +573,7 @@ impl SuperPdfApp {
             last_window: None,
             last_maximized: false,
             last_session_save: Instant::now(),
+            window_title: String::new(),
             number_history: if crate::settings::persistence_enabled(automation.screenshot_output.is_some()) {
                 crate::tabs::NumberHistory::load_default()
             } else {
@@ -606,6 +613,8 @@ impl SuperPdfApp {
             workers: BackgroundWorkers::spawn(egui_ctx.clone(), engine),
             dependency_warnings: crate::setup::check_versions_in_background(egui_ctx.clone()),
             dependency_warning_closed: false,
+            update_banner_closed: false,
+            logo: load_logo(egui_ctx),
             first_render_reported: false,
             last_image_ocr_page: None,
             deep_ocr: None,
@@ -1124,7 +1133,7 @@ impl SuperPdfApp {
         // Tab / Maj+Tab : champ texte suivant / précédent (le champ garde le focus, egui ne le
         // donne pas aux boutons de la barre latérale).
         let mut move_to: Option<i32> = None;
-        egui::Area::new(egui::Id::new("superpdf_form_editor"))
+        egui::Area::new(egui::Id::new("kite_form_editor"))
             .fixed_pos(rect.min)
             .order(Order::Foreground)
             .show(ctx, |ui| {
@@ -1234,7 +1243,7 @@ impl SuperPdfApp {
         let Some(dims) = tab.page_dimensions.get(popup.page).copied() else { return };
         let rect = popup.rect.to_screen_rect(*page_rect, dims);
         let mut chosen = None;
-        let area = egui::Area::new(egui::Id::new("superpdf_form_choice"))
+        let area = egui::Area::new(egui::Id::new("kite_form_choice"))
             .fixed_pos(Pos2::new(rect.left(), rect.bottom() + 2.0))
             .order(Order::Foreground)
             .show(ctx, |ui| {
@@ -1287,7 +1296,7 @@ impl SuperPdfApp {
         let mut source = tab.path.clone();
         let mut cleanup = None;
         if tab.is_modified {
-            let temp = std::env::temp_dir().join(format!("superpdf-impression-{}.pdf", tab.id));
+            let temp = std::env::temp_dir().join(format!("kite-impression-{}.pdf", tab.id));
             tab.ensure_details_for_saved_pages(self.engine);
             let saved = save_pdf_with_ocr_state(
                 &tab.path,
@@ -1337,7 +1346,7 @@ impl SuperPdfApp {
         };
         let mut close = false;
         let width = (canvas_rect.width() - 48.0).min(480.0);
-        egui::Area::new(egui::Id::new("superpdf_print_status"))
+        egui::Area::new(egui::Id::new("kite_print_status"))
             .fixed_pos(Pos2::new(canvas_rect.center().x - width * 0.5, canvas_rect.max.y - 90.0))
             .order(Order::Foreground)
             .show(ctx, |ui| {
@@ -1382,7 +1391,7 @@ impl SuperPdfApp {
         ctx.layer_painter(egui::LayerId::new(Order::Foreground, egui::Id::new("password_backdrop")))
             .rect_filled(screen, CornerRadius::ZERO, Color32::from_rgba_unmultiplied(6, 8, 12, 150));
         let width = 400.0_f32.min(screen.width() - 32.0);
-        egui::Area::new(egui::Id::new("superpdf_password_prompt"))
+        egui::Area::new(egui::Id::new("kite_password_prompt"))
             .fixed_pos(Pos2::new(screen.center().x - width * 0.5, screen.min.y + screen.height() * 0.25))
             .order(Order::Tooltip)
             .show(ctx, |ui| {
@@ -1503,6 +1512,35 @@ impl SuperPdfApp {
         }
     }
 
+    /// PDF ouverts depuis l'Explorateur pendant que l'application tournait déjà : un onglet chacun
+    /// (ou celui où le fichier est déjà ouvert), et la fenêtre revient au premier plan.
+    fn open_forwarded_files(&mut self, ctx: &Context) {
+        let requests = crate::single_instance::take_requests();
+        if requests.is_empty() {
+            return;
+        }
+        for path in requests.into_iter().flat_map(|r| r.paths) {
+            match self.tabs.iter().position(|t| t.path == path) {
+                Some(index) => self.switch_to_tab(index),
+                None => self.open_pdf_in_new_tab(&path),
+            }
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+
+    /// « document.pdf — Kite PDF » : le document actif se retrouve dans la barre des tâches et Alt+Tab.
+    fn update_window_title(&mut self, ctx: &Context) {
+        let title = match self.tabs.get(self.active_tab) {
+            Some(tab) => format!("{} — {}", tab.title, crate::APP_NAME),
+            None => crate::APP_NAME.to_string(),
+        };
+        if title != self.window_title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.window_title = title;
+        }
+    }
+
     /// PDF glissés dans la fenêtre : chacun s'ouvre dans un onglet (un calque l'annonce pendant le survol).
     fn open_dropped_files(&mut self, ctx: &Context) {
         let is_pdf = |path: &Path| path.extension().is_some_and(|e| e.eq_ignore_ascii_case("pdf"));
@@ -1512,7 +1550,7 @@ impl SuperPdfApp {
         });
         if hovering {
             let screen = ctx.screen_rect();
-            let painter = ctx.layer_painter(egui::LayerId::new(Order::Foreground, egui::Id::new("superpdf_drop")));
+            let painter = ctx.layer_painter(egui::LayerId::new(Order::Foreground, egui::Id::new("kite_drop")));
             painter.rect_filled(screen, CornerRadius::ZERO, Color32::from_rgba_unmultiplied(20, 40, 80, 170));
             painter.rect_stroke(
                 screen.shrink(12.0),
@@ -2699,7 +2737,7 @@ impl SuperPdfApp {
     }
 }
 
-impl eframe::App for SuperPdfApp {
+impl eframe::App for KiteApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         self.frame_count += 1;
         self.text_field_focused_prev = std::mem::take(&mut self.text_field_focused_now);
@@ -2710,6 +2748,8 @@ impl eframe::App for SuperPdfApp {
         self.process_worker_events(ctx);
         self.track_window(ctx);
         self.open_dropped_files(ctx);
+        self.open_forwarded_files(ctx);
+        self.update_window_title(ctx);
         if self.last_session_save.elapsed() >= SESSION_SAVE_INTERVAL {
             self.last_session_save = Instant::now();
             self.save_session();
@@ -2747,7 +2787,7 @@ impl eframe::App for SuperPdfApp {
         if self.sidebar.pinned {
             // Largeur fixe : la poignée d'egui est recouverte par la zone du document, qui capte le
             // glissé ; une poignée propre, au premier plan, la remplace (voir `render_sidebar_resize_handle`).
-            egui::SidePanel::left("superpdf_sidebar_pinned")
+            egui::SidePanel::left("kite_sidebar_pinned")
                 .exact_width(self.sidebar.width)
                 .resizable(false)
                 .frame(
@@ -3388,6 +3428,7 @@ impl eframe::App for SuperPdfApp {
                 self.render_line_context_menu(ctx);
                 self.render_save_error_popup(ctx);
                 self.render_dependency_warning(ctx, canvas_rect);
+                self.render_update_banner(ctx, canvas_rect);
 
                 // Barre de recherche flottante `Ctrl+F`
                 if self.search_bar.is_open {
@@ -3426,14 +3467,14 @@ impl eframe::App for SuperPdfApp {
     }
 }
 
-impl SuperPdfApp {
+impl KiteApp {
     /// Intègre les résultats des threads d'arrière-plan (textures, texte, OCR).
     fn process_worker_events(&mut self, ctx: &Context) {
         while let Some(event) = self.workers.try_next_event() {
             match event {
                 WorkerEvent::Rendered { key, image } => {
-                    // `SUPERPDF_TIMING=1` : temps entre le lancement et la première image de page.
-                    if !self.first_render_reported && std::env::var_os("SUPERPDF_TIMING").is_some() {
+                    // `KITE_TIMING=1` : temps entre le lancement et la première image de page.
+                    if !self.first_render_reported && std::env::var_os("KITE_TIMING").is_some() {
                         self.first_render_reported = true;
                         println!(
                             "Première page affichée {:.0} ms après le lancement",
@@ -3970,7 +4011,7 @@ impl SuperPdfApp {
         if ctx.input(|i| i.pointer.any_released()) {
             self.freetext_awaiting_opening_release = false;
         }
-        egui::Area::new(egui::Id::new("superpdf_freetext_editor").with(editing_id))
+        egui::Area::new(egui::Id::new("kite_freetext_editor").with(editing_id))
             .fixed_pos(screen_rect.min)
             .order(Order::Foreground)
             .show(ctx, |ui| {
@@ -4100,7 +4141,7 @@ impl SuperPdfApp {
         let mut open_menu_at = None;
         let mut header_buttons_left = f32::INFINITY;
 
-        let area = egui::Area::new(egui::Id::new("superpdf_comment_panel").with(note_id))
+        let area = egui::Area::new(egui::Id::new("kite_comment_panel").with(note_id))
             .fixed_pos(panel_pos)
             .order(Order::Foreground)
             .show(ctx, |ui| {
@@ -4437,7 +4478,7 @@ impl SuperPdfApp {
             .as_ref()
             .map_or("None", |r| r.state.as_str());
 
-        let area = egui::Area::new(egui::Id::new("superpdf_line_context_menu"))
+        let area = egui::Area::new(egui::Id::new("kite_line_context_menu"))
             .fixed_pos(position)
             .order(Order::Tooltip)
             .show(ctx, |ui| {
@@ -4606,7 +4647,7 @@ impl SuperPdfApp {
             (lacking > 0 && lacking * 5 >= analysed.max(1)).then_some(SearchOcrHint::PagesWithoutText(lacking))
         });
 
-        egui::Area::new(egui::Id::new("superpdf_floating_ctrl_f"))
+        egui::Area::new(egui::Id::new("kite_floating_ctrl_f"))
             .fixed_pos(bar_pos)
             .order(Order::Foreground)
             .show(ctx, |ui| {
@@ -4755,17 +4796,18 @@ impl SuperPdfApp {
 
         ui.spacing_mut().item_spacing = Vec2::new(6.0, 4.0);
 
-        // 1. En-tête de la barre latérale
+        // 1. En-tête de la barre latérale : logo et nom
+        let logo = self.logo.clone();
         egui::Frame::NONE
             .inner_margin(Margin::symmetric(12, 8))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("⚡ SUPER PDF")
-                            .strong()
-                            .size(14.0)
-                            .color(Color32::from_rgb(130, 185, 255)),
-                    );
+                    if let Some(logo) = &logo {
+                        ui.add(egui::Image::new(logo).fit_to_exact_size(Vec2::splat(22.0)));
+                    }
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    ui.label(egui::RichText::new("Kite").strong().size(15.0).color(Color32::from_rgb(245, 247, 250)));
+                    ui.label(egui::RichText::new("PDF").size(15.0).color(Color32::from_rgb(140, 150, 170)));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let pin_label = if self.sidebar.pinned {
                             "📌 Épinglée"
@@ -4853,7 +4895,7 @@ impl SuperPdfApp {
                 let columns = if self.sidebar.width >= SIDEBAR_ONE_ROW_TOOLS_WIDTH { 8 } else { 4 };
                 let spacing = 5.0;
                 let tool_width = ((ui.available_width() - spacing * (columns - 1) as f32) / columns as f32).max(40.0);
-                egui::Grid::new("superpdf_tools_grid")
+                egui::Grid::new("kite_tools_grid")
                     .num_columns(columns)
                     .spacing([spacing, 4.0])
                     .show(ui, |ui| {
@@ -5424,7 +5466,7 @@ impl SuperPdfApp {
             Pos2::new(edge - SIDEBAR_HANDLE_PX * 0.5, screen.top()),
             Pos2::new(edge + SIDEBAR_HANDLE_PX * 0.5, screen.bottom()),
         );
-        egui::Area::new(egui::Id::new("superpdf_sidebar_resize"))
+        egui::Area::new(egui::Id::new("kite_sidebar_resize"))
             .fixed_pos(grab.min)
             .order(Order::Foreground)
             .show(ctx, |ui| {
@@ -5448,7 +5490,7 @@ impl SuperPdfApp {
     fn render_autohide_sidebar_overlay(&mut self, ctx: &Context, canvas_rect: Rect) {
         let painter = ctx.layer_painter(egui::LayerId::new(
             Order::Foreground,
-            egui::Id::new("superpdf_edge_indicator"),
+            egui::Id::new("kite_edge_indicator"),
         ));
 
         let edge_strip = Rect::from_min_size(canvas_rect.min, Vec2::new(4.0, canvas_rect.height()));
@@ -5468,7 +5510,7 @@ impl SuperPdfApp {
             Vec2::new(self.sidebar.width, canvas_rect.height() - 16.0),
         );
 
-        egui::Area::new(egui::Id::new("superpdf_floating_sidebar_overlay"))
+        egui::Area::new(egui::Id::new("kite_floating_sidebar_overlay"))
             .fixed_pos(overlay_rect.min)
             // Sans cela egui ramène la zone dans l'écran et la fait apparaître en fondu : la barre
             // surgissait en place au lieu de glisser depuis le bord.
@@ -5488,6 +5530,47 @@ impl SuperPdfApp {
             });
     }
 
+    /// Bandeau discret en bas de la fenêtre : une nouvelle version est publiée.
+    fn render_update_banner(&mut self, ctx: &Context, canvas_rect: Rect) {
+        if self.update_banner_closed {
+            return;
+        }
+        let Some(release) = crate::updates::available() else {
+            return;
+        };
+        egui::Area::new(egui::Id::new("kite_update_banner"))
+            .anchor(Align2::RIGHT_BOTTOM, Vec2::new(-16.0, -16.0))
+            .constrain_to(canvas_rect)
+            .order(Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::NONE
+                    .fill(Color32::from_rgb(24, 32, 52))
+                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(70, 95, 150)))
+                    .corner_radius(CornerRadius::same(10))
+                    .inner_margin(Margin::same(12))
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(format!("Kite PDF {} est disponible.", release.version))
+                                .size(12.5)
+                                .color(Color32::WHITE),
+                        );
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Voir la nouvelle version").clicked() {
+                                let _ = std::process::Command::new("explorer").arg(&release.page_url).spawn();
+                                self.update_banner_closed = true;
+                            }
+                            if ui.button("Ignorer cette version").clicked() {
+                                crate::updates::skip(&release.version);
+                            }
+                            if ui.button("Plus tard").clicked() {
+                                self.update_banner_closed = true;
+                            }
+                        });
+                    });
+            });
+    }
+
     /// Bandeau signalant une dépendance installée dans une version autre que celle testée.
     fn render_dependency_warning(&mut self, ctx: &Context, canvas_rect: Rect) {
         if self.dependency_warning_closed {
@@ -5498,7 +5581,7 @@ impl SuperPdfApp {
             return;
         }
         let width = (canvas_rect.width() - 48.0).min(620.0);
-        egui::Area::new(egui::Id::new("superpdf_dependency_warning"))
+        egui::Area::new(egui::Id::new("kite_dependency_warning"))
             .fixed_pos(Pos2::new(canvas_rect.center().x - width * 0.5, canvas_rect.min.y + 12.0))
             .order(Order::Foreground)
             .show(ctx, |ui| {
@@ -5622,7 +5705,7 @@ impl SuperPdfApp {
         ctx.layer_painter(egui::LayerId::new(Order::Foreground, egui::Id::new("deep_ocr_backdrop")))
             .rect_filled(screen, CornerRadius::ZERO, Color32::from_rgba_unmultiplied(6, 8, 12, 150));
         let width = 470.0_f32.min(screen.width() - 32.0);
-        egui::Area::new(egui::Id::new("superpdf_deep_ocr_dialog"))
+        egui::Area::new(egui::Id::new("kite_deep_ocr_dialog"))
             .fixed_pos(Pos2::new(screen.center().x - width * 0.5, screen.min.y + screen.height() * 0.2))
             .order(Order::Tooltip)
             .show(ctx, |ui| {
@@ -5797,7 +5880,7 @@ impl SuperPdfApp {
         let mut save = false;
         let mut dismiss = false;
         let width = (canvas_rect.width() - 48.0).min(520.0);
-        egui::Area::new(egui::Id::new("superpdf_deep_ocr_result"))
+        egui::Area::new(egui::Id::new("kite_deep_ocr_result"))
             .fixed_pos(Pos2::new(canvas_rect.center().x - width * 0.5, canvas_rect.max.y - 130.0))
             .order(Order::Foreground)
             .show(ctx, |ui| {
@@ -5847,7 +5930,7 @@ impl SuperPdfApp {
         let mut read_page = false;
         let mut read = false;
         let mut close = false;
-        egui::Area::new(egui::Id::new("superpdf_no_text_hint"))
+        egui::Area::new(egui::Id::new("kite_no_text_hint"))
             .fixed_pos(position + Vec2::new(12.0, 12.0))
             .order(Order::Foreground)
             .show(ctx, |ui| {
@@ -5959,7 +6042,7 @@ impl SuperPdfApp {
         );
         let muted = Color32::from_rgb(135, 145, 168);
 
-        let area = egui::Area::new(egui::Id::new("superpdf_command_palette_modal"))
+        let area = egui::Area::new(egui::Id::new("kite_command_palette_modal"))
             .fixed_pos(bar_pos)
             .order(Order::Tooltip)
             .show(ctx, |ui| {
@@ -6134,4 +6217,16 @@ fn palette_entry_icon(entry: &crate::tabs::PaletteEntry) -> (&'static str, Color
         "Outil" => ("🛠", Color32::from_rgb(250, 205, 110)),
         _ => ("⚡", Color32::from_rgb(170, 160, 250)),
     }
+}
+
+/// Cerf-volant du logo, sans fond (la barre latérale est déjà sombre), lissé pour un affichage en petite taille.
+fn load_logo(ctx: &Context) -> Option<egui::TextureHandle> {
+    let image = image::load_from_memory(include_bytes!("../assets/icon/kite-mark-64.png")).ok()?.into_rgba8();
+    let size = [image.width() as usize, image.height() as usize];
+    let pixels = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
+    let options = egui::TextureOptions {
+        mipmap_mode: Some(egui::TextureFilter::Linear),
+        ..egui::TextureOptions::LINEAR
+    };
+    Some(ctx.load_texture("kite_logo", pixels, options))
 }

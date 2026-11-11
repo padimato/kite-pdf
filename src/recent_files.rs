@@ -1,7 +1,7 @@
 //! Historique des PDF ouverts et recherche « intelligente » utilisée par la barre centrale (`Ctrl+T`).
 //!
 //! L'historique est un simple fichier texte (`date\tnombre d'ouvertures\tchemin` par ligne) dans
-//! `%APPDATA%\SuperLecteurPDF\recent.tsv`, sans dépendance de sérialisation.
+//! `%APPDATA%\KitePDF\recent.tsv`, sans dépendance de sérialisation.
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -356,7 +356,7 @@ mod tests {
 
     #[test]
     fn test_recent_files_persist_and_reorder() {
-        let dir = std::env::temp_dir().join("superpdf_recent_test");
+        let dir = std::env::temp_dir().join("kite_recent_test");
         let _ = std::fs::remove_dir_all(&dir);
         let storage = dir.join("recent.tsv");
         let a = dir.join("a.pdf");

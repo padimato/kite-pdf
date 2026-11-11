@@ -1146,7 +1146,7 @@ pub fn save_pdf_with_ocr_state(
 
     // Écriture dans un fichier voisin puis remplacement atomique : une panne en cours d'écriture
     // ne peut pas corrompre l'original, et les lectures PDFium en cours restent valides.
-    let temp_path = dest_path.with_extension("superpdf-save.tmp");
+    let temp_path = dest_path.with_extension("kite-save.tmp");
     forget_previous_revisions(&mut doc);
     doc.save(&temp_path).with_context(|| {
         format!(
@@ -2275,7 +2275,7 @@ fn dict_date(d: &lopdf::Dictionary) -> String {
     }
 }
 
-/// Charge les annotations d'un PDF (Acrobat ou Super Lecteur PDF), avec leurs fils de discussion.
+/// Charge les annotations d'un PDF (Acrobat ou Kite PDF), avec leurs fils de discussion.
 pub fn load_annotations_from_pdf(
     path: &Path,
     page_dimensions: &[PageDimensions],

@@ -38,7 +38,7 @@ impl InstallJob {
             .collect();
         let worker = job.clone();
         std::thread::Builder::new()
-            .name("superpdf-deps".into())
+            .name("kite-deps".into())
             .spawn(move || worker.run(ctx))
             .expect("thread de téléchargement");
         job
@@ -233,7 +233,7 @@ pub fn check_versions_in_background(ctx: Context) -> Arc<Mutex<Option<Vec<Untest
     let result = Arc::new(Mutex::new(None));
     let slot = result.clone();
     let _ = std::thread::Builder::new()
-        .name("superpdf-deps-check".into())
+        .name("kite-deps-check".into())
         .spawn(move || {
             let ignored = ignored_versions();
             let untested: Vec<UntestedVersion> = deps::untested_versions()

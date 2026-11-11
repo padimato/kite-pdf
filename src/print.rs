@@ -167,7 +167,7 @@ pub fn print_in_background(
         ..Default::default()
     }));
     let shared = progress.clone();
-    let _ = std::thread::Builder::new().name("superpdf-print".into()).spawn(move || {
+    let _ = std::thread::Builder::new().name("kite-print".into()).spawn(move || {
         let result = print_pages(engine, &pdf, &doc_name, &choice, output.as_deref(), &shared);
         unsafe { DeleteDC(choice.dc) };
         if let Some(temp) = cleanup {
