@@ -3,10 +3,11 @@
 
 use crate::memory_manager::PageTextureKey;
 use crate::ocr_engine::{HybridOcrEngine, OcrRecognizer, RecognizedOcrSegment};
-use crate::pdf_engine::{LoadedPdfDocument, PdfEngine, TileRegion};
+use crate::annotations::{load_annotations_from_pdf, PdfAnnotation};
+use crate::pdf_engine::{LoadedPdfDocument, PageDetails, PageDimensions, PdfEngine, TileRegion};
 use crate::text_search::PageTextLayer;
 use egui::{ColorImage, Context};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -15,6 +16,57 @@ use std::time::{Duration, Instant};
 
 /// Documents gardés ouverts par le thread de rendu (onglet actif + changements rapides d'onglet).
 const MAX_OPEN_RENDER_DOCS: usize = 3;
+/// Avancement d'une lecture OCR approfondie, partagé entre son thread et l'interface.
+#[derive(Debug, Clone)]
+pub struct DeepOcrProgress {
+    /// Pages restant à lire, dans l'ordre (les pages demandées en urgence sont mises devant)
+    pub queue: VecDeque<usize>,
+    /// Page en cours de lecture
+    pub current: Option<usize>,
+    /// Pages demandées
+    pub total: usize,
+    /// Pages traitées
+    pub done: usize,
+    /// Pages réellement lues par l'OCR
+    pub read: usize,
+    /// Temps de calcul cumulé des pages lues (pour estimer la durée restante)
+    pub busy: Duration,
+    pub paused: bool,
+    pub cancelled: bool,
+    pub finished: bool,
+    pub error: Option<String>,
+}
+
+impl DeepOcrProgress {
+    /// Fait passer `pages` en tête de la lecture en cours (sans doublon avec la file).
+    pub fn prioritize(&mut self, pages: &[usize]) {
+        for &page in pages.iter().rev() {
+            if self.current == Some(page) {
+                continue;
+            }
+            if let Some(index) = self.queue.iter().position(|&p| p == page) {
+                self.queue.remove(index);
+            } else {
+                self.total += 1;
+            }
+            self.queue.push_front(page);
+        }
+    }
+
+    /// Secondes par page lue : mesurées dès la première page, sinon `default_seconds`.
+    pub fn seconds_per_page(&self, default_seconds: f32) -> f32 {
+        if self.read > 0 {
+            self.busy.as_secs_f32() / self.read as f32
+        } else {
+            default_seconds
+        }
+    }
+}
+
+/// Pages envoyées ensemble par l'analyse de fond d'un gros document.
+const DETAILS_BATCH_PAGES: usize = 20;
+/// L'analyse de fond cède la place au rendu et au texte au plus pendant cette durée par page.
+const DETAILS_MAX_PAUSE: Duration = Duration::from_secs(2);
 /// En mode Éco, le thread OCR se repose ce multiple du temps de travail entre deux pages.
 const ECO_REST_FACTOR: u32 = 2;
 
@@ -64,6 +116,26 @@ pub enum WorkerEvent {
         layer: PageTextLayer,
     },
     OcrPage(OcrPageOutcome),
+    /// Détails de pages d'un gros document, lus en tâche de fond après l'ouverture.
+    PageDetails {
+        tab_id: u64,
+        pages: Vec<(usize, PageDetails)>,
+    },
+    /// Toutes les pages ont été lues.
+    PageDetailsDone {
+        tab_id: u64,
+    },
+    /// Une page lue par l'OCR approfondi.
+    DeepOcrPage {
+        tab_id: u64,
+        page: usize,
+        segments: Vec<RecognizedOcrSegment>,
+    },
+    /// Annotations relues du fichier en tâche de fond.
+    AnnotationsLoaded {
+        tab_id: u64,
+        items: Vec<PdfAnnotation>,
+    },
 }
 
 #[derive(Default)]
@@ -90,6 +162,11 @@ pub struct BackgroundWorkers {
     render_queue: Arc<SharedState<RenderQueue>>,
     ocr_slot: Arc<SharedState<Option<OcrJob>>>,
     events: Receiver<WorkerEvent>,
+    sender: Sender<WorkerEvent>,
+    ctx: Context,
+    engine: &'static PdfEngine,
+    /// Onglets fermés : leur analyse de fond s'arrête.
+    closed_tabs: Arc<Mutex<HashSet<u64>>>,
 }
 
 impl BackgroundWorkers {
@@ -109,6 +186,8 @@ impl BackgroundWorkers {
         }
         {
             let slot = ocr_slot.clone();
+            let tx = tx.clone();
+            let ctx = ctx.clone();
             std::thread::Builder::new()
                 .name("superpdf-ocr".into())
                 .spawn(move || ocr_thread(engine, slot, tx, ctx))
@@ -119,7 +198,172 @@ impl BackgroundWorkers {
             render_queue,
             ocr_slot,
             events,
+            sender: tx,
+            ctx,
+            engine,
+            closed_tabs: Arc::default(),
         }
+    }
+
+    /// Lit en tâche de fond les détails de chaque page d'un gros document (une page à la fois, pour
+    /// que le rendu puisse s'intercaler).
+    pub fn scan_page_details(&self, tab_id: u64, path: PathBuf, page_count: usize) {
+        let (engine, tx, ctx, closed) =
+            (self.engine, self.sender.clone(), self.ctx.clone(), self.closed_tabs.clone());
+        let render_queue = self.render_queue.clone();
+        let _ = std::thread::Builder::new()
+            .name("superpdf-page-details".into())
+            .spawn(move || {
+                let Ok(doc) = engine.open_lightweight(&path) else {
+                    return;
+                };
+                let mut batch = Vec::with_capacity(DETAILS_BATCH_PAGES);
+                for page in 0..page_count {
+                    if closed.lock().unwrap_or_else(|e| e.into_inner()).contains(&tab_id) {
+                        break;
+                    }
+                    // Le verrou PDFium n'est pas équitable : sans cette pause, cette boucle le reprendrait
+                    // aussitôt et la page à l'écran attendrait la fin de l'analyse (jusqu'à 15 s mesurées).
+                    let pause_started = Instant::now();
+                    while pause_started.elapsed() < DETAILS_MAX_PAUSE {
+                        let busy = {
+                            let queue = render_queue.lock();
+                            queue.render_in_progress || !queue.render.is_empty() || !queue.text.is_empty()
+                        };
+                        if !busy {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    if let Some(details) = doc.page_details(page) {
+                        batch.push((page, details));
+                    }
+                    if batch.len() >= DETAILS_BATCH_PAGES || page + 1 == page_count {
+                        let _ = tx.send(WorkerEvent::PageDetails { tab_id, pages: std::mem::take(&mut batch) });
+                        ctx.request_repaint();
+                    }
+                }
+                let _ = tx.send(WorkerEvent::PageDetailsDone { tab_id });
+                ctx.request_repaint();
+                let _lock = PdfEngine::lock_guard();
+                drop(doc);
+            });
+    }
+
+    /// Lance l'OCR approfondi des `pages` (page entière). Les pages qui ont déjà du texte sont relues
+    /// aussi (figures dessinées) : seules les lignes absentes du texte du fichier sont gardées.
+    /// Le thread s'interrompt entre deux pages si `paused` ou `cancelled` est levé.
+    pub fn start_deep_ocr(
+        &self,
+        tab_id: u64,
+        path: PathBuf,
+        pages: Vec<usize>,
+    ) -> Arc<Mutex<DeepOcrProgress>> {
+        let progress = Arc::new(Mutex::new(DeepOcrProgress {
+            queue: pages.iter().copied().collect(),
+            current: None,
+            total: pages.len(),
+            done: 0,
+            read: 0,
+            busy: Duration::ZERO,
+            paused: false,
+            cancelled: false,
+            finished: false,
+            error: None,
+        }));
+        let (engine, tx, ctx, closed, shared) = (
+            self.engine,
+            self.sender.clone(),
+            self.ctx.clone(),
+            self.closed_tabs.clone(),
+            progress.clone(),
+        );
+        let lock = |p: &Arc<Mutex<DeepOcrProgress>>| -> DeepOcrProgress {
+            p.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        };
+        let _ = std::thread::Builder::new()
+            .name("superpdf-deep-ocr".into())
+            .spawn(move || {
+                let finish = |error: Option<String>| {
+                    let mut p = shared.lock().unwrap_or_else(|e| e.into_inner());
+                    p.finished = true;
+                    p.error = error;
+                    ctx.request_repaint();
+                };
+                let doc = match engine.open_lightweight(&path) {
+                    Ok(doc) => doc,
+                    Err(e) => return finish(Some(format!("{e:#}"))),
+                };
+                // Le moteur des figures est en pause pendant l'OCR approfondi : sa mémoire est rendue.
+                OcrRecognizer::release_shared();
+                let mut error = None;
+                loop {
+                    let page = {
+                        let mut p = shared.lock().unwrap_or_else(|e| e.into_inner());
+                        p.current = p.queue.pop_front();
+                        p.current
+                    };
+                    let Some(page) = page else {
+                        break;
+                    };
+                    loop {
+                        let state = lock(&shared);
+                        if state.cancelled || !state.paused {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(150));
+                    }
+                    let tab_closed = closed.lock().unwrap_or_else(|e| e.into_inner()).contains(&tab_id);
+                    if lock(&shared).cancelled || tab_closed {
+                        break;
+                    }
+                    let started = Instant::now();
+                    let native = doc.extract_single_page_text_layer(page);
+                    match crate::ocr_engine::recognize_full_page(&doc, page, &native) {
+                        Ok(segments) => {
+                            {
+                                let mut p = shared.lock().unwrap_or_else(|e| e.into_inner());
+                                p.done += 1;
+                                p.read += 1;
+                                p.busy += started.elapsed();
+                                p.current = None;
+                            }
+                            let _ = tx.send(WorkerEvent::DeepOcrPage { tab_id, page, segments });
+                            ctx.request_repaint();
+                        }
+                        Err(e) => {
+                            error = Some(e);
+                            break;
+                        }
+                    }
+                }
+                {
+                    let _lock = PdfEngine::lock_guard();
+                    drop(doc);
+                }
+                OcrRecognizer::release_full_page();
+                finish(error);
+            });
+        progress
+    }
+
+    /// Relit les annotations du fichier en tâche de fond (gros document).
+    pub fn load_annotations(&self, tab_id: u64, path: PathBuf, dims: Vec<PageDimensions>) {
+        let (tx, ctx) = (self.sender.clone(), self.ctx.clone());
+        let _ = std::thread::Builder::new()
+            .name("superpdf-annotations".into())
+            .spawn(move || {
+                if let Ok(items) = load_annotations_from_pdf(&path, &dims) {
+                    let _ = tx.send(WorkerEvent::AnnotationsLoaded { tab_id, items });
+                    ctx.request_repaint();
+                }
+            });
+    }
+
+    /// L'onglet est fermé : ses analyses de fond s'arrêtent.
+    pub fn tab_closed(&self, tab_id: u64) {
+        self.closed_tabs.lock().unwrap_or_else(|e| e.into_inner()).insert(tab_id);
+        self.forget_tab(tab_id);
     }
 
     /// Remplace les pages à rendre : les demandes devenues hors écran sont ainsi annulées d'elles-mêmes.
@@ -351,7 +595,12 @@ fn process_ocr_page(engine: &'static PdfEngine, job: &OcrJob) -> OcrPageOutcome 
         }
     };
     let native = doc.extract_single_page_text_layer(job.page);
-    let (images_found, images) = HybridOcrEngine::collect_images_to_scan(&doc, job.page, &native);
+    let (images_found, mut images) = HybridOcrEngine::collect_images_to_scan(&doc, job.page, &native);
+    // Page sans texte (scan, texte dessiné) : lire ses seules images n'a pas de sens, c'est le rôle
+    // de l'OCR approfondi, proposé pour ces documents.
+    if crate::ocr_engine::native_text_chars(&native) <= crate::ocr_engine::PAGE_WITHOUT_TEXT_MAX_CHARS {
+        images.clear();
+    }
     {
         let _lock = PdfEngine::lock_guard();
         drop(doc);
@@ -361,11 +610,38 @@ fn process_ocr_page(engine: &'static PdfEngine, job: &OcrJob) -> OcrPageOutcome 
     if !images.is_empty() {
         match OcrRecognizer::shared() {
             Ok(recognizer) => {
-                outcome.segments = HybridOcrEngine::recognize_images(recognizer, images, &native);
+                outcome.segments = HybridOcrEngine::recognize_images(&recognizer, images, &native);
             }
             Err(reason) => outcome.error = Some(reason.to_string()),
         }
     }
     outcome.native_layer = Some(native);
     outcome
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_deep_ocr_requested_pages_jump_the_queue() {
+        let mut progress = DeepOcrProgress {
+            queue: (0..10).collect(),
+            current: Some(42),
+            total: 11,
+            done: 1,
+            read: 1,
+            busy: Duration::ZERO,
+            paused: true,
+            cancelled: false,
+            finished: false,
+            error: None,
+        };
+        // Page 7 déjà prévue : déplacée en tête sans être comptée deux fois ; page 300 ajoutée ;
+        // la page en cours de lecture n'est pas relue.
+        progress.prioritize(&[300, 7, 42]);
+        assert_eq!(progress.queue.iter().take(3).copied().collect::<Vec<_>>(), vec![300, 7, 0]);
+        assert_eq!(progress.queue.len(), 11);
+        assert_eq!(progress.total, 12);
+    }
 }

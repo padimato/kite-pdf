@@ -5,12 +5,14 @@ use image::RgbImage;
 use lopdf::content::{Content, Operation};
 use lopdf::{dictionary, Document, Object, ObjectId, Stream};
 use oar_ocr::core::config::OrtSessionConfig;
+use oar_ocr::domain::tasks::TextDetectionConfig;
 use oar_ocr::prelude::{OAROCRBuilder, TextRegion, OAROCR};
+use oar_ocr::processors::LimitType;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 #[cfg(test)]
 use std::path::Path;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Mode de fonctionnement de l'ordonnanceur OCR Hybride à 3 vitesses
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -55,6 +57,10 @@ pub struct TabOcrState {
     pub in_flight_page: Option<usize>,
     /// Raison de l'indisponibilité de l'OCR (modèles absents...) : plus aucune page n'est soumise
     pub unavailable_reason: Option<String>,
+    /// Pages lues par l'OCR approfondi (page entière), ici ou lors d'un enregistrement précédent
+    pub deep_done: Vec<bool>,
+    /// Une lecture approfondie tourne sur ce document : l'OCR des images lui laisse la place
+    pub deep_running: bool,
 }
 
 impl Default for TabOcrState {
@@ -69,6 +75,8 @@ impl Default for TabOcrState {
             status_summary: "OCR Prêt (0 ms)".to_string(),
             in_flight_page: None,
             unavailable_reason: None,
+            deep_done: Vec::new(),
+            deep_running: false,
         }
     }
 }
@@ -77,6 +85,9 @@ impl TabOcrState {
     pub fn ensure_initialized(&mut self, page_count: usize) {
         if self.page_scanned.len() < page_count {
             self.page_scanned.resize(page_count, false);
+        }
+        if self.deep_done.len() < page_count {
+            self.deep_done.resize(page_count, false);
         }
     }
 
@@ -260,18 +271,52 @@ pub struct OcrRecognizer {
     pipeline: Mutex<OAROCR>,
 }
 
-static OCR_RECOGNIZER: OnceLock<Result<OcrRecognizer, String>> = OnceLock::new();
+/// Moteur chargé à la demande et libérable : ONNX Runtime garde la mémoire de ses plus gros calculs
+/// tant que le moteur existe (plus d'un gigaoctet mesuré pour l'OCR de pages entières).
+type RecognizerSlot = Mutex<Option<Result<Arc<OcrRecognizer>, String>>>;
+static OCR_RECOGNIZER: RecognizerSlot = Mutex::new(None);
+/// Variante pour les pages entières : la détection travaille sur une image bien plus grande.
+static OCR_FULL_PAGE_RECOGNIZER: RecognizerSlot = Mutex::new(None);
 
-/// Cherche `assets/models` dans le dossier courant puis autour de l'exécutable.
-fn locate_model_dir() -> Option<PathBuf> {
-    let mut candidates = vec![PathBuf::from("assets/models")];
-    if let Ok(exe) = std::env::current_exe() {
-        for ancestor in exe.ancestors().skip(1).take(4) {
-            candidates.push(ancestor.join("assets/models"));
-        }
+fn get_or_load(
+    slot: &RecognizerSlot,
+    load: impl FnOnce() -> std::result::Result<OcrRecognizer, String>,
+) -> std::result::Result<Arc<OcrRecognizer>, String> {
+    let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(loaded) = guard.as_ref() {
+        return loaded.clone();
     }
-    candidates
+    // Modèles absents : pas de mise en cache de l'échec, ils peuvent être en cours de téléchargement.
+    if locate_model_dir().is_none() {
+        return Err(OCR_MODELS_MISSING.to_string());
+    }
+    let loaded = load().map(Arc::new);
+    *guard = Some(loaded.clone());
+    loaded
+}
+
+fn release(slot: &RecognizerSlot) {
+    let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+    if matches!(guard.as_ref(), Some(Ok(_))) {
+        *guard = None;
+    }
+}
+static ORT_RUNTIME: OnceLock<Result<(), String>> = OnceLock::new();
+
+/// Plus grand côté, en pixels, d'une page rendue pour l'OCR approfondi (environ 175 dpi en A4) :
+/// un texte de 8 pt y fait une vingtaine de pixels de haut, assez pour être lu.
+/// Mesuré sur des pages denses : 1280 px ne fait pas gagner de temps (la reconnaissance ligne par
+/// ligne domine) et perd 1 % des mots.
+pub const FULL_PAGE_OCR_LONG_SIDE_PX: f32 = 2048.0;
+
+/// Raison affichée tant que les modèles OCR ne sont pas installés.
+pub const OCR_MODELS_MISSING: &str = "modèles OCR absents";
+
+/// Cherche `assets/models` autour de l'exécutable puis dans le dossier des dépendances de l'utilisateur.
+fn locate_model_dir() -> Option<PathBuf> {
+    crate::deps::search_roots()
         .into_iter()
+        .map(|root| root.join("assets/models"))
         .find(|dir| {
             [DET_MODEL_FILE, REC_MODEL_FILE, REC_DICT_FILE, LINE_ORI_MODEL_FILE, ONNX_RUNTIME_DLL]
                 .iter()
@@ -282,31 +327,73 @@ fn locate_model_dir() -> Option<PathBuf> {
 impl OcrRecognizer {
     /// Retourne le moteur partagé (chargé une seule fois), ou la raison pour laquelle il est indisponible.
     /// Le chargement prend plusieurs centaines de ms : ne jamais appeler depuis le thread de l'interface.
-    pub fn shared() -> std::result::Result<&'static OcrRecognizer, &'static str> {
-        OCR_RECOGNIZER
-            .get_or_init(Self::load)
-            .as_ref()
-            .map_err(|e| e.as_str())
+    pub fn shared() -> std::result::Result<Arc<OcrRecognizer>, String> {
+        get_or_load(&OCR_RECOGNIZER, Self::load)
+    }
+
+    /// Libère le moteur des figures (rechargé à la demande, en quelques centaines de ms).
+    pub fn release_shared() {
+        release(&OCR_RECOGNIZER);
+    }
+
+    /// Libère le moteur des pages entières à la fin d'un OCR approfondi.
+    pub fn release_full_page() {
+        release(&OCR_FULL_PAGE_RECOGNIZER);
+    }
+
+    /// Moteur réglé pour une page entière : la détection par défaut réduit l'image à 960 pixels de
+    /// côté, ce qui rend illisible le petit texte d'une page complète.
+    pub fn shared_full_page() -> std::result::Result<Arc<OcrRecognizer>, String> {
+        get_or_load(&OCR_FULL_PAGE_RECOGNIZER, || {
+                Self::load_with(Some(TextDetectionConfig {
+                    score_threshold: 0.3,
+                    box_threshold: 0.6,
+                    unclip_ratio: 2.0,
+                    max_candidates: 3000,
+                    limit_side_len: Some(FULL_PAGE_OCR_LONG_SIDE_PX as u32),
+                    limit_type: Some(LimitType::Max),
+                    max_side_len: Some(4000),
+                }))
+            })
     }
 
     fn load() -> std::result::Result<OcrRecognizer, String> {
+        Self::load_with(None)
+    }
+
+    fn load_with(detection: Option<TextDetectionConfig>) -> std::result::Result<OcrRecognizer, String> {
         let dir = locate_model_dir()
             .ok_or_else(|| "modèles absents de assets/models".to_string())?;
         // Chemin explicite : Windows 11 fournit une ancienne onnxruntime.dll dans System32.
-        let runtime = std::fs::canonicalize(dir.join(ONNX_RUNTIME_DLL))
-            .map_err(|e| format!("onnxruntime.dll illisible : {e}"))?;
-        ort::init_from(runtime.to_string_lossy().as_ref())
-            .map_err(|e| format!("onnxruntime.dll inutilisable : {e}"))?
-            .commit();
+        ORT_RUNTIME
+            .get_or_init(|| {
+                let runtime = std::fs::canonicalize(dir.join(ONNX_RUNTIME_DLL))
+                    .map_err(|e| format!("onnxruntime.dll illisible : {e}"))?;
+                ort::init_from(runtime.to_string_lossy().as_ref())
+                    .map_err(|e| format!("onnxruntime.dll inutilisable : {e}"))?
+                    .commit();
+                Ok(())
+            })
+            .clone()?;
         let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
-        let session = OrtSessionConfig::new().with_intra_threads(cores.saturating_sub(1).clamp(1, 4));
+        // Mesuré : plus de threads (hyper-threading) ou des lots de lignes plus gros ralentissent.
+        let threads = cores.saturating_sub(1).clamp(1, 4);
+        // Processeur uniquement. Mesuré avec DirectML sur une puce Intel Iris Xe : plus lent que le
+        // processeur (chaque ligne de texte a une taille d'image différente, DirectML recompile).
+        let session = OrtSessionConfig::new().with_intra_threads(threads);
         let pipeline = OAROCRBuilder::new(
             dir.join(DET_MODEL_FILE),
             dir.join(REC_MODEL_FILE),
             dir.join(REC_DICT_FILE),
         )
         .with_text_line_orientation_classification(dir.join(LINE_ORI_MODEL_FILE))
-        .ort_session(session)
+        // Position réelle de chaque caractère dans la ligne (colonnes du décodage CTC).
+        .return_word_box(true)
+        .ort_session(session);
+        let pipeline = match detection {
+            Some(config) => pipeline.text_detection_config(config),
+            None => pipeline,
+        }
         .build()
         .map_err(|e| format!("chargement OCR impossible : {e}"))?;
         Ok(OcrRecognizer {
@@ -392,6 +479,35 @@ fn segment_from_region(
         .find(|snap| (raw_angle - snap).abs() < 3.0)
         .unwrap_or(raw_angle);
 
+    // Ligne horizontale : chaque caractère est placé là où le modèle l'a lu. Une répartition selon
+    // une largeur moyenne par caractère dérive le long d'une longue ligne (copie décalée de plusieurs
+    // caractères mesurée sur un numéro de téléphone).
+    let char_count = text.chars().count();
+    let measured_boxes = region
+        .word_boxes
+        .as_ref()
+        .filter(|boxes| !is_tall && !is_flipped && angle_deg == 0.0 && boxes.len() == char_count);
+    if let Some(boxes) = measured_boxes {
+        let line_top = corners.iter().map(|c| c.1).fold(f32::MAX, f32::min);
+        let line_bottom = corners.iter().map(|c| c.1).fold(f32::MIN, f32::max);
+        let chars = text
+            .chars()
+            .zip(boxes)
+            .map(|(ch, b)| PositionedChar {
+                ch,
+                rect: PdfTopDownRect {
+                    x_min: rect_pt.x_min + b.x_min() * scale_x,
+                    y_min: rect_pt.y_min + line_top * scale_y,
+                    x_max: rect_pt.x_min + b.x_max() * scale_x,
+                    y_max: rect_pt.y_min + line_bottom * scale_y,
+                    angle_deg,
+                },
+                is_ocr: true,
+            })
+            .collect();
+        return Some(RecognizedOcrSegment { text: text.to_string(), angle_deg, chars });
+    }
+
     let total_weight: f32 = text.chars().map(char_advance_weight).sum();
     let mut advanced = 0.0_f32;
     let chars = text
@@ -428,6 +544,93 @@ fn segment_from_region(
         angle_deg,
         chars,
     })
+}
+
+/// Nombre de caractères de texte natif en dessous duquel une page est considérée sans texte
+/// (numéro de page, en-tête isolé...).
+pub const PAGE_WITHOUT_TEXT_MAX_CHARS: usize = 40;
+
+/// Caractères de texte natif (hors OCR et espaces) d'une couche de page.
+pub fn native_text_chars(layer: &PageTextLayer) -> usize {
+    layer.chars.iter().filter(|c| !c.is_ocr && !c.ch.is_whitespace()).count()
+}
+
+/// Part des caractères d'une ligne lue par l'OCR au-delà de laquelle, si le texte du fichier en
+/// contient autant au même endroit, la ligne est un doublon.
+const DUPLICATE_LINE_NATIVE_RATIO: f32 = 0.6;
+
+/// Écarte les lignes lues par l'OCR que le texte du fichier contient déjà au même endroit : relire
+/// une page qui a du texte ne doit pas le dupliquer. Une étiquette de figure identique à un mot du
+/// texte, mais placée ailleurs, est gardée.
+fn drop_lines_already_in_text(
+    segments: Vec<RecognizedOcrSegment>,
+    native: &PageTextLayer,
+) -> Vec<RecognizedOcrSegment> {
+    let native_chars: Vec<&PositionedChar> =
+        native.chars.iter().filter(|c| !c.is_ocr && !c.ch.is_whitespace()).collect();
+    if native_chars.is_empty() {
+        return segments;
+    }
+    segments
+        .into_iter()
+        .filter(|segment| {
+            let Some(first) = segment.chars.first() else {
+                return false;
+            };
+            let bounds = segment.chars.iter().fold(first.rect, |acc, c| acc.union(&c.rect));
+            let read = segment.chars.iter().filter(|c| !c.ch.is_whitespace()).count().max(1);
+            let already = native_chars
+                .iter()
+                .filter(|c| {
+                    let (cx, cy) = c.rect.center();
+                    bounds.contains_pt(cx, cy, 1.0)
+                })
+                .count();
+            (already as f32) < read as f32 * DUPLICATE_LINE_NATIVE_RATIO
+        })
+        .collect()
+}
+
+/// OCR approfondi : rend la page entière en image et la passe à la reconnaissance. Lit le texte
+/// dessiné en tracés vectoriels ou scanné, que l'OCR des images intégrées ne voit pas. Les lignes
+/// déjà présentes dans `native` (texte du fichier) sont écartées.
+pub fn recognize_full_page(
+    doc: &LoadedPdfDocument<'_>,
+    page_index: usize,
+    native: &PageTextLayer,
+) -> std::result::Result<Vec<RecognizedOcrSegment>, String> {
+    Ok(drop_lines_already_in_text(read_full_page(doc, page_index)?, native))
+}
+
+/// Toutes les lignes lues sur la page entière, doublons du texte du fichier compris.
+fn read_full_page(
+    doc: &LoadedPdfDocument<'_>,
+    page_index: usize,
+) -> std::result::Result<Vec<RecognizedOcrSegment>, String> {
+    let recognizer = OcrRecognizer::shared_full_page()?;
+    let dims = doc
+        .page_details(page_index)
+        .ok_or_else(|| format!("page {} illisible", page_index + 1))?
+        .dims;
+    let scale = FULL_PAGE_OCR_LONG_SIDE_PX / dims.width_pt.max(dims.height_pt).max(1.0);
+    let (w, h) = ((dims.width_pt * scale) as i32, (dims.height_pt * scale) as i32);
+    let rendered = doc.render_page(page_index, w, h).map_err(|e| format!("{e:#}"))?;
+    let [pw, ph] = rendered.size;
+    let mut rgb = RgbImage::new(pw as u32, ph as u32);
+    for (pixel, color) in rgb.pixels_mut().zip(&rendered.pixels) {
+        // Fond transparent éventuel ramené sur du blanc, comme à l'écran.
+        let a = color.a() as u32;
+        let blend = |c: u8| ((c as u32 * a + 255 * (255 - a)) / 255) as u8;
+        *pixel = image::Rgb([blend(color.r()), blend(color.g()), blend(color.b())]);
+    }
+    let rect = PdfTopDownRect {
+        x_min: 0.0,
+        y_min: 0.0,
+        x_max: dims.width_pt,
+        y_max: dims.height_pt,
+        angle_deg: 0.0,
+    };
+    Ok(recognizer.recognize_image(rgb, rect))
 }
 
 /// Moteur OCR hybride : ne traite que les images embarquées dépourvues de couche texte.
@@ -553,7 +756,7 @@ impl HybridOcrEngine {
         let Ok(recognizer) = OcrRecognizer::shared() else {
             return (total, Vec::new());
         };
-        let segments = Self::recognize_images(recognizer, images, existing_layer);
+        let segments = Self::recognize_images(&recognizer, images, existing_layer);
         Self::merge_segments_into_layer(existing_layer, &segments);
         (total, segments)
     }
@@ -1038,6 +1241,8 @@ pub fn append_invisible_ocr_layer_to_doc(
 /// Clé privée du dictionnaire `/Info` listant les pages déjà passées à l'OCR, avec ou sans texte trouvé.
 /// À la réouverture, ces pages ne sont pas rescannées : leur texte est déjà dans le fichier.
 pub const OCR_SCANNED_PAGES_INFO_KEY: &str = "SuperPdfOcrPages";
+/// Clé privée du dictionnaire `/Info` listant les pages lues par l'OCR approfondi (même format).
+pub const OCR_DEEP_PAGES_INFO_KEY: &str = "SuperPdfDeepOcrPages";
 
 /// Encode les pages scannées sous la forme « nombre de pages:plages », par exemple `23:1-5,7,9-23`.
 /// Le nombre de pages permet d'ignorer un marqueur devenu faux (pages ajoutées ou retirées ailleurs).
@@ -1282,6 +1487,81 @@ mod tests {
             .find(|m| m.is_ocr)
             .expect("Ctrl+F doit trouver l'occurrence OCR dans le graphique JPG");
         assert!((ocr_match.angle_deg - 30.0).abs() < 12.0);
+    }
+
+    #[test]
+    fn test_deep_ocr_places_characters_where_they_are_printed() {
+        if OcrRecognizer::shared_full_page().is_err() {
+            eprintln!("Modèles OCR absents : test ignoré");
+            return;
+        }
+        // Page avec du vrai texte : chaque caractère lu par l'OCR est comparé au même caractère du
+        // texte du fichier, sur la même ligne. Une copie après OCR doit prendre ce qui est surligné.
+        let path = PathBuf::from("test_pdfs/unit_test_ocr_positions.pdf");
+        ensure_hybrid_word_jpg_pdf(&path).expect("Doit générer le PDF");
+        let doc = PdfEngine::instance().load_document(&path).expect("Doit charger");
+        let native = doc.extract_single_page_text_layer(0);
+        let segments = read_full_page(&doc, 0).expect("Doit lire la page");
+        let mut offsets: Vec<f32> = Vec::new();
+        for segment in segments.iter().filter(|s| s.angle_deg == 0.0 && s.text.chars().count() > 20) {
+            for c in segment.chars.iter().filter(|c| c.ch.is_ascii_alphanumeric()) {
+                let (cx, cy) = c.rect.center();
+                let nearest = native
+                    .chars
+                    .iter()
+                    .filter(|n| n.ch == c.ch && (n.rect.center().1 - cy).abs() < 3.0)
+                    .map(|n| (n.rect.center().0 - cx).abs())
+                    .fold(f32::MAX, f32::min);
+                if nearest < 50.0 {
+                    offsets.push(nearest);
+                }
+            }
+        }
+        offsets.sort_by(f32::total_cmp);
+        assert!(offsets.len() > 200, "trop peu de caractères comparés : {}", offsets.len());
+        let median = offsets[offsets.len() / 2];
+        let p90 = offsets[offsets.len() * 9 / 10];
+        eprintln!("écart OCR / texte : médiane {median:.2} pt, 90 % sous {p90:.2} pt ({} car.)", offsets.len());
+        assert!(median < 1.0 && p90 < 2.5, "médiane {median:.2} pt, 90 % {p90:.2} pt");
+    }
+
+    #[test]
+    fn test_deep_ocr_reads_whole_page_and_survives_save() {
+        if OcrRecognizer::shared_full_page().is_err() {
+            eprintln!("Modèles OCR absents : test ignoré");
+            return;
+        }
+        use crate::annotations::save_pdf_with_ocr_state;
+        let src_path = PathBuf::from("test_pdfs/unit_test_deep_ocr_src.pdf");
+        let saved_path = PathBuf::from("test_pdfs/unit_test_deep_ocr_saved.pdf");
+        let _ = std::fs::remove_file(&saved_path);
+        ensure_hybrid_word_jpg_pdf(&src_path).expect("Doit générer le PDF source");
+        let engine = PdfEngine::instance();
+        let doc = engine.load_document(&src_path).expect("Doit charger");
+        let dims = doc.page_dimensions.clone();
+
+        // La page entière est lue, y compris le texte dessiné dans le graphique, mais le texte
+        // Word déjà présent dans le fichier n'est pas relu en double.
+        let native = doc.extract_single_page_text_layer(0);
+        let segments = recognize_full_page(&doc, 0, &native).expect("Doit lire la page");
+        let read: String = segments.iter().map(|s| s.text.as_str()).collect::<Vec<_>>().join(" ");
+        assert!(read.to_uppercase().contains("COUPLE"), "texte lu : {read}");
+        assert!(!read.contains("Contexte du document"), "texte Word lu en double : {read}");
+
+        // Comme l'application : la page lue remplace l'OCR des images, puis on enregistre.
+        let mut layer = PageTextLayer::new(0, Vec::new());
+        HybridOcrEngine::merge_segments_into_layer(&mut layer, &segments);
+        drop(doc);
+        save_pdf_with_ocr_state(&src_path, &saved_path, &[], &[layer], &dims, &[true], &[true])
+            .expect("Doit enregistrer");
+
+        // Réouverture : le texte fait partie du fichier et la page est marquée comme lue.
+        let reloaded = engine.load_document(&saved_path).expect("Doit recharger");
+        assert_eq!(reloaded.deep_ocr_pages, vec![true]);
+        let mut search = SearchBarState::default();
+        search.query = "COUPLE".to_string();
+        search.execute_search(&[reloaded.extract_single_page_text_layer(0)]);
+        assert!(!search.matches.is_empty(), "le texte OCR doit être cherchable après réouverture");
     }
 
     #[test]

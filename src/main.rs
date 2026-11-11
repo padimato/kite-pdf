@@ -1,4 +1,7 @@
 mod annotations;
+mod bench;
+mod deps;
+mod setup;
 mod app;
 mod memory_manager;
 mod ocr_engine;
@@ -14,10 +17,19 @@ use std::path::PathBuf;
 use tabs::ActiveTool;
 use text_search::PdfTopDownRect;
 
+/// Variable d'environnement qui active les options de test (`--screenshot`, `--page`...) dans une
+/// compilation optimisée. Une compilation de développement les accepte toujours.
+const QA_ENV: &str = "SUPERPDF_QA";
+
 fn parse_args() -> AutomationConfig {
     let mut cfg = AutomationConfig::default();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // Version distribuée : seul le chemin du PDF à ouvrir est lu (« Ouvrir avec », double-clic).
+    if !cfg!(debug_assertions) && std::env::var_os(QA_ENV).is_none() {
+        cfg.initial_pdf = args.iter().find(|a| !a.starts_with("--")).map(PathBuf::from);
+        return cfg;
+    }
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -145,6 +157,12 @@ fn parse_args() -> AutomationConfig {
             "--ocr-turbo" => {
                 cfg.ocr_turbo = true;
             }
+            "--deep-ocr-dialog" => {
+                cfg.deep_ocr_dialog = true;
+            }
+            "--deep-ocr-all" => {
+                cfg.deep_ocr_all = true;
+            }
             "--save-annotated" => {
                 if let Some(out_path) = args.get(i + 1) {
                     cfg.save_annotated_output = Some(PathBuf::from(out_path));
@@ -189,8 +207,54 @@ fn install_crash_log() {
     }));
 }
 
+/// Écran d'installation tant que PDFium manque, puis l'application elle-même.
+enum Root {
+    Setup { screen: setup::SetupScreen, cfg: Option<AutomationConfig> },
+    Ready(Box<SuperPdfApp>),
+}
+
+impl eframe::App for Root {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        match self {
+            Root::Setup { screen, cfg } => {
+                screen.show(ctx);
+                if screen.ready() {
+                    let cfg = cfg.take().unwrap_or_default();
+                    *self = Root::Ready(Box::new(SuperPdfApp::new(ctx, cfg)));
+                    ctx.request_repaint();
+                }
+            }
+            Root::Ready(app) => app.update(ctx, frame),
+        }
+    }
+}
+
+/// Instant du lancement du processus (mesure du temps jusqu'à la première page affichée).
+pub static PROCESS_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
 fn main() -> eframe::Result<()> {
+    PROCESS_START.get_or_init(std::time::Instant::now);
     install_crash_log();
+
+    // `--fetch-deps [dossier]` : installe PDFium et l'OCR (dossier courant par défaut) puis quitte.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(pos) = args.iter().position(|a| a == "--fetch-deps") {
+        let root = args
+            .get(pos + 1)
+            .filter(|a| !a.starts_with("--"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        std::process::exit(deps::fetch_missing_cli(&root));
+    }
+
+    if let Some(pos) = args.iter().position(|a| a == "--bench") {
+        let Some(pdf) = args.get(pos + 1) else {
+            eprintln!("Usage : super_pdf_reader --bench <fichier.pdf>");
+            std::process::exit(2);
+        };
+        std::process::exit(bench::run(std::path::Path::new(pdf)));
+    }
+
     let cfg = parse_args();
 
     let mut viewport = egui::ViewportBuilder::default()
@@ -211,6 +275,16 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Super Lecteur PDF",
         native_options,
-        Box::new(move |cc| Ok(Box::new(SuperPdfApp::new(cc, cfg)))),
+        Box::new(move |cc| {
+            let pdfium_installed = deps::by_file_name("pdfium.dll")
+                .and_then(|d| deps::locate(&d))
+                .is_some();
+            let root = if pdfium_installed {
+                Root::Ready(Box::new(SuperPdfApp::new(&cc.egui_ctx, cfg)))
+            } else {
+                Root::Setup { screen: setup::SetupScreen::new(&cc.egui_ctx), cfg: Some(cfg) }
+            };
+            Ok(Box::new(root))
+        }),
     )
 }

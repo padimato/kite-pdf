@@ -1,4 +1,4 @@
-use crate::ocr_engine::{format_ocr_scanned_pages, OCR_SCANNED_PAGES_INFO_KEY};
+use crate::ocr_engine::{format_ocr_scanned_pages, OCR_DEEP_PAGES_INFO_KEY, OCR_SCANNED_PAGES_INFO_KEY};
 use crate::ocr_engine::{append_invisible_ocr_layer_to_doc, encode_win_ansi};
 use crate::pdf_engine::PageDimensions;
 use crate::text_search::{PageTextLayer, PdfTopDownRect};
@@ -755,6 +755,23 @@ impl AnnotationManager {
     }
 
     /// Annotations relues du fichier : elles ne font pas partie de l'historique d'annulation.
+    /// Ajoute les annotations relues du fichier en tâche de fond, devant celles que l'utilisateur
+    /// a pu créer entre-temps (nouveaux identifiants pour éviter tout doublon).
+    pub fn merge_loaded(&mut self, loaded: Vec<PdfAnnotation>) {
+        if self.items.is_empty() {
+            self.load_items(loaded);
+            return;
+        }
+        let renumbered: Vec<PdfAnnotation> = loaded
+            .into_iter()
+            .map(|mut item| {
+                item.id = self.alloc_id();
+                item
+            })
+            .collect();
+        self.items.splice(0..0, renumbered);
+    }
+
     pub fn load_items(&mut self, items: Vec<PdfAnnotation>) {
         self.next_id = items.iter().map(|a| a.id + 1).max().unwrap_or(1).max(self.next_id);
         self.items = items;
@@ -1002,11 +1019,12 @@ pub fn save_annotations_and_ocr_to_pdf(
     text_layers: &[PageTextLayer],
     page_dimensions: &[PageDimensions],
 ) -> Result<()> {
-    save_pdf_with_ocr_state(source_path, dest_path, annotations, text_layers, page_dimensions, &[])
+    save_pdf_with_ocr_state(source_path, dest_path, annotations, text_layers, page_dimensions, &[], &[])
 }
 
 /// Comme [`save_annotations_and_ocr_to_pdf`], en notant en plus dans le fichier les pages déjà
-/// passées à l'OCR (`ocr_scanned_pages`, vide pour laisser le marqueur existant tel quel).
+/// passées à l'OCR (`ocr_scanned_pages`) et à l'OCR approfondi (`deep_ocr_pages`). Une liste vide
+/// laisse le marqueur existant tel quel.
 pub fn save_pdf_with_ocr_state(
     source_path: &Path,
     dest_path: &Path,
@@ -1014,6 +1032,7 @@ pub fn save_pdf_with_ocr_state(
     text_layers: &[PageTextLayer],
     page_dimensions: &[PageDimensions],
     ocr_scanned_pages: &[bool],
+    deep_ocr_pages: &[bool],
 ) -> Result<()> {
     let mut doc = Document::load(source_path).with_context(|| {
         format!(
@@ -1108,7 +1127,10 @@ pub fn save_pdf_with_ocr_state(
         let _ = append_invisible_ocr_layer_to_doc(&mut doc, &pages_map, text_layers, page_dimensions);
     }
     if ocr_scanned_pages.iter().any(|&s| s) {
-        record_ocr_scanned_pages(&mut doc, ocr_scanned_pages);
+        record_ocr_pages(&mut doc, OCR_SCANNED_PAGES_INFO_KEY, ocr_scanned_pages);
+    }
+    if deep_ocr_pages.iter().any(|&s| s) {
+        record_ocr_pages(&mut doc, OCR_DEEP_PAGES_INFO_KEY, deep_ocr_pages);
     }
 
     // Écriture dans un fichier voisin puis remplacement atomique : une panne en cours d'écriture
@@ -1131,8 +1153,9 @@ pub fn save_pdf_with_ocr_state(
     Ok(())
 }
 
-/// Note dans le dictionnaire `/Info` les pages déjà passées à l'OCR (clé privée, ignorée des autres lecteurs).
-fn record_ocr_scanned_pages(doc: &mut Document, scanned: &[bool]) {
+/// Note dans le dictionnaire `/Info` une liste de pages traitées par l'OCR (clé privée, ignorée des
+/// autres lecteurs).
+fn record_ocr_pages(doc: &mut Document, key: &str, scanned: &[bool]) {
     let value = Object::string_literal(format_ocr_scanned_pages(scanned));
     let info_ref = match doc.trailer.get(b"Info") {
         Ok(Object::Reference(id)) => Some(*id),
@@ -1140,15 +1163,17 @@ fn record_ocr_scanned_pages(doc: &mut Document, scanned: &[bool]) {
     };
     if let Some(id) = info_ref {
         if let Ok(info) = doc.get_object_mut(id).and_then(Object::as_dict_mut) {
-            info.set(OCR_SCANNED_PAGES_INFO_KEY, value);
+            info.set(key, value);
             return;
         }
     }
     if let Ok(Object::Dictionary(info)) = doc.trailer.get_mut(b"Info") {
-        info.set(OCR_SCANNED_PAGES_INFO_KEY, value);
+        info.set(key, value);
         return;
     }
-    let id = doc.add_object(dictionary! { OCR_SCANNED_PAGES_INFO_KEY => value });
+    let mut info = lopdf::Dictionary::new();
+    info.set(key, value);
+    let id = doc.add_object(info);
     doc.trailer.set("Info", Object::Reference(id));
 }
 
@@ -2600,8 +2625,10 @@ mod tests {
         assert!(engine.load_document(&src).unwrap().ocr_scanned_pages.iter().all(|s| !s));
 
         let scanned = vec![true, false, true, true, true];
-        save_pdf_with_ocr_state(&src, &dst, &[], &[], &dims, &scanned).expect("Doit enregistrer");
+        let deep = vec![false, false, true, false, false];
+        save_pdf_with_ocr_state(&src, &dst, &[], &[], &dims, &scanned, &deep).expect("Doit enregistrer");
         assert_eq!(engine.load_document(&dst).unwrap().ocr_scanned_pages, scanned);
+        assert_eq!(engine.load_document(&dst).unwrap().deep_ocr_pages, deep);
 
         // Un enregistrement sans état OCR garde le marqueur du fichier.
         save_annotations_and_ocr_to_pdf(&dst, &dst, &[], &[], &dims).expect("Doit enregistrer");

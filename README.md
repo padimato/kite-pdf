@@ -36,22 +36,23 @@ cd super-lecteur-pdf
 cargo build --release
 ```
 
-Les bibliothèques natives et les modèles OCR ne sont pas dans le dépôt. Placez-les ainsi :
+Les bibliothèques natives et les modèles OCR ne sont pas dans le dépôt : ils sont téléchargés depuis leur source officielle, dans la version listée dans [`deps.toml`](deps.toml) (adresse, version et empreinte SHA-256 de chaque fichier).
 
-```
-super-lecteur-pdf/
-├── pdfium.dll                       (à côté de l'exécutable ou à la racine)
-└── assets/models/
-    ├── onnxruntime.dll
-    ├── pp-ocrv5_mobile_det.onnx
-    ├── latin_pp-ocrv5_mobile_rec.onnx
-    ├── ppocrv5_latin_dict.txt
-    └── pp-lcnet_x0_25_textline_ori.onnx
+```bash
+cargo run --release -- --fetch-deps
 ```
 
-- **`pdfium.dll`** : archive `pdfium-win-x64` des [binaires PDFium de bblanchon](https://github.com/bblanchon/pdfium-binaries/releases) (fichier `bin/pdfium.dll`).
-- **`onnxruntime.dll`** : archive `onnxruntime-win-x64` des [versions d'ONNX Runtime](https://github.com/microsoft/onnxruntime/releases) (1.28 testée).
-- **Modèles OCR** : modèles PaddleOCR PP-OCRv5 au format ONNX (détection, reconnaissance latine et son dictionnaire, orientation des lignes), tels que distribués pour la bibliothèque [`oar-ocr`](https://crates.io/crates/oar-ocr).
+Cette commande installe dans le dossier courant les fichiers manquants :
+
+| Fichier | Source |
+|---|---|
+| `pdfium.dll` | [binaires PDFium de bblanchon](https://github.com/bblanchon/pdfium-binaries/releases) |
+| `assets/models/onnxruntime.dll` | [ONNX Runtime, Microsoft](https://github.com/microsoft/onnxruntime/releases) |
+| `assets/models/*.onnx`, `ppocrv5_latin_dict.txt` | modèles PaddleOCR PP-OCRv5 au format ONNX, [publiés par oar-ocr](https://github.com/GreatV/oar-ocr/releases/tag/v0.3.0) |
+
+Sans cette étape, l'application télécharge elle-même ces fichiers au premier lancement, dans `%LOCALAPPDATA%\SuperLecteurPDF\deps` : l'écran d'installation attend PDFium, l'OCR peut être installé plus tard. La variable d'environnement `SUPERPDF_DEPS_DIR` désigne un autre dossier (installation portable).
+
+**Autre version** : un fichier différent de la version testée est accepté. L'application affiche alors un avertissement qui indique la version testée et où la télécharger, en cas de problème. Pour adopter une nouvelle version, mettez à jour `deps.toml` puis lancez `cargo test`.
 
 Sans les modèles, l'application fonctionne normalement ; seul l'OCR est désactivé.
 
@@ -69,7 +70,17 @@ Sans argument, l'application s'ouvre sur la barre centrale et propose les PDF r�
 cargo test
 ```
 
-Les tests créent leurs PDF dans `test_pdfs/` (ignoré par git). Les tests OCR demandent les modèles ci-dessus.
+Les tests créent leurs PDF dans `test_pdfs/` (ignoré par git). Les tests OCR demandent les dépendances ci-dessus (`--fetch-deps`).
+
+## Outils de développement
+
+| Commande ou variable | Rôle |
+|---|---|
+| `--fetch-deps [dossier]` | Installe PDFium et l'OCR (voir plus haut) |
+| `--bench fichier.pdf` | Mesure le temps de chaque étape : ouverture, rendu, texte, OCR (à lancer en `--release`) |
+| `SUPERPDF_TIMING=1` | Affiche le temps entre le lancement et la première page affichée |
+| `SUPERPDF_DEPS_DIR` | Dossier des dépendances (installation portable, essais) |
+| `SUPERPDF_QA=1` | Active dans une compilation `--release` les options de test (`--screenshot`, `--page`, `--search`…), toujours actives en compilation de développement |
 
 ## Licence
 

@@ -18,6 +18,14 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 oar-ocr = { version = "0.10.2", default-features = false, features = ["simd"] }
 # ONNX Runtime est chargé depuis assets/models/onnxruntime.dll (pas de liaison statique, indépendant de la version de MSVC).
 ort = { version = "=2.0.0-rc.13", default-features = false, features = ["load-dynamic"] }
+# Téléchargement des dépendances natives (deps.toml) depuis leur source officielle.
+ureq = "2"
+sha2 = "0.10"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+flate2 = "1"
+tar = "0.4"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 
 # Le code applicatif reste débogable, mais les dépendances (image, egui, ONNX) sont optimisées même en debug.
 [profile.dev]

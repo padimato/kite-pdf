@@ -149,6 +149,13 @@ pub struct DocumentTab {
     pub badge_color: Color32,
     /// Faux si le PDF contient un formulaire : ses champs n'apparaîtraient pas dans les tuiles
     pub supports_tiled_rendering: bool,
+    /// Pour chaque page : rotation et zone visible exactes (gros documents : lues en tâche de fond)
+    pub page_details_known: Vec<bool>,
+    /// Analyse de fond : une page contient des champs de formulaire / des annotations à reprendre
+    pub found_form_widgets: bool,
+    /// Pour chaque page : sa couche de texte native a été extraite (même vide)
+    pub text_received: Vec<bool>,
+    pub found_app_annotations: bool,
 }
 
 impl DocumentTab {
@@ -168,11 +175,15 @@ impl DocumentTab {
         }
         let supports_tiled_rendering = !doc.has_form_fields();
         let page_count = page_dimensions.len();
+        let page_details_known = vec![doc.page_details_complete; page_count];
         let mut ocr = TabOcrState::default();
         ocr.ensure_initialized(page_count);
         // Pages scannées lors d'un enregistrement précédent : leur texte est déjà dans le fichier.
         for (scanned, already) in ocr.page_scanned.iter_mut().zip(&doc.ocr_scanned_pages) {
             *scanned |= *already;
+        }
+        for (done, already) in ocr.deep_done.iter_mut().zip(&doc.deep_ocr_pages) {
+            *done |= *already;
         }
         Self {
             id,
@@ -189,11 +200,104 @@ impl DocumentTab {
             is_modified: false,
             badge_color,
             supports_tiled_rendering,
+            page_details_known,
+            text_received: vec![false; page_count],
+            found_form_widgets: false,
+            found_app_annotations: false,
         }
+    }
+
+    /// Toutes les pages ont été lues en détail.
+    pub fn page_details_complete(&self) -> bool {
+        self.page_details_known.iter().all(|&k| k)
+    }
+
+    /// Intègre les détails de pages lus en tâche de fond.
+    pub fn apply_page_details(&mut self, pages: Vec<(usize, crate::pdf_engine::PageDetails)>) {
+        for (page, details) in pages {
+            if let Some(dims) = self.page_dimensions.get_mut(page) {
+                *dims = details.dims;
+                self.page_details_known[page] = true;
+            }
+            self.found_form_widgets |= details.has_form_widgets;
+            self.found_app_annotations |= details.has_app_drawn_annotations;
+        }
+    }
+
+    /// Avant un enregistrement : rotation et zone visible exactes pour les pages qui portent des
+    /// annotations ou du texte OCR, sans attendre l'analyse de fond.
+    pub fn ensure_details_for_saved_pages(&mut self, engine: &'static PdfEngine) {
+        let mut pages: Vec<usize> = self.annotations.items.iter().map(|a| a.page_index).collect();
+        pages.extend(
+            self.text_layers
+                .iter()
+                .filter(|l| l.chars.iter().any(|c| c.is_ocr))
+                .map(|l| l.page_index),
+        );
+        pages.sort_unstable();
+        pages.dedup();
+        pages.retain(|&p| !self.page_details_known.get(p).copied().unwrap_or(true));
+        if pages.is_empty() || self.ensure_awake(engine).is_err() {
+            return;
+        }
+        let Some(doc) = &self.document else { return };
+        let details: Vec<_> = pages.iter().filter_map(|&p| doc.page_details(p).map(|d| (p, d))).collect();
+        self.apply_page_details(details);
     }
 
     pub fn page_count(&self) -> usize {
         self.page_dimensions.len()
+    }
+
+    /// La page n'a (presque) pas de texte et n'a pas encore été lue par l'OCR approfondi.
+    /// `None` tant que son texte n'a pas été extrait.
+    pub fn page_lacks_text(&self, page: usize) -> Option<bool> {
+        if !self.text_received.get(page).copied().unwrap_or(false) {
+            return None;
+        }
+        let layer = self.text_layers.get(page)?;
+        Some(
+            !self.ocr.deep_done.get(page).copied().unwrap_or(false)
+                && crate::ocr_engine::native_text_chars(layer)
+                    <= crate::ocr_engine::PAGE_WITHOUT_TEXT_MAX_CHARS,
+        )
+    }
+
+    /// Pages analysées et pages sans texte parmi elles.
+    pub fn text_coverage(&self) -> (usize, usize) {
+        let analysed = self.text_received.iter().filter(|&&r| r).count();
+        let lacking = (0..self.page_count()).filter(|&p| self.page_lacks_text(p) == Some(true)).count();
+        (analysed, lacking)
+    }
+
+    /// Pages que l'OCR approfondi n'a pas encore relues. Il traite tout le document : du texte peut
+    /// être dessiné dans une figure d'une page qui a par ailleurs du texte normal.
+    pub fn deep_ocr_pending_pages(&self, range: std::ops::RangeInclusive<usize>) -> Vec<usize> {
+        range
+            .filter(|&p| p < self.page_count())
+            .filter(|&p| !self.ocr.deep_done.get(p).copied().unwrap_or(false))
+            .collect()
+    }
+
+    /// Intègre une page lue par l'OCR approfondi : son texte remplace celui de l'OCR des images.
+    pub fn apply_deep_ocr_page(&mut self, page: usize, segments: Vec<crate::ocr_engine::RecognizedOcrSegment>) {
+        self.ensure_text_slots();
+        self.ocr.ensure_initialized(self.page_count());
+        if page >= self.page_count() {
+            return;
+        }
+        self.ocr.deep_done[page] = true;
+        self.ocr.page_scanned[page] = true;
+        if segments.is_empty() {
+            return;
+        }
+        let layer = &mut self.text_layers[page];
+        layer.chars.retain(|c| !c.is_ocr);
+        HybridOcrEngine::merge_segments_into_layer(layer, &segments);
+        self.ocr.recognized_ocr_chars_count += segments.iter().map(|s| s.chars.len()).sum::<usize>();
+        self.ocr.recognized_segments_count += segments.len();
+        self.ocr.has_unsaved_ocr = true;
+        self.is_modified = true;
     }
 
     /// Après un enregistrement : le texte OCR est désormais une couche du fichier, comme du texte natif.
@@ -343,6 +447,9 @@ impl DocumentTab {
     /// Intègre une couche de texte reçue du thread d'arrière-plan.
     pub fn apply_text_layer(&mut self, layer: PageTextLayer) {
         self.ensure_text_slots();
+        if let Some(received) = self.text_received.get_mut(layer.page_index) {
+            *received = true;
+        }
         if let Some(slot) = self.text_layers.get_mut(layer.page_index) {
             if slot.chars.is_empty() {
                 *slot = layer;
@@ -374,6 +481,9 @@ impl DocumentTab {
         if self.ocr.mode == OcrSpeedMode::InstantOpen {
             self.ocr.mode = OcrSpeedMode::EcoBackground;
         }
+        if self.ocr.deep_running {
+            return;
+        }
         let submitted = workers.submit_ocr(OcrJob {
             tab_id: self.id,
             path: self.path.clone(),
@@ -402,6 +512,9 @@ impl DocumentTab {
 
         let mut changed = false;
         if let Some(native) = outcome.native_layer {
+            if let Some(received) = self.text_received.get_mut(page) {
+                *received = true;
+            }
             if self.text_layers[page].chars.is_empty() {
                 changed = !native.chars.is_empty();
                 self.text_layers[page] = native;
@@ -411,7 +524,8 @@ impl DocumentTab {
         self.ocr.page_scanned[page] = true;
         self.ocr.detected_images_count += outcome.images_found;
 
-        if !outcome.segments.is_empty() {
+        // Page déjà lue en entier par l'OCR approfondi : la lecture des seules images ferait doublon.
+        if !outcome.segments.is_empty() && !self.ocr.deep_done[page] {
             HybridOcrEngine::merge_segments_into_layer(&mut self.text_layers[page], &outcome.segments);
             self.ocr.recognized_ocr_chars_count +=
                 outcome.segments.iter().map(|s| s.chars.len()).sum::<usize>();
@@ -450,6 +564,9 @@ impl DocumentTab {
         let _ = self.ensure_awake(engine);
         if let Some(doc) = &self.document {
             self.text_layers[page_index] = doc.extract_single_page_text_layer(page_index);
+            if let Some(received) = self.text_received.get_mut(page_index) {
+                *received = true;
+            }
         }
     }
 
@@ -490,7 +607,11 @@ impl DocumentTab {
     pub fn ensure_awake(&mut self, engine: &'static PdfEngine) -> Result<()> {
         if self.document.is_none() {
             let doc = engine.load_document(&self.path)?;
-            self.page_dimensions = doc.page_dimensions.clone();
+            // Un gros document rouvert n'a que des tailles : garder les détails déjà lus.
+            if doc.page_details_complete || doc.page_dimensions.len() != self.page_dimensions.len() {
+                self.page_dimensions = doc.page_dimensions.clone();
+                self.page_details_known = vec![doc.page_details_complete; doc.page_dimensions.len()];
+            }
             self.document = Some(doc);
         }
         Ok(())
@@ -506,8 +627,8 @@ pub enum PaletteCommand {
     ToggleSidebarPin,
     OpenFileDialog,
     OpenSearch,
+    OpenDeepOcrDialog,
     SaveAnnotatedPdf,
-    RunHybridOcrTurbo,
     HibernateInactiveTabs,
     UndoAnnotation,
     RedoAnnotation,
@@ -518,6 +639,87 @@ pub enum PaletteCommand {
     FitToPage,
     ZoomReset100,
     JumpToPage(usize),
+    /// Zoom en pourcent
+    SetZoomPercent(u32),
+}
+
+/// Bornes du zoom proposé par la barre centrale pour un nombre tapé seul.
+pub const PALETTE_ZOOM_RANGE: std::ops::RangeInclusive<u32> = 10..=3200;
+/// Nombre de choix récents (page ou zoom) qui décident lequel des deux est proposé en premier.
+const NUMBER_HISTORY_LEN: usize = 5;
+
+/// Ce qu'un nombre tapé seul dans la barre centrale a servi à faire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NumberChoice {
+    Page,
+    Zoom,
+}
+
+/// Les derniers choix faits pour un nombre tapé seul, gardés entre deux lancements :
+/// le choix le plus fréquent est proposé en premier (Entrée suffit).
+#[derive(Debug, Clone, Default)]
+pub struct NumberHistory {
+    recent: std::collections::VecDeque<NumberChoice>,
+    storage: Option<PathBuf>,
+}
+
+impl NumberHistory {
+    pub fn load_default() -> Self {
+        let storage = std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join("SuperLecteurPDF")
+            .join("palette_numbers.txt");
+        let recent = std::fs::read_to_string(&storage)
+            .map(|text| {
+                text.lines()
+                    .filter_map(|l| match l.trim() {
+                        "page" => Some(NumberChoice::Page),
+                        "zoom" => Some(NumberChoice::Zoom),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self { recent, storage: Some(storage) }
+    }
+
+    pub fn prefers_zoom(&self) -> bool {
+        let zoom = self.recent.iter().filter(|&&c| c == NumberChoice::Zoom).count();
+        zoom * 2 > self.recent.len()
+    }
+
+    pub fn record(&mut self, choice: NumberChoice) {
+        self.recent.push_back(choice);
+        while self.recent.len() > NUMBER_HISTORY_LEN {
+            self.recent.pop_front();
+        }
+        if let Some(storage) = &self.storage {
+            let text: Vec<&str> = self
+                .recent
+                .iter()
+                .map(|c| if *c == NumberChoice::Zoom { "zoom" } else { "page" })
+                .collect();
+            if let Some(dir) = storage.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let _ = std::fs::write(storage, text.join("\n"));
+        }
+    }
+}
+
+/// Nombre tapé seul (« 125 ») : peut être une page ou un zoom.
+pub fn bare_number(normalized_query: &str) -> Option<u32> {
+    normalized_query.parse::<u32>().ok()
+}
+
+/// « 125 % », « zoom 125 » → 125.
+fn parse_zoom_request(raw_query: &str, normalized_query: &str) -> Option<u32> {
+    let raw = raw_query.trim();
+    if let Some(number) = raw.strip_suffix('%') {
+        return number.trim().parse().ok();
+    }
+    normalized_query.strip_prefix("zoom")?.trim().parse().ok()
 }
 
 #[derive(Debug, Clone)]
@@ -575,34 +777,34 @@ impl ActionSpec {
 
 fn tool_keywords(tool: ActiveTool) -> (&'static str, &'static str) {
     match tool {
-        ActiveTool::Select => ("Sélectionner et copier du texte, déplacer une annotation", "selection selectionner curseur copier texte souris"),
-        ActiveTool::Pan => ("Faire défiler le document à la main", "main deplacer glisser defiler pan naviguer"),
-        ActiveTool::Highlight => ("Surligner un passage du texte", "surligner surligneur stabilo highlight marquer fluo souligner"),
-        ActiveTool::FreeText => ("Écrire une zone de texte sur la page", "texte ecrire taper zone saisie machine a ecrire"),
-        ActiveTool::Ink => ("Dessiner à main levée", "dessin dessiner crayon stylo main levee gribouiller signer"),
-        ActiveTool::Shape => ("Tracer une flèche ou un rectangle", "fleche rectangle forme cadre encadrer pointer"),
-        ActiveTool::StickyNote => ("Ajouter un commentaire (note) sur la page", "commentaire commenter comment note bulle annoter remarque post it memo"),
-        ActiveTool::Measure => ("Mesurer une distance sur la page", "mesure mesurer regle distance longueur"),
+        ActiveTool::Select => ("Sélectionner et copier du texte, déplacer une annotation", "selection selectionner copier"),
+        ActiveTool::Pan => ("Faire défiler le document à la main", "main deplacer"),
+        ActiveTool::Highlight => ("Surligner un passage du texte", "surligner surlignage"),
+        ActiveTool::FreeText => ("Écrire une zone de texte sur la page", "texte ecrire"),
+        ActiveTool::Ink => ("Dessiner à main levée", "dessin dessiner"),
+        ActiveTool::Shape => ("Tracer une flèche ou un rectangle", "fleche rectangle"),
+        ActiveTool::StickyNote => ("Ajouter un commentaire (note) sur la page", "commentaire note"),
+        ActiveTool::Measure => ("Mesurer une distance sur la page", "mesure mesurer"),
     }
 }
 
 fn action_specs() -> Vec<ActionSpec> {
     use PaletteCommand as C;
     let mut actions = vec![
-        ActionSpec::new("Fichier", "Ouvrir un PDF depuis le disque…", "Choisir un fichier dans l'explorateur", "ouvrir fichier parcourir explorateur disque importer", "Ctrl+O", C::OpenFileDialog),
-        ActionSpec::new("Fichier", "Enregistrer le PDF", "Annotations et texte reconnu par l'OCR inclus", "enregistrer sauvegarder save garder", "Ctrl+S", C::SaveAnnotatedPdf),
-        ActionSpec::new("Document", "Rechercher dans le PDF", "Trouver un mot dans le document ouvert", "rechercher chercher trouver find mot", "Ctrl+F", C::OpenSearch),
-        ActionSpec::new("Document", "Reconnaître le texte des images (OCR)", "Rend cherchable le texte des figures et des scans", "ocr reconnaissance texte image scanner scan figure", "OCR", C::RunHybridOcrTurbo),
-        ActionSpec::new("Annotations", "Annuler", "Défaire la dernière modification d'annotation", "annuler undo defaire retour arriere", "Ctrl+Z", C::UndoAnnotation),
-        ActionSpec::new("Annotations", "Rétablir", "Refaire la modification annulée", "retablir redo refaire", "Ctrl+Y", C::RedoAnnotation),
-        ActionSpec::new("Annotations", "Supprimer l'annotation sélectionnée", "", "supprimer effacer enlever retirer delete", "Suppr", C::DeleteSelectedAnnotation),
-        ActionSpec::new("Onglet", "Fermer l'onglet actif", "", "fermer onglet close", "Ctrl+W", C::CloseActiveTab),
-        ActionSpec::new("Onglet", "Rouvrir le dernier onglet fermé", "", "rouvrir dernier onglet ferme restaurer annuler fermeture", "Ctrl+Maj+T", C::ReopenClosedTab),
-        ActionSpec::new("Affichage", "Ajuster à la largeur", "", "ajuster largeur zoom fit", "Ctrl+9", C::FitToWidth),
-        ActionSpec::new("Affichage", "Afficher la page entière", "", "ajuster page entiere hauteur zoom fit", "Ctrl+0", C::FitToPage),
-        ActionSpec::new("Affichage", "Zoom à 100 %", "", "zoom 100 taille reelle reinitialiser", "100%", C::ZoomReset100),
-        ActionSpec::new("Affichage", "Épingler ou masquer la barre latérale", "", "barre laterale epingler masquer cacher plein ecran", "Ctrl+B", C::ToggleSidebarPin),
-        ActionSpec::new("Mémoire", "Libérer la mémoire des onglets inactifs", "", "memoire ram purger liberer hiberner", "Purge", C::HibernateInactiveTabs),
+        ActionSpec::new("Fichier", "Ouvrir un PDF depuis le disque…", "Choisir un fichier dans l'explorateur", "ouvrir fichier parcourir", "Ctrl+O", C::OpenFileDialog),
+        ActionSpec::new("Fichier", "Enregistrer le PDF", "Annotations et texte reconnu par l'OCR inclus", "enregistrer sauvegarder", "Ctrl+S", C::SaveAnnotatedPdf),
+        ActionSpec::new("Document", "Rechercher dans le PDF", "Trouver un mot dans le document ouvert", "rechercher chercher trouver", "Ctrl+F", C::OpenSearch),
+        ActionSpec::new("Document", "OCR approfondi…", "Lit le texte scanné ou dessiné, page par page (lent)", "ocr approfondi scan scanner", "OCR", C::OpenDeepOcrDialog),
+        ActionSpec::new("Annotations", "Annuler", "Défaire la dernière modification d'annotation", "annuler", "Ctrl+Z", C::UndoAnnotation),
+        ActionSpec::new("Annotations", "Rétablir", "Refaire la modification annulée", "retablir refaire", "Ctrl+Y", C::RedoAnnotation),
+        ActionSpec::new("Annotations", "Supprimer l'annotation sélectionnée", "", "supprimer effacer", "Suppr", C::DeleteSelectedAnnotation),
+        ActionSpec::new("Onglet", "Fermer l'onglet actif", "", "fermer", "Ctrl+W", C::CloseActiveTab),
+        ActionSpec::new("Onglet", "Rouvrir le dernier onglet fermé", "", "rouvrir", "Ctrl+Maj+T", C::ReopenClosedTab),
+        ActionSpec::new("Affichage", "Ajuster à la largeur", "", "ajuster largeur zoom", "Ctrl+9", C::FitToWidth),
+        ActionSpec::new("Affichage", "Afficher la page entière", "", "ajuster page entiere zoom", "Ctrl+0", C::FitToPage),
+        ActionSpec::new("Affichage", "Zoom à 100 %", "", "zoom", "100%", C::ZoomReset100),
+        ActionSpec::new("Affichage", "Épingler ou masquer la barre latérale", "", "barre laterale epingler masquer", "Ctrl+B", C::ToggleSidebarPin),
+        ActionSpec::new("Mémoire", "Libérer la mémoire des onglets inactifs", "", "memoire liberer", "Purge", C::HibernateInactiveTabs),
     ];
     for tool in ActiveTool::all() {
         let (_, name, key) = tool.icon_and_label();
@@ -612,8 +814,11 @@ fn action_specs() -> Vec<ActionSpec> {
     actions
 }
 
-/// « 12 », « p12 », « page 12 », « aller a la page 12 » → page 12.
+/// « p12 », « page 12 », « aller a la page 12 » → page 12 (un nombre seul est traité à part).
 fn parse_page_request(normalized_query: &str) -> Option<usize> {
+    if bare_number(normalized_query).is_some() {
+        return None;
+    }
     let rest = normalized_query
         .trim_start_matches("aller a la")
         .trim_start_matches("aller")
@@ -662,19 +867,40 @@ impl CommandPaletteState {
         active_tab_page_count: usize,
         recent: &RecentFiles,
         now: u64,
+        numbers: &NumberHistory,
     ) -> Vec<PaletteEntry> {
         let query = normalize(&self.query);
         let mut scored: Vec<(f32, PaletteEntry)> = Vec::new();
 
-        if let Some(page) = parse_page_request(&query) {
-            if page <= active_tab_page_count {
-                scored.push((100.0, PaletteEntry {
-                    category: "Page",
-                    label: format!("Aller à la page {page}"),
-                    detail: format!("sur {active_tab_page_count}"),
-                    shortcut: "Entrée",
-                    command: PaletteCommand::JumpToPage(page - 1),
-                }));
+        let page_entry = |page: usize| PaletteEntry {
+            category: "Page",
+            label: format!("Aller à la page {page}"),
+            detail: format!("sur {active_tab_page_count}"),
+            shortcut: "Entrée",
+            command: PaletteCommand::JumpToPage(page - 1),
+        };
+        let zoom_entry = |percent: u32| PaletteEntry {
+            category: "Zoom",
+            label: format!("Zoom à {percent} %"),
+            detail: String::new(),
+            shortcut: "Entrée",
+            command: PaletteCommand::SetZoomPercent(percent),
+        };
+        let page_fits = |p: usize| p >= 1 && p <= active_tab_page_count;
+        if let Some(page) = parse_page_request(&query).filter(|&p| page_fits(p)) {
+            scored.push((100.0, page_entry(page)));
+        } else if let Some(percent) =
+            parse_zoom_request(&self.query, &query).filter(|z| PALETTE_ZOOM_RANGE.contains(z))
+        {
+            scored.push((100.0, zoom_entry(percent)));
+        } else if let Some(number) = bare_number(&query) {
+            // Nombre seul : page et zoom, le choix habituel de l'utilisateur en premier.
+            let (page_score, zoom_score) = if numbers.prefers_zoom() { (99.0, 100.0) } else { (100.0, 99.0) };
+            if active_tab_page_count > 0 && page_fits(number as usize) {
+                scored.push((page_score, page_entry(number as usize)));
+            }
+            if active_tab_page_count > 0 && PALETTE_ZOOM_RANGE.contains(&number) {
+                scored.push((zoom_score, zoom_entry(number)));
             }
         }
 
@@ -773,16 +999,15 @@ mod tests {
             (1, "Spécification_ISO_32000.pdf".to_string(), 8, PathBuf::from("Spécification_ISO_32000.pdf")),
         ];
         let recent = RecentFiles::in_memory();
-        let results = |palette: &CommandPaletteState| palette.filtered_entries(&tabs, 5, &recent, 0);
+        let numbers = NumberHistory::default();
+        let results = |palette: &CommandPaletteState| palette.filtered_entries(&tabs, 5, &recent, 0, &numbers);
 
         palette.query = "specification".to_string();
         assert_eq!(results(&palette)[0].command, PaletteCommand::SwitchTab(1));
 
         // Les mots du langage courant mènent à l'outil, pas seulement son nom exact.
         for (query, tool) in [
-            ("comment", ActiveTool::StickyNote),
             ("ajouter un commentaire", ActiveTool::StickyNote),
-            ("stabilo", ActiveTool::Highlight),
             ("surligner", ActiveTool::Highlight),
             ("fleche", ActiveTool::Shape),
         ] {
@@ -795,6 +1020,24 @@ mod tests {
 
         palette.query = "page 3".to_string();
         assert_eq!(results(&palette)[0].command, PaletteCommand::JumpToPage(2));
+
+        // Nombre seul valable comme page et comme zoom (document de 200 pages) : page d'abord par
+        // défaut, zoom d'abord si c'est l'habitude récente.
+        palette.query = "125".to_string();
+        let first = |numbers: &NumberHistory| palette.filtered_entries(&tabs, 200, &recent, 0, numbers)[..2]
+            .iter()
+            .map(|e| e.command.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(first(&numbers), vec![PaletteCommand::JumpToPage(124), PaletteCommand::SetZoomPercent(125)]);
+        let mut zoom_user = NumberHistory::default();
+        for choice in [NumberChoice::Zoom, NumberChoice::Zoom, NumberChoice::Page, NumberChoice::Zoom] {
+            zoom_user.record(choice);
+        }
+        assert_eq!(first(&zoom_user), vec![PaletteCommand::SetZoomPercent(125), PaletteCommand::JumpToPage(124)]);
+        // Trop grand pour une page de ce document : seulement le zoom.
+        assert_eq!(results(&palette)[0].command, PaletteCommand::SetZoomPercent(125));
+        palette.query = "125 %".to_string();
+        assert_eq!(results(&palette)[0].command, PaletteCommand::SetZoomPercent(125));
     }
 
     #[test]

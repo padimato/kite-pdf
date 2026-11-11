@@ -1,4 +1,4 @@
-use crate::ocr_engine::{parse_ocr_scanned_pages, OCR_SCANNED_PAGES_INFO_KEY};
+use crate::ocr_engine::{parse_ocr_scanned_pages, OCR_DEEP_PAGES_INFO_KEY, OCR_SCANNED_PAGES_INFO_KEY};
 use crate::text_search::{PageTextLayer, PdfTopDownRect, PositionedChar};
 use anyhow::{Context, Result};
 use egui::ColorImage;
@@ -12,6 +12,19 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 static PDFIUM_SINGLETON: OnceLock<PdfEngine> = OnceLock::new();
+
+/// Au-delà, l'ouverture ne charge plus chaque page : charger une page coûte environ 25 ms
+/// (analyse de son contenu), soit plus de 10 s pour 460 pages. Les détails des pages (annotations,
+/// rotation, champs de formulaire) sont alors lus en tâche de fond.
+pub const FULL_SCAN_MAX_PAGES: usize = 40;
+
+/// Ce que l'ouverture apprend d'une page en la chargeant.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PageDetails {
+    pub dims: PageDimensions,
+    pub has_app_drawn_annotations: bool,
+    pub has_form_widgets: bool,
+}
 static PDFIUM_GUARD: Mutex<()> = Mutex::new(());
 
 /// Dimensions d'une page PDF en points (1 pt = 1/72 pouce)
@@ -109,8 +122,15 @@ pub struct LoadedPdfDocument<'a> {
     has_form_widgets: bool,
     /// Au moins une annotation que l'application reprend à son compte
     pub has_app_drawn_annotations: bool,
+    /// Rotation, zone visible, annotations et champs de chaque page connus. Sinon (gros document),
+    /// seules les tailles sont exactes et le reste est à lire avec [`LoadedPdfDocument::page_details`].
+    pub page_details_complete: bool,
+    /// Le document déclare un formulaire (`/AcroForm`), peut-être vide.
+    declares_form: bool,
     /// Pages déjà passées à l'OCR lors d'un enregistrement précédent (marqueur du dictionnaire `/Info`)
     pub ocr_scanned_pages: Vec<bool>,
+    /// Pages déjà lues par l'OCR approfondi lors d'un enregistrement précédent
+    pub deep_ocr_pages: Vec<bool>,
     doc: PdfDocument<'a>,
 }
 
@@ -134,23 +154,16 @@ impl PdfEngine {
     }
 
     fn bind_pdfium() -> Result<Box<dyn PdfiumLibraryBindings>> {
-        // 1. Dossier courant
-        if let Ok(b) = Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path("./")) {
-            return Ok(b);
-        }
-        // 2. Dossier de l'exécutable
-        if let Ok(exe_path) = std::env::current_exe() {
-            if let Some(exe_dir) = exe_path.parent() {
-                if let Ok(b) = Pdfium::bind_to_library(
-                    Pdfium::pdfium_platform_library_name_at_path(exe_dir),
-                ) {
-                    return Ok(b);
-                }
+        // Dossier de l'exécutable et ses parents, puis dossier des dépendances de l'utilisateur
+        // (jamais le dossier courant : il pourrait fournir une DLL étrangère).
+        let installed = crate::deps::by_file_name("pdfium.dll").and_then(|d| crate::deps::locate(&d));
+        if let Some(path) = installed {
+            if let Ok(b) = Pdfium::bind_to_library(&path) {
+                return Ok(b);
             }
         }
-        // 3. Bibliothèque système
         Pdfium::bind_to_system_library().context(
-            "Impossible de charger pdfium.dll. Assurez-vous que pdfium.dll est présent à la racine du projet.",
+            "Impossible de charger pdfium.dll : lancez `super_pdf_reader --fetch-deps` pour l'installer.",
         )
     }
 
@@ -167,7 +180,10 @@ impl PdfEngine {
             page_dimensions: Vec::new(),
             has_form_widgets: false,
             has_app_drawn_annotations: false,
+            page_details_complete: false,
+            declares_form: false,
             ocr_scanned_pages: Vec::new(),
+            deep_ocr_pages: Vec::new(),
             doc,
         })
     }
@@ -183,26 +199,28 @@ impl PdfEngine {
         let pages = doc.pages();
         let page_count = pages.len();
         let mut page_dimensions = Vec::with_capacity(page_count as usize);
-        let document_declares_form = doc.form().is_some();
-        let mut has_form_widgets = false;
+        let declares_form = doc.form().is_some();
+        let page_details_complete = (page_count as usize) <= FULL_SCAN_MAX_PAGES;
+        // Gros document : formulaire supposé présent tant que les pages n'ont pas été lues (prudent).
+        let mut has_form_widgets = declares_form && !page_details_complete;
         let mut has_app_drawn_annotations = false;
 
         for idx in 0..page_count {
-            let page = pages
-                .get(idx)
-                .with_context(|| format!("Impossible de lire la page {}", idx + 1))?;
-            has_form_widgets = has_form_widgets
-                || (document_declares_form
-                    && page
-                        .annotations()
-                        .iter()
-                        .any(|a| a.annotation_type() == PdfPageAnnotationType::Widget));
-            page_dimensions.push(page_view_dimensions(&page));
-            has_app_drawn_annotations = has_app_drawn_annotations
-                || page
-                    .annotations()
-                    .iter()
-                    .any(|a| annotation_is_drawn_by_app(a.annotation_type()));
+            if page_details_complete {
+                let page = pages
+                    .get(idx)
+                    .with_context(|| format!("Impossible de lire la page {}", idx + 1))?;
+                let details = page_details(&page, declares_form);
+                has_form_widgets |= details.has_form_widgets;
+                has_app_drawn_annotations |= details.has_app_drawn_annotations;
+                page_dimensions.push(details.dims);
+            } else {
+                // Taille affichée (rotation comprise) sans analyser le contenu de la page.
+                let size = pages
+                    .page_size(idx)
+                    .with_context(|| format!("Impossible de lire la page {}", idx + 1))?;
+                page_dimensions.push(PageDimensions::simple(size.width().value, size.height().value));
+            }
         }
 
         let title = path
@@ -217,6 +235,12 @@ impl PdfEngine {
                 .unwrap_or_default(),
             page_dimensions.len(),
         );
+        let deep_ocr_pages = parse_ocr_scanned_pages(
+            &self
+                .read_info_text(path, OCR_DEEP_PAGES_INFO_KEY)
+                .unwrap_or_default(),
+            page_dimensions.len(),
+        );
 
         Ok(LoadedPdfDocument {
             path: path.to_path_buf(),
@@ -224,7 +248,10 @@ impl PdfEngine {
             page_dimensions,
             has_form_widgets,
             has_app_drawn_annotations,
+            page_details_complete,
+            declares_form,
             ocr_scanned_pages,
+            deep_ocr_pages,
             doc,
         })
     }
@@ -250,6 +277,20 @@ impl PdfEngine {
             .take_while(|&u| u != 0)
             .collect();
         (!units.is_empty()).then(|| String::from_utf16_lossy(&units))
+    }
+}
+
+fn page_details(page: &PdfPage<'_>, declares_form: bool) -> PageDetails {
+    let annotations = page.annotations();
+    PageDetails {
+        dims: page_view_dimensions(page),
+        has_app_drawn_annotations: annotations
+            .iter()
+            .any(|a| annotation_is_drawn_by_app(a.annotation_type())),
+        has_form_widgets: declares_form
+            && annotations
+                .iter()
+                .any(|a| a.annotation_type() == PdfPageAnnotationType::Widget),
     }
 }
 
@@ -493,6 +534,13 @@ impl<'a> LoadedPdfDocument<'a> {
     /// Les champs de formulaire ne peuvent pas être dessinés dans une tuile (limite de PDFium).
     pub fn has_form_fields(&self) -> bool {
         self.has_form_widgets
+    }
+
+    /// Charge une page pour en lire la rotation, la zone visible, les annotations et les champs.
+    pub fn page_details(&self, page_index: usize) -> Option<PageDetails> {
+        let _lock = PDFIUM_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let page = self.doc.pages().get(page_index as u16).ok()?;
+        Some(page_details(&page, self.declares_form || self.doc.form().is_some()))
     }
 
     /// Extrait la couche de texte natif d'une seule page à la volée (< 1 ms, idéal pour les très gros PDF).
@@ -911,6 +959,41 @@ pub fn ensure_sample_pdf(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_large_document_opens_with_sizes_then_reads_details_lazily() {
+        use crate::annotations::{save_annotations_and_ocr_to_pdf, AnnotationKind, PdfAnnotation};
+        let src = PathBuf::from("test_pdfs/unit_test_large_src.pdf");
+        let dst = PathBuf::from("test_pdfs/unit_test_large_annotated.pdf");
+        let pages = FULL_SCAN_MAX_PAGES + 5;
+        ensure_custom_sample_pdf(&src, "GROS DOCUMENT", (0.2, 0.3, 0.5), pages).expect("Doit créer le PDF");
+        let engine = PdfEngine::instance();
+        let dims = engine.load_document(&src).expect("Doit charger").page_dimensions.clone();
+        let rect = PdfTopDownRect { x_min: 100.0, y_min: 100.0, x_max: 300.0, y_max: 120.0, angle_deg: 0.0 };
+        let highlight = PdfAnnotation {
+            meta: Default::default(),
+            id: 1,
+            page_index: pages - 2,
+            rect,
+            color_rgb: (255, 226, 52),
+            kind: AnnotationKind::Highlight { quads: vec![rect] },
+        };
+        save_annotations_and_ocr_to_pdf(&src, &dst, &[highlight], &[], &dims).expect("Doit enregistrer");
+
+        let doc = engine.load_document(&dst).expect("Doit charger");
+        // Gros document : ouverture sans charger les pages, donc sans les annotations.
+        assert!(!doc.page_details_complete);
+        assert!(!doc.has_app_drawn_annotations);
+        assert_eq!(doc.page_dimensions.len(), pages);
+        // Les tailles lues sans charger les pages sont les tailles exactes.
+        for (fast, exact) in doc.page_dimensions.iter().zip(&dims) {
+            assert!((fast.width_pt - exact.width_pt).abs() < 0.01 && (fast.height_pt - exact.height_pt).abs() < 0.01);
+        }
+        // Les détails, lus page par page, retrouvent l'annotation.
+        let details = doc.page_details(pages - 2).expect("Doit lire la page");
+        assert!(details.has_app_drawn_annotations);
+        assert!(!doc.page_details(0).unwrap().has_app_drawn_annotations);
+    }
 
     #[test]
     fn test_pdfium_engine_loads_and_renders_sample_pdf() {

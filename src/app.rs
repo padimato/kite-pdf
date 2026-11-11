@@ -235,6 +235,60 @@ struct AnnotationDrag {
     has_moved: bool,
 }
 
+/// Durée par défaut d'une page d'OCR approfondi, avant la première mesure (page dense, CPU).
+const DEFAULT_DEEP_OCR_SECONDS_PER_PAGE: f32 = 6.0;
+/// Durée d'affichage de la bulle « page sans texte ».
+const NO_TEXT_HINT_DURATION: Duration = Duration::from_secs(6);
+
+/// Lecture OCR approfondie lancée sur un onglet.
+struct DeepOcrRun {
+    tab_id: u64,
+    progress: std::sync::Arc<std::sync::Mutex<crate::worker::DeepOcrProgress>>,
+    /// Le message de fin a été vu (enregistré ou écarté)
+    acknowledged: bool,
+}
+
+/// Ligne d'information sous la recherche.
+enum SearchOcrHint {
+    PagesWithoutText(usize),
+    Running { done: usize, total: usize },
+}
+
+/// Pages lues de part et d'autre de la page affichée par le choix « autour de celle-ci ».
+const DEEP_OCR_PAGES_AROUND: usize = 5;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeepOcrScope {
+    CurrentPage,
+    Around,
+    WholeDocument,
+}
+
+/// Fenêtre de l'OCR approfondi (la lecture commence par `current_page`).
+struct DeepOcrDialog {
+    scope: DeepOcrScope,
+    current_page: usize,
+}
+
+/// Bulle « cette page n'a pas de texte » après une tentative de sélection.
+struct NoTextHint {
+    page: usize,
+    position: Pos2,
+    shown_at: Instant,
+}
+
+/// « ≈ 45 s », « ≈ 12 min », « ≈ 1 h 05 ».
+fn format_duration(seconds: f32) -> String {
+    let seconds = seconds.max(1.0).round() as u64;
+    if seconds < 60 {
+        format!("≈ {seconds} s")
+    } else if seconds < 3600 {
+        format!("≈ {} min", (seconds + 30) / 60)
+    } else {
+        format!("≈ {} h {:02}", seconds / 3600, (seconds % 3600) / 60)
+    }
+}
+
 /// Menu contextuel ouvert sur une flèche
 struct LineContextMenu {
     annotation_id: u64,
@@ -270,6 +324,10 @@ pub struct AutomationConfig {
     pub initial_select_stream: Option<(usize, usize)>,
     pub initial_highlight_stream: Option<(usize, usize)>,
     pub ocr_turbo: bool,
+    /// Ouvre la fenêtre de l'OCR approfondi au démarrage (captures QA)
+    pub deep_ocr_dialog: bool,
+    /// Lance l'OCR approfondi de tout le document au démarrage (captures QA)
+    pub deep_ocr_all: bool,
     pub save_annotated_output: Option<PathBuf>,
     pub screenshot_output: Option<PathBuf>,
     /// Délai avant la capture (permet à un script QA d'envoyer des événements à la fenêtre)
@@ -295,8 +353,22 @@ pub struct SuperPdfApp {
     pub command_palette: CommandPaletteState,
     /// Historique des PDF ouverts, cherché par la barre centrale (`Ctrl+T`)
     pub recent_files: RecentFiles,
+    /// Usage récent d'un nombre seul dans la barre centrale : page ou zoom
+    number_history: crate::tabs::NumberHistory,
     /// Fichiers des onglets fermés, du plus ancien au plus récent (`Ctrl+Maj+T`)
     closed_tabs: Vec<PathBuf>,
+    /// Dépendances installées dans une version non testée (rempli par un thread au démarrage)
+    dependency_warnings: std::sync::Arc<std::sync::Mutex<Option<Vec<crate::deps::UntestedVersion>>>>,
+    dependency_warning_closed: bool,
+    first_render_reported: bool,
+    /// Dernière page vue en cours de lecture des images (onglet, page), pour l'afficher entre deux pages
+    last_image_ocr_page: Option<(u64, usize)>,
+    /// Lecture OCR approfondie en cours ou dont le résultat n'a pas encore été vu
+    deep_ocr: Option<DeepOcrRun>,
+    deep_ocr_dialog: Option<DeepOcrDialog>,
+    no_text_hint: Option<NoTextHint>,
+    /// Téléchargement de l'OCR en cours, s'il manquait au démarrage
+    ocr_install: Option<crate::setup::InstallJob>,
     /// Taille de la zone du document à l'image précédente (navigation depuis la barre latérale)
     canvas_size: Vec2,
     /// État du moteur de recherche `Ctrl+F`
@@ -367,7 +439,7 @@ const TAB_BADGE_COLORS: [(Color32, (f32, f32, f32)); 6] = [
 ];
 
 impl SuperPdfApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, automation: AutomationConfig) -> Self {
+    pub fn new(egui_ctx: &Context, automation: AutomationConfig) -> Self {
         let engine = PdfEngine::instance();
 
         let mut sidebar = SidebarState::default();
@@ -399,6 +471,11 @@ impl SuperPdfApp {
             command_palette: CommandPaletteState::default(),
             // Les lancements automatisés (captures QA) ne doivent pas remplir l'historique réel.
             closed_tabs: Vec::new(),
+            number_history: if automation.screenshot_output.is_some() {
+                crate::tabs::NumberHistory::default()
+            } else {
+                crate::tabs::NumberHistory::load_default()
+            },
             canvas_size: Vec2::new(1000.0, 800.0),
             recent_files: if automation.screenshot_output.is_some() {
                 RecentFiles::in_memory()
@@ -430,7 +507,20 @@ impl SuperPdfApp {
             screenshot_requested: false,
             automation: automation.clone(),
             last_frame_instant: Instant::now(),
-            workers: BackgroundWorkers::spawn(cc.egui_ctx.clone(), engine),
+            workers: BackgroundWorkers::spawn(egui_ctx.clone(), engine),
+            dependency_warnings: crate::setup::check_versions_in_background(egui_ctx.clone()),
+            dependency_warning_closed: false,
+            first_render_reported: false,
+            last_image_ocr_page: None,
+            deep_ocr: None,
+            deep_ocr_dialog: None,
+            no_text_hint: None,
+            // OCR manquant (PDFium présent) : téléchargé en tâche de fond, l'application reste utilisable.
+            ocr_install: {
+                let missing: Vec<_> = crate::deps::missing().into_iter().filter(|d| !d.required).collect();
+                (automation.screenshot_output.is_none() && !missing.is_empty())
+                    .then(|| crate::setup::InstallJob::start(missing, egui_ctx.clone()))
+            },
             failed_renders: HashSet::new(),
             search_refresh_pending: false,
             last_search_refresh: Instant::now(),
@@ -483,6 +573,16 @@ impl SuperPdfApp {
         if let Some(q) = &automation.open_palette_query {
             app.command_palette.open();
             app.command_palette.query = q.clone();
+        }
+
+        if automation.deep_ocr_dialog {
+            app.open_deep_ocr_dialog(Vec2::new(1000.0, 800.0));
+        }
+        if automation.deep_ocr_all {
+            if let Some(tab) = app.tabs.get(app.active_tab) {
+                let pages = tab.deep_ocr_pending_pages(0..=tab.page_count().saturating_sub(1));
+                app.start_deep_ocr(pages, 0);
+            }
         }
 
         if automation.ocr_turbo {
@@ -588,6 +688,7 @@ impl SuperPdfApp {
                     &tab.text_layers,
                     &tab.page_dimensions,
                     &tab.ocr.page_scanned,
+                    &tab.ocr.deep_done,
                 );
                 tab.annotations.saved_feedback_frames = 120;
                 tab.ocr.has_unsaved_ocr = false;
@@ -636,7 +737,12 @@ impl SuperPdfApp {
             Ok(doc) => {
                 let id = self.next_tab_id;
                 self.next_tab_id += 1;
-                self.tabs.push(DocumentTab::new_active(id, doc, badge_color));
+                let tab = DocumentTab::new_active(id, doc, badge_color);
+                // Gros document : affiché tout de suite, détails des pages lus ensuite.
+                if !tab.page_details_complete() {
+                    self.workers.scan_page_details(id, tab.path.clone(), tab.page_count());
+                }
+                self.tabs.push(tab);
                 self.recent_files.record_open(path);
                 self.active_tab = self.tabs.len() - 1;
                 self.error_message = None;
@@ -656,7 +762,7 @@ impl SuperPdfApp {
         self.closed_tabs.retain(|p| p != &removed.path);
         self.closed_tabs.push(removed.path.clone());
         self.texture_cache.evict_tab(removed.id);
-        self.workers.forget_tab(removed.id);
+        self.workers.tab_closed(removed.id);
 
         if self.tabs.is_empty() {
             self.active_tab = 0;
@@ -693,6 +799,7 @@ impl SuperPdfApp {
     /// Enregistre les annotations ISO 32000 ET la couche de texte OCR invisible (`3 Tr` + `Tm`) dans le PDF (`Ctrl+S`)
     pub fn save_active_tab_annotations(&mut self) {
         if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+            tab.ensure_details_for_saved_pages(self.engine);
             // Relâcher temporairement le handle PDFium sur Windows pour écrire dans le fichier en place
             let tab_id = tab.id;
             tab.hibernate(&mut self.texture_cache);
@@ -703,6 +810,7 @@ impl SuperPdfApp {
                 &tab.text_layers,
                 &tab.page_dimensions,
                 &tab.ocr.page_scanned,
+                &tab.ocr.deep_done,
             );
             let _ = tab.ensure_awake(self.engine);
             self.texture_cache.evict_tab(tab_id);
@@ -772,13 +880,6 @@ impl SuperPdfApp {
             PaletteCommand::SaveAnnotatedPdf => {
                 self.save_active_tab_annotations();
             }
-            PaletteCommand::RunHybridOcrTurbo => {
-                if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-                    let p = tab.viewport.current_page_index(viewport_size, &tab.page_dimensions);
-                    tab.start_turbo_ocr();
-                    tab.pump_ocr(p, &self.workers);
-                }
-            }
             PaletteCommand::OpenRecent(path) => {
                 if path.is_file() {
                     self.open_pdf_in_new_tab(&path);
@@ -795,6 +896,9 @@ impl SuperPdfApp {
                         break;
                     }
                 }
+            }
+            PaletteCommand::OpenDeepOcrDialog => {
+                self.open_deep_ocr_dialog(viewport_size);
             }
             PaletteCommand::OpenSearch => {
                 self.search_bar.open();
@@ -858,6 +962,15 @@ impl SuperPdfApp {
                     tab.viewport
                         .clamp_scroll(viewport_size, &tab.page_dimensions);
                     tab.viewport.last_gesture_label = "Zoom 100%".to_string();
+                }
+            }
+            PaletteCommand::SetZoomPercent(percent) => {
+                if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                    let target = percent as f32 / 100.0;
+                    let factor = target / tab.viewport.zoom.max(0.01);
+                    let pages = tab.page_dimensions.clone();
+                    tab.viewport
+                        .apply_zoom_around_anchor(factor, viewport_size * 0.5, viewport_size, &pages);
                 }
             }
             PaletteCommand::JumpToPage(page_idx) => {
@@ -973,6 +1086,10 @@ impl SuperPdfApp {
                     || self.comment_edit.is_some()
                 {
                     // Géré par l'éditeur en place et le menu contextuel.
+                } else if self.deep_ocr_dialog.is_some() {
+                    self.deep_ocr_dialog = None;
+                } else if self.no_text_hint.is_some() {
+                    self.no_text_hint = None;
                 } else if self.command_palette.is_open {
                     self.command_palette.close();
                 } else if self.search_bar.is_open {
@@ -1220,7 +1337,7 @@ impl SuperPdfApp {
         page_index: usize,
         page_rect: Rect,
     ) {
-        if self.command_palette.is_open {
+        if self.command_palette.is_open || self.deep_ocr_dialog.is_some() {
             return;
         }
         let pointer_over_sidebar = self.sidebar.is_expanded()
@@ -1520,6 +1637,19 @@ impl SuperPdfApp {
             if primary_released {
                 self.annotation_drag = None;
 
+                let dragged_far = match (tab.text_selection.drag_start_pt, tab.text_selection.drag_current_pt) {
+                    (Some(a), Some(b)) => (a.0 - b.0).hypot(a.1 - b.1) > 12.0,
+                    _ => false,
+                };
+                if matches!(self.active_tool, ActiveTool::Select | ActiveTool::Highlight)
+                    && dragged_far
+                    && !tab.text_selection.has_selection()
+                    && tab.page_lacks_text(page_index) == Some(true)
+                    && !tab.ocr.deep_running
+                {
+                    self.no_text_hint = Some(NoTextHint { page: page_index, position: cursor, shown_at: Instant::now() });
+                }
+
                 // Un glissé sur du texte marqué est une sélection de texte, pas un clic sur l'annotation.
                 if tab.text_selection.has_selection()
                     && tab.annotations.selected().is_some_and(|a| a.is_fixed_to_text())
@@ -1721,6 +1851,27 @@ impl eframe::App for SuperPdfApp {
         self.last_frame_instant = now;
 
         self.process_worker_events(ctx);
+
+        // Lecture approfondie terminée : l'OCR des images de cet onglet peut reprendre.
+        if let Some(run) = &self.deep_ocr {
+            if run.progress.lock().map(|p| p.finished).unwrap_or(true) {
+                if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == run.tab_id) {
+                    tab.ocr.deep_running = false;
+                }
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(500));
+            }
+        }
+
+        // OCR téléchargé en tâche de fond : les onglets qui l'avaient trouvé absent réessaient.
+        if self.ocr_install.as_ref().is_some_and(|job| job.is_finished()) {
+            self.ocr_install = None;
+            for tab in &mut self.tabs {
+                if tab.ocr.unavailable_reason.as_deref() == Some(crate::ocr_engine::OCR_MODELS_MISSING) {
+                    tab.ocr.unavailable_reason = None;
+                }
+            }
+        }
 
         if self.sidebar.step_animation(dt) {
             ctx.request_repaint();
@@ -2247,7 +2398,7 @@ impl eframe::App for SuperPdfApp {
                                 if is_active_match {
                                     if let Some(first_b) = m.highlight_boxes.first() {
                                         let screen_b = first_b.to_screen_rect(page_rect, page_dim);
-                                        let ocr_prefix = if m.is_ocr { "OCR JPG " } else { "" };
+                                        let ocr_prefix = if m.is_ocr { "OCR " } else { "" };
                                         let label = if m.angle_deg.abs() > 1.0 {
                                             format!(
                                                 "🔎 {}#{}/{} (Orienté {:+.0}°)",
@@ -2258,7 +2409,7 @@ impl eframe::App for SuperPdfApp {
                                             )
                                         } else if m.is_ocr {
                                             format!(
-                                                "🔎 OCR JPG #{}/{} (0°)",
+                                                "🔎 OCR #{}/{} (0°)",
                                                 m_idx + 1,
                                                 self.search_bar.matches.len()
                                             )
@@ -2361,6 +2512,7 @@ impl eframe::App for SuperPdfApp {
                 self.render_comment_panel(ctx, canvas_rect, &visible_pages_info);
                 self.render_line_context_menu(ctx);
                 self.render_save_error_popup(ctx);
+                self.render_dependency_warning(ctx, canvas_rect);
 
                 // Barre de recherche flottante `Ctrl+F`
                 if self.search_bar.is_open {
@@ -2372,6 +2524,9 @@ impl eframe::App for SuperPdfApp {
                 }
 
 
+                self.render_no_text_hint(ctx);
+                self.render_deep_ocr_result(ctx, canvas_rect);
+                self.render_deep_ocr_dialog(ctx);
                 if self.command_palette.is_open {
                     self.render_command_palette(ctx, canvas_rect);
                 }
@@ -2399,12 +2554,53 @@ impl SuperPdfApp {
         while let Some(event) = self.workers.try_next_event() {
             match event {
                 WorkerEvent::Rendered { key, image } => {
+                    // `SUPERPDF_TIMING=1` : temps entre le lancement et la première image de page.
+                    if !self.first_render_reported && std::env::var_os("SUPERPDF_TIMING").is_some() {
+                        self.first_render_reported = true;
+                        println!(
+                            "Première page affichée {:.0} ms après le lancement",
+                            crate::PROCESS_START
+                                .get()
+                                .unwrap_or(&self.app_started)
+                                .elapsed()
+                                .as_secs_f64()
+                                * 1000.0
+                        );
+                    }
                     if self.tabs.iter().any(|t| t.id == key.tab_id) {
                         self.texture_cache.insert_color_image(ctx, key, image, &[]);
                     }
                 }
                 WorkerEvent::RenderFailed { key } => {
                     self.failed_renders.insert(key);
+                }
+                WorkerEvent::PageDetails { tab_id, pages } => {
+                    if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
+                        tab.apply_page_details(pages);
+                    }
+                }
+                WorkerEvent::PageDetailsDone { tab_id } => {
+                    if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
+                        tab.supports_tiled_rendering = !tab.found_form_widgets;
+                        if tab.found_app_annotations {
+                            self.workers.load_annotations(
+                                tab_id,
+                                tab.path.clone(),
+                                tab.page_dimensions.clone(),
+                            );
+                        }
+                    }
+                }
+                WorkerEvent::DeepOcrPage { tab_id, page, segments } => {
+                    if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
+                        tab.apply_deep_ocr_page(page, segments);
+                        self.search_refresh_pending = true;
+                    }
+                }
+                WorkerEvent::AnnotationsLoaded { tab_id, items } => {
+                    if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
+                        tab.annotations.merge_loaded(items);
+                    }
                 }
                 WorkerEvent::TextLayer { tab_id, layer } => {
                     if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
@@ -3516,6 +3712,16 @@ impl SuperPdfApp {
         let mut run_search = false;
         let mut step_dir: i32 = 0;
         let mut close_search = false;
+        let mut open_ocr_dialog = false;
+        // Document dont au moins une page sur cinq n'a pas de texte : proposer l'OCR approfondi.
+        let ocr_hint = self.tabs.get(self.active_tab).and_then(|tab| {
+            if self.deep_ocr_running_for(tab.id) {
+                let p = self.deep_ocr.as_ref()?.progress.lock().ok()?.clone();
+                return Some(SearchOcrHint::Running { done: p.done, total: p.total });
+            }
+            let (analysed, lacking) = tab.text_coverage();
+            (lacking > 0 && lacking * 5 >= analysed.max(1)).then_some(SearchOcrHint::PagesWithoutText(lacking))
+        });
 
         egui::Area::new(egui::Id::new("superpdf_floating_ctrl_f"))
             .fixed_pos(bar_pos)
@@ -3589,8 +3795,41 @@ impl SuperPdfApp {
                                 close_search = true;
                             }
                         });
+                        match &ocr_hint {
+                            Some(SearchOcrHint::Running { done, total }) => {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "OCR approfondi en cours : {done} / {total} pages. Les résultats s'ajoutent au fur et à mesure."
+                                    ))
+                                    .size(11.0)
+                                    .color(Color32::from_rgb(150, 160, 182)),
+                                );
+                            }
+                            Some(SearchOcrHint::PagesWithoutText(count)) => {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{count} page{} sans texte lisible.",
+                                            if *count > 1 { "s" } else { "" }
+                                        ))
+                                        .size(11.0)
+                                        .color(Color32::from_rgb(150, 160, 182)),
+                                    );
+                                    if ui
+                                        .link(egui::RichText::new("Lancer l'OCR approfondi…").size(11.0))
+                                        .clicked()
+                                    {
+                                        open_ocr_dialog = true;
+                                    }
+                                });
+                            }
+                            None => {}
+                        }
                     });
             });
+        if open_ocr_dialog {
+            self.open_deep_ocr_dialog(canvas_rect.size());
+        }
 
         ctx.input(|input| {
             if input.key_pressed(Key::Enter) && !self.command_palette.is_open {
@@ -4066,7 +4305,7 @@ impl SuperPdfApp {
                                     .corner_radius(CornerRadius::same(5))
                                     .inner_margin(Margin::symmetric(6, 3))
                                     .show(ui, |ui| {
-                                        let ocr_tag = if m.is_ocr { " [OCR JPG]" } else { "" };
+                                        let ocr_tag = if m.is_ocr { " [OCR]" } else { "" };
                                         let angle_tag = if m.angle_deg.abs() > 1.0 {
                                             format!(" [↗{:+.0}°]", m.angle_deg)
                                         } else {
@@ -4105,22 +4344,37 @@ impl SuperPdfApp {
             .show(ui, |ui| {
                 let muted = Color32::from_rgb(140, 150, 172);
                 let viewport_size = self.canvas_size;
+                self.render_deep_ocr_progress(ui);
                 let Some(tab) = self.tabs.get_mut(self.active_tab) else {
                     return;
                 };
 
-                if let Some(reason) = &tab.ocr.unavailable_reason {
+                if tab.ocr.deep_running {
+                    // L'avancement de la lecture approfondie est affiché juste au-dessus.
+                } else if self.ocr_install.is_some() {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new().size(11.0).color(muted));
+                        ui.label(egui::RichText::new("Téléchargement de l'OCR").size(10.5).color(muted));
+                    });
+                    ui.add_space(2.0);
+                } else if let Some(reason) = &tab.ocr.unavailable_reason {
                     ui.label(egui::RichText::new("OCR indisponible").size(10.5).color(muted))
                         .on_hover_text(reason.as_str());
                     ui.add_space(2.0);
-                } else if let Some(page) = tab.ocr.in_flight_page {
+                } else if tab.ocr.page_scanned.iter().any(|scanned| !scanned) {
+                    // Affichée tant qu'il reste des pages, pas seulement pendant le calcul : en mode
+                    // éco, l'OCR se repose entre deux pages, et la ligne disparaissait puis
+                    // réapparaissait en faisant sauter les boutons du dessous.
+                    if let Some(page) = tab.ocr.in_flight_page {
+                        self.last_image_ocr_page = Some((tab.id, page));
+                    }
+                    let label = match self.last_image_ocr_page {
+                        Some((tab_id, page)) if tab_id == tab.id => format!("Lecture des images, page {}", page + 1),
+                        _ => "Lecture des images…".to_string(),
+                    };
                     ui.horizontal(|ui| {
                         ui.add(egui::Spinner::new().size(11.0).color(muted));
-                        ui.label(
-                            egui::RichText::new(format!("Lecture des images, page {}", page + 1))
-                                .size(10.5)
-                                .color(muted),
-                        );
+                        ui.label(egui::RichText::new(label).size(10.5).color(muted));
                     });
                     ui.add_space(2.0);
                 }
@@ -4263,6 +4517,409 @@ impl SuperPdfApp {
             });
     }
 
+    /// Bandeau signalant une dépendance installée dans une version autre que celle testée.
+    fn render_dependency_warning(&mut self, ctx: &Context, canvas_rect: Rect) {
+        if self.dependency_warning_closed {
+            return;
+        }
+        let warnings = self.dependency_warnings.lock().ok().and_then(|w| w.clone()).unwrap_or_default();
+        if warnings.is_empty() {
+            return;
+        }
+        let width = (canvas_rect.width() - 48.0).min(620.0);
+        egui::Area::new(egui::Id::new("superpdf_dependency_warning"))
+            .fixed_pos(Pos2::new(canvas_rect.center().x - width * 0.5, canvas_rect.min.y + 12.0))
+            .order(Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::NONE
+                    .fill(Color32::from_rgb(52, 42, 20))
+                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(150, 115, 40)))
+                    .corner_radius(CornerRadius::same(10))
+                    .inner_margin(Margin::same(12))
+                    .show(ui, |ui| {
+                        ui.set_width(width - 24.0);
+                        for warning in &warnings {
+                            ui.label(
+                                egui::RichText::new(format!("⚠ {}", warning.warning()))
+                                    .size(12.0)
+                                    .color(Color32::from_rgb(250, 225, 170)),
+                            );
+                        }
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Ne plus afficher").clicked() {
+                                for warning in &warnings {
+                                    crate::setup::ignore_version(&warning.found_sha256);
+                                }
+                                self.dependency_warning_closed = true;
+                            }
+                            if ui.button("Fermer").clicked() {
+                                self.dependency_warning_closed = true;
+                            }
+                        });
+                    });
+            });
+    }
+
+    /// Ouvre la fenêtre de choix de l'OCR approfondi pour l'onglet actif.
+    fn open_deep_ocr_dialog(&mut self, viewport_size: Vec2) {
+        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+            return;
+        };
+        // Le texte de toutes les pages est nécessaire pour savoir lesquelles en manquent.
+        tab.request_all_text(&self.workers);
+        let current_page = tab.viewport.current_page_index(viewport_size, &tab.page_dimensions);
+        self.deep_ocr_dialog = Some(DeepOcrDialog { scope: DeepOcrScope::WholeDocument, current_page });
+    }
+
+    /// Lecture approfondie en cours pour cet onglet.
+    fn deep_ocr_running_for(&self, tab_id: u64) -> bool {
+        self.deep_ocr.as_ref().is_some_and(|run| {
+            run.tab_id == tab_id && !run.progress.lock().map(|p| p.finished).unwrap_or(true)
+        })
+    }
+
+    /// Lance l'OCR approfondi des `pages` de l'onglet actif, en commençant par la page affichée.
+    fn start_deep_ocr(&mut self, mut pages: Vec<usize>, current_page: usize) {
+        if pages.is_empty() {
+            return;
+        }
+        pages.sort_by_key(|&p| (p as i64 - current_page as i64).unsigned_abs());
+        let Some(tab_id) = self.tabs.get(self.active_tab).map(|t| t.id) else {
+            return;
+        };
+        if let Some(run) = &self.deep_ocr {
+            if !run.progress.lock().map(|p| p.finished).unwrap_or(true) {
+                // Une seule lecture à la fois : sur le même onglet, les pages demandées passent devant.
+                if run.tab_id == tab_id {
+                    if let Ok(mut progress) = run.progress.lock() {
+                        progress.prioritize(&pages);
+                        progress.paused = false;
+                    }
+                    self.no_text_hint = None;
+                }
+                return;
+            }
+        }
+        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+            return;
+        };
+        tab.ocr.deep_running = true;
+        let progress = self.workers.start_deep_ocr(tab.id, tab.path.clone(), pages);
+        self.deep_ocr = Some(DeepOcrRun { tab_id: tab.id, progress, acknowledged: false });
+        self.no_text_hint = None;
+    }
+
+    /// Fenêtre de l'OCR approfondi : cette page, les pages autour, ou tout le document.
+    fn render_deep_ocr_dialog(&mut self, ctx: &Context) {
+        if self.deep_ocr_dialog.is_none() {
+            return;
+        }
+        // Une lecture sur un autre onglet bloque ; sur cet onglet, les pages demandées passent devant.
+        let Some(tab_id) = self.tabs.get(self.active_tab).map(|t| t.id) else {
+            self.deep_ocr_dialog = None;
+            return;
+        };
+        let running_here = self.deep_ocr_running_for(tab_id);
+        let busy_elsewhere = !running_here
+            && self.deep_ocr.as_ref().is_some_and(|r| !r.progress.lock().map(|p| p.finished).unwrap_or(true));
+        let Some(dialog) = self.deep_ocr_dialog.as_mut() else {
+            return;
+        };
+        let Some(tab) = self.tabs.get(self.active_tab) else {
+            return;
+        };
+        let page_count = tab.page_count();
+        let current = dialog.current_page.min(page_count.saturating_sub(1));
+        let around = current.saturating_sub(DEEP_OCR_PAGES_AROUND)..=(current + DEEP_OCR_PAGES_AROUND).min(page_count.saturating_sub(1));
+        let pending: Vec<usize> = match dialog.scope {
+            DeepOcrScope::CurrentPage => tab.deep_ocr_pending_pages(current..=current),
+            DeepOcrScope::Around => tab.deep_ocr_pending_pages(around.clone()),
+            DeepOcrScope::WholeDocument => tab.deep_ocr_pending_pages(0..=page_count.saturating_sub(1)),
+        };
+        let (_, lacking) = tab.text_coverage();
+        let seconds_per_page = self
+            .deep_ocr
+            .as_ref()
+            .and_then(|r| r.progress.lock().ok().map(|p| p.seconds_per_page(DEFAULT_DEEP_OCR_SECONDS_PER_PAGE)))
+            .unwrap_or(DEFAULT_DEEP_OCR_SECONDS_PER_PAGE);
+
+        let muted = Color32::from_rgb(150, 160, 182);
+        let mut start = false;
+        let mut close = false;
+        let screen = ctx.screen_rect();
+        ctx.layer_painter(egui::LayerId::new(Order::Foreground, egui::Id::new("deep_ocr_backdrop")))
+            .rect_filled(screen, CornerRadius::ZERO, Color32::from_rgba_unmultiplied(6, 8, 12, 150));
+        let width = 470.0_f32.min(screen.width() - 32.0);
+        egui::Area::new(egui::Id::new("superpdf_deep_ocr_dialog"))
+            .fixed_pos(Pos2::new(screen.center().x - width * 0.5, screen.min.y + screen.height() * 0.2))
+            .order(Order::Tooltip)
+            .show(ctx, |ui| {
+                egui::Frame::NONE
+                    .fill(Color32::from_rgb(24, 28, 39))
+                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(70, 100, 170)))
+                    .corner_radius(CornerRadius::same(14))
+                    .inner_margin(Margin::same(18))
+                    .show(ui, |ui| {
+                        ui.set_width(width - 36.0);
+                        ui.label(egui::RichText::new("OCR approfondi").size(17.0).color(Color32::WHITE));
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new(
+                                "L'OCR approfondi relit chaque page entière comme une image, figures \
+                                 comprises. Il retrouve le texte scanné ou dessiné que la recherche ne peut \
+                                 pas lire, mais il est lent : plusieurs secondes par page. Une fois le \
+                                 document enregistré, ce texte est cherchable ici et dans les autres \
+                                 lecteurs PDF.",
+                            )
+                            .size(12.0)
+                            .color(muted),
+                        );
+                        ui.add_space(10.0);
+                        ui.radio_value(
+                            &mut dialog.scope,
+                            DeepOcrScope::CurrentPage,
+                            format!("Cette page (p. {})", current + 1),
+                        );
+                        ui.radio_value(
+                            &mut dialog.scope,
+                            DeepOcrScope::Around,
+                            format!("Pages {} à {} (autour de celle-ci)", around.start() + 1, around.end() + 1),
+                        );
+                        ui.radio_value(
+                            &mut dialog.scope,
+                            DeepOcrScope::WholeDocument,
+                            format!("Tout le document ({page_count} pages)"),
+                        );
+                        ui.add_space(10.0);
+                        let summary = if pending.is_empty() {
+                            "Ces pages ont déjà été lues par l'OCR approfondi.".to_string()
+                        } else {
+                            format!(
+                                "{} page{} à lire · {}",
+                                pending.len(),
+                                if pending.len() > 1 { "s" } else { "" },
+                                format_duration(pending.len() as f32 * seconds_per_page)
+                            )
+                        };
+                        ui.label(egui::RichText::new(summary).size(12.5).color(Color32::WHITE));
+                        let mut notes = Vec::new();
+                        if lacking > 0 {
+                            notes.push(format!("{lacking} pages n'ont aucun texte lisible."));
+                        }
+                        notes.push("Le texte déjà présent n'est pas dupliqué.".to_string());
+                        if running_here {
+                            notes.push("Une lecture est en cours : ces pages passeront en premier.".to_string());
+                        } else {
+                            notes.push("Vous pouvez continuer à lire, mettre en pause ou arrêter.".to_string());
+                        }
+                        for note in notes {
+                            ui.label(egui::RichText::new(note).size(11.0).color(muted));
+                        }
+                        if busy_elsewhere {
+                            ui.label(
+                                egui::RichText::new("Une lecture est en cours dans un autre onglet : attendez sa fin ou arrêtez-la.")
+                                    .size(11.0)
+                                    .color(Color32::from_rgb(250, 200, 110)),
+                            );
+                        }
+                        ui.add_space(12.0);
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(!pending.is_empty() && !busy_elsewhere, egui::Button::new("Lancer l'OCR approfondi"))
+                                .clicked()
+                            {
+                                start = true;
+                            }
+                            if ui.button("Annuler").clicked() {
+                                close = true;
+                            }
+                        });
+                    });
+            });
+
+        if start {
+            self.deep_ocr_dialog = None;
+            self.start_deep_ocr(pending, current);
+        } else if close {
+            self.deep_ocr_dialog = None;
+        }
+    }
+
+    /// Avancement dans la barre latérale : pages lues, temps restant, pause et arrêt.
+    fn render_deep_ocr_progress(&mut self, ui: &mut egui::Ui) {
+        let Some(run) = &self.deep_ocr else {
+            return;
+        };
+        let is_active_tab = self.tabs.get(self.active_tab).is_some_and(|t| t.id == run.tab_id);
+        let Ok(progress) = run.progress.lock().map(|p| p.clone()) else {
+            return;
+        };
+        if progress.finished || !is_active_tab {
+            return;
+        }
+        let muted = Color32::from_rgb(150, 160, 182);
+        let remaining = (progress.total - progress.done) as f32
+            * progress.seconds_per_page(DEFAULT_DEEP_OCR_SECONDS_PER_PAGE);
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(format!("OCR approfondi {} / {}", progress.done, progress.total))
+                    .size(11.0)
+                    .color(Color32::WHITE),
+            );
+            ui.label(
+                egui::RichText::new(if progress.paused { "en pause".to_string() } else { format_duration(remaining) })
+                    .size(10.5)
+                    .color(muted),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("Arrêter").on_hover_text("Le texte déjà lu est conservé").clicked() {
+                    if let Ok(mut p) = run.progress.lock() {
+                        p.cancelled = true;
+                    }
+                }
+                let label = if progress.paused { "Reprendre" } else { "Pause" };
+                if ui.small_button(label).clicked() {
+                    if let Ok(mut p) = run.progress.lock() {
+                        p.paused = !p.paused;
+                    }
+                }
+            });
+        });
+        let fraction = progress.done as f32 / progress.total.max(1) as f32;
+        ui.add(egui::ProgressBar::new(fraction).desired_height(4.0));
+        ui.add_space(4.0);
+    }
+
+    /// Fin de lecture : invitation à enregistrer pour garder le texte.
+    fn render_deep_ocr_result(&mut self, ctx: &Context, canvas_rect: Rect) {
+        let Some(run) = &self.deep_ocr else {
+            return;
+        };
+        if run.acknowledged {
+            return;
+        }
+        let Ok(progress) = run.progress.lock().map(|p| p.clone()) else {
+            return;
+        };
+        if !progress.finished {
+            return;
+        }
+        let Some(tab_index) = self.tabs.iter().position(|t| t.id == run.tab_id) else {
+            self.deep_ocr = None;
+            return;
+        };
+        let (message, can_save) = match &progress.error {
+            Some(error) => (format!("L'OCR approfondi s'est arrêté : {error}"), progress.read > 0),
+            None if progress.read == 0 => ("OCR approfondi arrêté avant la première page.".to_string(), false),
+            None => (
+                format!(
+                    "OCR approfondi {} : texte lu sur {} page{}. Enregistrez le document pour le \
+                     garder : il sera cherchable ici et dans les autres lecteurs PDF.",
+                    if progress.cancelled { "arrêté" } else { "terminé" },
+                    progress.read,
+                    if progress.read > 1 { "s" } else { "" }
+                ),
+                true,
+            ),
+        };
+        let mut save = false;
+        let mut dismiss = false;
+        let width = (canvas_rect.width() - 48.0).min(520.0);
+        egui::Area::new(egui::Id::new("superpdf_deep_ocr_result"))
+            .fixed_pos(Pos2::new(canvas_rect.center().x - width * 0.5, canvas_rect.max.y - 130.0))
+            .order(Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::NONE
+                    .fill(Color32::from_rgb(26, 34, 48))
+                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(80, 130, 210)))
+                    .corner_radius(CornerRadius::same(12))
+                    .inner_margin(Margin::same(14))
+                    .show(ui, |ui| {
+                        ui.set_width(width - 28.0);
+                        ui.label(egui::RichText::new(message).size(12.5).color(Color32::WHITE));
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if can_save && ui.button("Enregistrer").clicked() {
+                                save = true;
+                            }
+                            if ui.button(if can_save { "Plus tard" } else { "Fermer" }).clicked() {
+                                dismiss = true;
+                            }
+                        });
+                    });
+            });
+        if save || dismiss {
+            if let Some(run) = &mut self.deep_ocr {
+                run.acknowledged = true;
+            }
+        }
+        if save {
+            if self.active_tab != tab_index {
+                self.switch_to_tab(tab_index);
+            }
+            self.save_active_tab_annotations();
+        }
+    }
+
+    /// Bulle proposée quand on essaie de sélectionner du texte sur une page qui n'en a pas.
+    fn render_no_text_hint(&mut self, ctx: &Context) {
+        let Some(hint) = &self.no_text_hint else {
+            return;
+        };
+        if hint.shown_at.elapsed() > NO_TEXT_HINT_DURATION {
+            self.no_text_hint = None;
+            return;
+        }
+        ctx.request_repaint_after(Duration::from_millis(250));
+        let (page, position) = (hint.page, hint.position);
+        let mut read_page = false;
+        let mut read = false;
+        let mut close = false;
+        egui::Area::new(egui::Id::new("superpdf_no_text_hint"))
+            .fixed_pos(position + Vec2::new(12.0, 12.0))
+            .order(Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::NONE
+                    .fill(Color32::from_rgb(26, 34, 48))
+                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(80, 130, 210)))
+                    .corner_radius(CornerRadius::same(10))
+                    .inner_margin(Margin::same(10))
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new("Cette page n'a pas de texte sélectionnable.")
+                                .size(12.0)
+                                .color(Color32::WHITE),
+                        );
+                        ui.horizontal(|ui| {
+                            if ui
+                                .button("Lire cette page")
+                                .on_hover_text("OCR approfondi de cette page seulement (quelques secondes)")
+                                .clicked()
+                            {
+                                read_page = true;
+                            }
+                            if ui.button("OCR approfondi…").clicked() {
+                                read = true;
+                            }
+                            if ui.small_button("✖").clicked() {
+                                close = true;
+                            }
+                        });
+                    });
+            });
+        if read_page {
+            self.start_deep_ocr(vec![page], page);
+        }
+        if read {
+            let viewport = self.canvas_size;
+            self.open_deep_ocr_dialog(viewport);
+        }
+        if read_page || read || close {
+            self.no_text_hint = None;
+        }
+    }
+
     /// Barre centrale (`Ctrl+T`) : retrouve un PDF de l'historique, un onglet, une page ou un outil.
     fn render_command_palette(&mut self, ctx: &Context, canvas_rect: Rect) {
         let tabs_info: Vec<(usize, String, usize, PathBuf)> = self
@@ -4286,7 +4943,10 @@ impl SuperPdfApp {
             active_pages,
             &self.recent_files,
             now,
+            &self.number_history,
         );
+        let typed_bare_number =
+            crate::tabs::bare_number(&crate::recent_files::normalize(&self.command_palette.query)).is_some();
         if self.command_palette.selected_index >= entries.len() {
             self.command_palette.selected_index = entries.len().saturating_sub(1);
         }
@@ -4481,6 +5141,13 @@ impl SuperPdfApp {
             self.command_palette.close();
         }
         if let Some(cmd) = command_to_run {
+            if typed_bare_number {
+                match cmd {
+                    PaletteCommand::JumpToPage(_) => self.number_history.record(crate::tabs::NumberChoice::Page),
+                    PaletteCommand::SetZoomPercent(_) => self.number_history.record(crate::tabs::NumberChoice::Zoom),
+                    _ => {}
+                }
+            }
             self.execute_palette_command(cmd, canvas_rect.size());
         }
     }
@@ -4490,6 +5157,7 @@ impl SuperPdfApp {
 fn palette_entry_icon(entry: &crate::tabs::PaletteEntry) -> (&'static str, Color32) {
     match entry.category {
         "Récent" => ("📄", Color32::from_rgb(235, 120, 110)),
+        "Zoom" => ("🔍", Color32::from_rgb(140, 220, 170)),
         "Onglet" => ("📑", Color32::from_rgb(120, 190, 255)),
         "Page" => ("↪", Color32::from_rgb(140, 220, 170)),
         "Outil" => ("🛠", Color32::from_rgb(250, 205, 110)),
