@@ -1,4 +1,4 @@
-//! Réglages gardés d'un lancement à l'autre : position et taille de la fenêtre, barre latérale.
+//! Réglages gardés d'un lancement à l'autre : fenêtre, barre latérale et préférences de la page Réglages.
 //! Fichier texte `clé=valeur` dans `%APPDATA%\KitePDF\settings.txt`.
 
 use std::path::PathBuf;
@@ -11,6 +11,55 @@ pub struct Settings {
     pub sidebar_pinned: Option<bool>,
     pub sidebar_width: Option<f32>,
     pub drawer_height: Option<f32>,
+    /// Écran d'accueil déjà montré (premier lancement)
+    pub welcome_seen: bool,
+    /// Choix de la page Réglages
+    pub prefs: Preferences,
+}
+
+/// Lecture du texte des images (OCR) pendant la lecture.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ImageOcr {
+    /// En arrière-plan, page après page
+    #[default]
+    Auto,
+    /// Seulement pendant une recherche (`Ctrl+F`)
+    OnSearch,
+    Never,
+}
+
+/// Zoom d'un PDF ouvert pour la première fois.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OpenZoom {
+    #[default]
+    Actual,
+    FitWidth,
+    FitPage,
+}
+
+/// Préférences modifiables dans la page Réglages.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Preferences {
+    pub image_ocr: ImageOcr,
+    pub open_zoom: OpenZoom,
+    /// Rouvrir un PDF à la page et au zoom où on l'avait laissé
+    pub resume_reading: bool,
+    /// Garder la liste des PDF ouverts récemment
+    pub keep_history: bool,
+    /// Consulter GitHub une fois par jour pour signaler une nouvelle version
+    pub check_updates: bool,
+}
+
+impl Default for Preferences {
+    fn default() -> Self {
+        Self {
+            image_ocr: ImageOcr::Auto,
+            open_zoom: OpenZoom::Actual,
+            resume_reading: true,
+            keep_history: true,
+            check_updates: true,
+        }
+    }
 }
 
 /// Variable d'environnement : dossier des réglages et de l'historique à la place de
@@ -80,6 +129,24 @@ impl Settings {
                 "sidebar_pinned" => settings.sidebar_pinned = Some(value.trim() == "1"),
                 "sidebar_width" => settings.sidebar_width = value.trim().parse().ok(),
                 "drawer_height" => settings.drawer_height = value.trim().parse().ok(),
+                "welcome_seen" => settings.welcome_seen = value.trim() == "1",
+                "image_ocr" => {
+                    settings.prefs.image_ocr = match value.trim() {
+                        "search" => ImageOcr::OnSearch,
+                        "never" => ImageOcr::Never,
+                        _ => ImageOcr::Auto,
+                    }
+                }
+                "open_zoom" => {
+                    settings.prefs.open_zoom = match value.trim() {
+                        "width" => OpenZoom::FitWidth,
+                        "page" => OpenZoom::FitPage,
+                        _ => OpenZoom::Actual,
+                    }
+                }
+                "resume_reading" => settings.prefs.resume_reading = value.trim() != "0",
+                "keep_history" => settings.prefs.keep_history = value.trim() != "0",
+                "check_updates" => settings.prefs.check_updates = value.trim() != "0",
                 _ => {}
             }
         }
@@ -100,6 +167,28 @@ impl Settings {
         }
         if let Some(height) = self.drawer_height {
             text.push_str(&format!("drawer_height={height:.0}\n"));
+        }
+        if self.welcome_seen {
+            text.push_str("welcome_seen=1\n");
+        }
+        let prefs = &self.prefs;
+        let image_ocr = match prefs.image_ocr {
+            ImageOcr::Auto => "auto",
+            ImageOcr::OnSearch => "search",
+            ImageOcr::Never => "never",
+        };
+        let open_zoom = match prefs.open_zoom {
+            OpenZoom::Actual => "100",
+            OpenZoom::FitWidth => "width",
+            OpenZoom::FitPage => "page",
+        };
+        text.push_str(&format!("image_ocr={image_ocr}\nopen_zoom={open_zoom}\n"));
+        for (key, value) in [
+            ("resume_reading", prefs.resume_reading),
+            ("keep_history", prefs.keep_history),
+            ("check_updates", prefs.check_updates),
+        ] {
+            text.push_str(&format!("{key}={}\n", u8::from(value)));
         }
         text
     }
@@ -136,9 +225,19 @@ mod tests {
             sidebar_pinned: Some(false),
             sidebar_width: Some(320.0),
             drawer_height: Some(180.0),
+            welcome_seen: true,
+            prefs: Preferences {
+                image_ocr: ImageOcr::OnSearch,
+                open_zoom: OpenZoom::FitWidth,
+                resume_reading: false,
+                keep_history: true,
+                check_updates: false,
+            },
         };
         assert_eq!(Settings::parse(&settings.render()), settings);
         assert!(settings.window_is_plausible());
+        // Ancien fichier sans préférences : valeurs par défaut (OCR automatique, reprise, historique).
+        assert_eq!(Settings::parse("maximized=1\n").prefs, Preferences::default());
         // Fenêtre restée sur un écran débranché : ignorée.
         let lost = Settings { window: Some([-5000.0, 80.0, 1280.0, 820.0]), ..Default::default() };
         assert!(!lost.window_is_plausible());

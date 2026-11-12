@@ -388,6 +388,12 @@ pub struct AutomationConfig {
     pub initial_password: Option<String>,
     /// Lance l'OCR approfondi de tout le document au démarrage (captures QA)
     pub deep_ocr_all: bool,
+    /// Montre l'écran d'accueil du premier lancement (captures QA)
+    pub show_welcome: bool,
+    /// Montre l'aide-mémoire des raccourcis (captures QA)
+    pub show_shortcuts: bool,
+    /// Montre la page Réglages (captures QA)
+    pub show_settings: bool,
     pub save_annotated_output: Option<PathBuf>,
     pub screenshot_output: Option<PathBuf>,
     /// Délai avant la capture (permet à un script QA d'envoyer des événements à la fenêtre)
@@ -417,6 +423,12 @@ pub struct KiteApp {
     number_history: crate::tabs::NumberHistory,
     /// Réglages gardés entre deux lancements (aucun en capture automatisée)
     settings: Option<crate::settings::Settings>,
+    /// Préférences en vigueur (celles du fichier de réglages, ou par défaut pour une capture automatisée)
+    prefs: crate::settings::Preferences,
+    /// Page Réglages ouverte
+    settings_open: bool,
+    /// « Effacer l'historique » cliqué une première fois : attend la confirmation
+    confirm_clear_history: bool,
     /// Dernière position et taille connues de la fenêtre non agrandie, et si elle est agrandie
     last_window: Option<[f32; 4]>,
     last_maximized: bool,
@@ -434,6 +446,10 @@ pub struct KiteApp {
     update_banner_closed: bool,
     /// Logo affiché en haut de la barre latérale
     logo: Option<egui::TextureHandle>,
+    /// Écran d'accueil du premier lancement affiché
+    welcome_open: bool,
+    /// Aide-mémoire des raccourcis affiché (`F1`)
+    shortcuts_open: bool,
     first_render_reported: bool,
     /// Dernière page vue en cours de lecture des images (onglet, page), pour l'afficher entre deux pages
     last_image_ocr_page: Option<(u64, usize)>,
@@ -615,6 +631,11 @@ impl KiteApp {
             dependency_warning_closed: false,
             update_banner_closed: false,
             logo: load_logo(egui_ctx),
+            welcome_open: false,
+            settings_open: automation.show_settings,
+            confirm_clear_history: false,
+            prefs: crate::settings::Preferences::default(),
+            shortcuts_open: automation.show_shortcuts,
             first_render_reported: false,
             last_image_ocr_page: None,
             deep_ocr: None,
@@ -649,8 +670,17 @@ impl KiteApp {
         for extra in &automation.extra_pdfs {
             app.open_pdf_in_new_tab(extra);
         }
+        if let Some(settings) = &app.settings {
+            app.prefs = settings.prefs.clone();
+        }
+        // Premier lancement : quelques gestes pour bien démarrer.
+        app.welcome_open = automation.show_welcome || app.settings.as_ref().is_some_and(|s| !s.welcome_seen);
         // Lancé sans fichier : la barre centrale propose directement les PDF récents.
-        if app.tabs.is_empty() && automation.open_palette_query.is_none() && app.password_prompt.is_none() {
+        if app.tabs.is_empty()
+            && !app.welcome_open
+            && automation.open_palette_query.is_none()
+            && app.password_prompt.is_none()
+        {
             app.command_palette.open();
         }
 
@@ -893,13 +923,24 @@ impl KiteApp {
                 if !tab.page_details_complete() {
                     self.workers.scan_page_details(id, tab.path.clone(), tab.page_count());
                 }
-                let reading = self.recent_files.reading_for(path);
+                let reading = self.prefs.resume_reading.then(|| self.recent_files.reading_for(path)).flatten();
                 self.tabs.push(tab);
-                self.recent_files.record_open(path);
-                if let (Some((page, zoom)), Some(tab)) = (reading, self.tabs.last_mut()) {
-                    tab.viewport.zoom = zoom.clamp(0.1, 32.0);
+                if self.prefs.keep_history {
+                    self.recent_files.record_open(path);
+                }
+                if let Some(tab) = self.tabs.last_mut() {
                     let pages = tab.page_dimensions.clone();
-                    tab.viewport.jump_to_page(page.min(pages.len().saturating_sub(1)), self.canvas_size, &pages);
+                    match reading {
+                        Some((page, zoom)) => {
+                            tab.viewport.zoom = zoom.clamp(0.1, 32.0);
+                            tab.viewport.jump_to_page(page.min(pages.len().saturating_sub(1)), self.canvas_size, &pages);
+                        }
+                        None => match self.prefs.open_zoom {
+                            crate::settings::OpenZoom::Actual => {}
+                            crate::settings::OpenZoom::FitWidth => tab.viewport.fit_to_width(self.canvas_size, &pages),
+                            crate::settings::OpenZoom::FitPage => tab.viewport.fit_to_page(self.canvas_size, &pages),
+                        },
+                    }
                 }
                 self.active_tab = self.tabs.len() - 1;
                 self.error_message = None;
@@ -1581,6 +1622,9 @@ impl KiteApp {
 
     /// Note la page et le zoom de l'onglet `index` dans l'historique, pour y revenir à la réouverture.
     fn remember_reading(&mut self, index: usize) {
+        if !self.prefs.resume_reading || !self.prefs.keep_history {
+            return;
+        }
         let Some(tab) = self.tabs.get(index) else { return };
         if tab.page_count() == 0 {
             return;
@@ -1603,6 +1647,7 @@ impl KiteApp {
             settings.sidebar_pinned = Some(self.sidebar.pinned);
             settings.sidebar_width = Some(self.sidebar.width);
             settings.drawer_height = Some(self.sidebar.drawer_height);
+            settings.prefs = self.prefs.clone();
             settings.save();
         }
     }
@@ -1763,7 +1808,7 @@ impl KiteApp {
                 } else {
                     self.recent_files.remove(&path);
                     self.error_message =
-                        Some(format!("Fichier introuvable : {}", path.display()));
+                        Some(format!("« {} » est introuvable : il a peut-être été déplacé ou supprimé.", path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()));
                 }
             }
             PaletteCommand::ReopenClosedTab => {
@@ -1774,16 +1819,25 @@ impl KiteApp {
                     }
                 }
             }
+            PaletteCommand::OpenSettings => {
+                self.settings_open = true;
+            }
+            PaletteCommand::ShowShortcuts => {
+                self.shortcuts_open = true;
+            }
             PaletteCommand::OpenDeepOcrDialog => {
                 self.open_deep_ocr_dialog(viewport_size);
             }
             PaletteCommand::OpenSearch => {
                 self.search_bar.open();
+                let read_images = self.prefs.image_ocr != crate::settings::ImageOcr::Never;
                 if let Some(tab) = self.tabs.get_mut(self.active_tab) {
                     let p = tab.viewport.current_page_index(viewport_size, &tab.page_dimensions);
                     tab.request_all_text(&self.workers);
-                    tab.start_turbo_ocr();
-                    tab.pump_ocr(p, &self.workers);
+                    if read_images {
+                        tab.start_turbo_ocr();
+                        tab.pump_ocr(p, &self.workers);
+                    }
                 }
             }
             PaletteCommand::UndoAnnotation => {
@@ -1971,8 +2025,16 @@ impl KiteApp {
             if ctrl && input.key_pressed(Key::K) {
                 self.command_palette.toggle();
             }
+            if ctrl && input.key_pressed(Key::Comma) {
+                self.settings_open = !self.settings_open;
+            }
+            if input.key_pressed(Key::F1) {
+                self.shortcuts_open = !self.shortcuts_open;
+            }
             if input.key_pressed(Key::Escape) {
-                if self.save_error.is_some() {
+                if self.welcome_open || self.shortcuts_open || self.settings_open {
+                    // Fermés par leur fenêtre.
+                } else if self.save_error.is_some() {
                     self.save_error = None;
                 } else if self.editing_freetext_id.is_some()
                     || self.line_context_menu.is_some()
@@ -2187,13 +2249,16 @@ impl KiteApp {
 
         if trigger_search_open {
             self.search_bar.open();
+            let read_images = self.prefs.image_ocr != crate::settings::ImageOcr::Never;
             if let Some(tab) = self.tabs.get_mut(self.active_tab) {
                 let p = tab
                     .viewport
                     .current_page_index(viewport_size, &tab.page_dimensions);
                 tab.request_all_text(&self.workers);
-                tab.start_turbo_ocr();
-                tab.pump_ocr(p, &self.workers);
+                if read_images {
+                    tab.start_turbo_ocr();
+                    tab.pump_ocr(p, &self.workers);
+                }
             }
         }
 
@@ -2821,6 +2886,7 @@ impl eframe::App for KiteApp {
                 self.handle_inputs(ctx, canvas_rect);
                 self.handle_scrollbar(ctx, canvas_rect);
 
+                let image_ocr = self.prefs.image_ocr;
                 if let Some(tab) = self.tabs.get_mut(self.active_tab) {
                     if tab.is_hibernated() {
                         let _ = tab.ensure_awake(self.engine);
@@ -2837,8 +2903,15 @@ impl eframe::App for KiteApp {
                         ctx.set_cursor_icon(egui::CursorIcon::Grab);
                     }
                     // Phase 2/3 : Éco uniquement au repos, Turbo en continu. Le calcul se fait sur le thread OCR.
+                    // Selon les réglages : en continu, seulement pendant une recherche, ou jamais.
                     let is_idle = tab.viewport.inertia_velocity.length_sq() < 0.1;
-                    if is_idle || tab.ocr.mode == crate::ocr_engine::OcrSpeedMode::TurboSearch {
+                    let searching = tab.ocr.mode == crate::ocr_engine::OcrSpeedMode::TurboSearch;
+                    let read_now = match image_ocr {
+                        crate::settings::ImageOcr::Auto => is_idle || searching,
+                        crate::settings::ImageOcr::OnSearch => searching,
+                        crate::settings::ImageOcr::Never => false,
+                    };
+                    if read_now {
                         let vis_p = tab
                             .viewport
                             .current_page_index(canvas_rect.size(), &tab.page_dimensions);
@@ -2886,7 +2959,7 @@ impl eframe::App for KiteApp {
 
                 let painter = ui.painter_at(canvas_rect);
 
-                if self.tabs.is_empty() && !self.command_palette.is_open {
+                if self.tabs.is_empty() && !self.command_palette.is_open && !self.welcome_open {
                     painter.text(
                         canvas_rect.center() - Vec2::new(0.0, 14.0),
                         Align2::CENTER_CENTER,
@@ -2903,13 +2976,12 @@ impl eframe::App for KiteApp {
                     );
                 }
                 if let Some(err) = &self.error_message {
-                    painter.text(
-                        canvas_rect.center() + Vec2::new(0.0, if self.tabs.is_empty() { 60.0 } else { 0.0 }),
-                        Align2::CENTER_CENTER,
-                        format!("Erreur : {}", err),
-                        FontId::proportional(16.0),
-                        Color32::from_rgb(255, 110, 110),
-                    );
+                    // Message centré, sur plusieurs lignes si la fenêtre est étroite.
+                    let color = Color32::from_rgb(255, 120, 120);
+                    let wrap = (canvas_rect.width() - 64.0).clamp(200.0, 640.0);
+                    let galley = painter.layout(err.clone(), FontId::proportional(16.0), color, wrap);
+                    let center = canvas_rect.center() + Vec2::new(0.0, if self.tabs.is_empty() { 60.0 } else { 0.0 });
+                    painter.galley(center - galley.size() * 0.5, galley, color);
                 } else if let Some(tab) = self.tabs.get(self.active_tab) {
                     let (_, _, total_h) = tab.viewport.compute_layout(&tab.page_dimensions);
                     // Le rendu suit les pixels physiques de l'écran (échelle Windows comprise), et n'est
@@ -3310,28 +3382,12 @@ impl eframe::App for KiteApp {
                                 if is_active_match {
                                     if let Some(first_b) = m.highlight_boxes.first() {
                                         let screen_b = first_b.to_screen_rect(page_rect, page_dim);
-                                        let ocr_prefix = if m.is_ocr { "OCR " } else { "" };
-                                        let label = if m.angle_deg.abs() > 1.0 {
-                                            format!(
-                                                "🔎 {}#{}/{} (Orienté {:+.0}°)",
-                                                ocr_prefix,
-                                                m_idx + 1,
-                                                self.search_bar.matches.len(),
-                                                m.angle_deg
-                                            )
-                                        } else if m.is_ocr {
-                                            format!(
-                                                "🔎 OCR #{}/{} (0°)",
-                                                m_idx + 1,
-                                                self.search_bar.matches.len()
-                                            )
-                                        } else {
-                                            format!(
-                                                "🔎 Occurrence #{}/{}",
-                                                m_idx + 1,
-                                                self.search_bar.matches.len()
-                                            )
-                                        };
+                                        let where_found = if m.is_ocr { " · dans une image" } else { "" };
+                                        let label = format!(
+                                            "🔎 {} / {}{where_found}",
+                                            m_idx + 1,
+                                            self.search_bar.matches.len()
+                                        );
                                         let badge_w = (label.chars().count() as f32 * 6.8).max(140.0);
                                         let badge_rect = Rect::from_min_size(
                                             Pos2::new(
@@ -3429,6 +3485,8 @@ impl eframe::App for KiteApp {
                 self.render_save_error_popup(ctx);
                 self.render_dependency_warning(ctx, canvas_rect);
                 self.render_update_banner(ctx, canvas_rect);
+                self.render_settings(ctx);
+                self.render_help(ctx);
 
                 // Barre de recherche flottante `Ctrl+F`
                 if self.search_bar.is_open {
@@ -4699,14 +4757,14 @@ impl KiteApp {
 
                             if ui
                                 .add_enabled(total > 0, egui::Button::new("◀").small())
-                                .on_hover_text("Occurrence précédente (Shift+Entrée)")
+                                .on_hover_text("Résultat précédent (Maj+Entrée)")
                                 .clicked()
                             {
                                 step_dir = -1;
                             }
                             if ui
                                 .add_enabled(total > 0, egui::Button::new("▶").small())
-                                .on_hover_text("Occurrence suivante (Entrée)")
+                                .on_hover_text("Résultat suivant (Entrée)")
                                 .clicked()
                             {
                                 step_dir = 1;
@@ -4762,14 +4820,17 @@ impl KiteApp {
         });
 
         if run_search {
+            let read_images = self.prefs.image_ocr != crate::settings::ImageOcr::Never;
             if let Some(tab) = self.tabs.get_mut(self.active_tab) {
                 let vis_p = tab
                     .viewport
                     .current_page_index(canvas_rect.size(), &tab.page_dimensions);
                 // Phase 3 : les résultats s'ajoutent au fil de l'indexation, sans bloquer la saisie.
                 tab.request_all_text(&self.workers);
-                tab.start_turbo_ocr();
-                tab.pump_ocr(vis_p, &self.workers);
+                if read_images {
+                    tab.start_turbo_ocr();
+                    tab.pump_ocr(vis_p, &self.workers);
+                }
                 self.search_bar.execute_search(&tab.text_layers);
             }
             self.scroll_to_current_search_match(canvas_rect.size());
@@ -4816,22 +4877,22 @@ impl KiteApp {
                         };
                         if ui
                             .small_button(pin_label)
-                            .on_hover_text("Basculer Épinglée / Auto-Hide plein écran (Ctrl+B)")
+                            .on_hover_text("Garder la barre ouverte, ou la masquer et la faire apparaître au bord gauche (Ctrl+B)")
                             .clicked()
                         {
                             pending_cmd = Some(PaletteCommand::ToggleSidebarPin);
                         }
 
+                        if ui.small_button("⚙").on_hover_text("Réglages (Ctrl+,)").clicked() {
+                            self.settings_open = true;
+                        }
+
                         if ui
                             .small_button("🔎")
-                            .on_hover_text("Recherche dans le PDF (Ctrl+F)")
+                            .on_hover_text("Chercher un mot dans le PDF (Ctrl+F)")
                             .clicked()
                         {
-                            self.search_bar.open();
-                            if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-                                tab.request_all_text(&self.workers);
-                                tab.start_turbo_ocr();
-                            }
+                            pending_cmd = Some(PaletteCommand::OpenSearch);
                         }
 
                     });
@@ -4924,7 +4985,7 @@ impl KiteApp {
 
                             if ui
                                 .add(btn)
-                                .on_hover_text(format!("{} (Raccourci : {})", label, shortcut))
+                                .on_hover_text(format!("{label} (touche {shortcut})"))
                                 .clicked()
                             {
                                 self.active_tool = *tool;
@@ -5272,18 +5333,12 @@ impl KiteApp {
                                         .corner_radius(CornerRadius::same(5))
                                         .inner_margin(Margin::symmetric(6, 3))
                                         .show(ui, |ui| {
-                                            let ocr_tag = if m.is_ocr { " [OCR]" } else { "" };
-                                            let angle_tag = if m.angle_deg.abs() > 1.0 {
-                                                format!(" [↗{:+.0}°]", m.angle_deg)
-                                            } else {
-                                                String::new()
-                                            };
+                                            let ocr_tag = if m.is_ocr { " · image" } else { "" };
                                             let btn = egui::Button::new(
                                                 egui::RichText::new(format!(
-                                                    "P.{}{}{} : {}",
+                                                    "p. {}{} : {}",
                                                     m.page_index + 1,
                                                     ocr_tag,
-                                                    angle_tag,
                                                     m.snippet
                                                 ))
                                                 .size(10.5)
@@ -5323,6 +5378,7 @@ impl KiteApp {
             .show(ui, |ui| {
                 let muted = Color32::from_rgb(140, 150, 172);
                 let viewport_size = self.canvas_size;
+                let image_ocr = self.prefs.image_ocr;
                 self.render_deep_ocr_progress(ui);
                 let Some(tab) = self.tabs.get_mut(self.active_tab) else {
                     return;
@@ -5333,14 +5389,14 @@ impl KiteApp {
                 } else if self.ocr_install.is_some() {
                     ui.horizontal(|ui| {
                         ui.add(egui::Spinner::new().size(11.0).color(muted));
-                        ui.label(egui::RichText::new("Téléchargement de l'OCR").size(10.5).color(muted));
+                        ui.label(egui::RichText::new("Installation de la lecture des images").size(10.5).color(muted));
                     });
                     ui.add_space(2.0);
                 } else if let Some(reason) = &tab.ocr.unavailable_reason {
-                    ui.label(egui::RichText::new("OCR indisponible").size(10.5).color(muted))
+                    ui.label(egui::RichText::new("Lecture des images indisponible").size(10.5).color(muted))
                         .on_hover_text(reason.as_str());
                     ui.add_space(2.0);
-                } else if tab.ocr.page_scanned.iter().any(|scanned| !scanned) {
+                } else if image_ocr_working(image_ocr, tab.ocr.mode) && tab.ocr.page_scanned.iter().any(|scanned| !scanned) {
                     // Affichée tant qu'il reste des pages, pas seulement pendant le calcul : en mode
                     // éco, l'OCR se repose entre deux pages, et la ligne disparaissait puis
                     // réapparaissait en faisant sauter les boutons du dessous.
@@ -5528,6 +5584,92 @@ impl KiteApp {
                         self.render_sidebar_contents(ui);
                     });
             });
+    }
+
+    /// Page Réglages : applique et enregistre chaque changement.
+    fn render_settings(&mut self, ctx: &Context) {
+        if !self.settings_open {
+            self.confirm_clear_history = false;
+            return;
+        }
+        use crate::settings_page::{Action, OcrStatus, PageInfo};
+        let ocr = if self.ocr_install.is_some() {
+            OcrStatus::Downloading
+        } else if crate::deps::missing().iter().any(|d| !d.required) {
+            OcrStatus::Missing
+        } else {
+            OcrStatus::Installed
+        };
+        let info = PageInfo {
+            ocr,
+            history_len: self.recent_files.items.len(),
+            confirm_clear_history: self.confirm_clear_history,
+        };
+        let mut prefs = self.prefs.clone();
+        let actions = crate::settings_page::show(ctx, &mut prefs, &info);
+        if prefs != self.prefs {
+            self.prefs = prefs;
+            if let Some(settings) = &mut self.settings {
+                settings.prefs = self.prefs.clone();
+                settings.save();
+            }
+        }
+        for action in actions {
+            match action {
+                Action::Close => self.settings_open = false,
+                Action::AskClearHistory => self.confirm_clear_history = true,
+                Action::CancelClearHistory => self.confirm_clear_history = false,
+                Action::ConfirmClearHistory => {
+                    self.recent_files.clear();
+                    self.confirm_clear_history = false;
+                }
+                Action::InstallOcr => {
+                    let missing: Vec<_> = crate::deps::missing().into_iter().filter(|d| !d.required).collect();
+                    if self.ocr_install.is_none() && !missing.is_empty() {
+                        self.ocr_install = Some(crate::setup::InstallJob::start(missing, ctx.clone()));
+                    }
+                }
+                Action::MakeDefaultReader => {
+                    let uri = format!("ms-settings:defaultapps?registeredAppUser={}", crate::APP_NAME);
+                    let _ = std::process::Command::new("explorer").arg(uri).spawn();
+                }
+                Action::OpenProjectPage => {
+                    let _ = std::process::Command::new("explorer").arg("https://github.com/padimato/kite-pdf").spawn();
+                }
+                Action::ShowShortcuts => {
+                    self.settings_open = false;
+                    self.shortcuts_open = true;
+                }
+                Action::ShowWelcome => {
+                    self.settings_open = false;
+                    self.welcome_open = true;
+                }
+            }
+        }
+    }
+
+    /// Accueil du premier lancement et aide-mémoire des raccourcis.
+    fn render_help(&mut self, ctx: &Context) {
+        if self.welcome_open {
+            if let Some(action) = crate::help::show_welcome(ctx, self.logo.as_ref()) {
+                self.welcome_open = false;
+                if let Some(settings) = &mut self.settings {
+                    settings.welcome_seen = true;
+                    settings.save();
+                }
+                match action {
+                    crate::help::WelcomeAction::OpenFile => self.execute_palette_command(PaletteCommand::OpenFileDialog, self.canvas_size),
+                    crate::help::WelcomeAction::ShowShortcuts => self.shortcuts_open = true,
+                    crate::help::WelcomeAction::Start => {
+                        if self.tabs.is_empty() {
+                            self.command_palette.open();
+                        }
+                    }
+                }
+            }
+        } else if self.shortcuts_open {
+            self.shortcuts_open = crate::help::show_shortcuts(ctx);
+        }
     }
 
     /// Bandeau discret en bas de la fenêtre : une nouvelle version est publiée.
@@ -6216,6 +6358,15 @@ fn palette_entry_icon(entry: &crate::tabs::PaletteEntry) -> (&'static str, Color
         "Page" => ("↪", Color32::from_rgb(140, 220, 170)),
         "Outil" => ("🛠", Color32::from_rgb(250, 205, 110)),
         _ => ("⚡", Color32::from_rgb(170, 160, 250)),
+    }
+}
+
+/// L'OCR des images travaille-t-il en ce moment, d'après les réglages ? (sinon, pas de ligne d'état)
+fn image_ocr_working(setting: crate::settings::ImageOcr, mode: crate::ocr_engine::OcrSpeedMode) -> bool {
+    match setting {
+        crate::settings::ImageOcr::Auto => true,
+        crate::settings::ImageOcr::OnSearch => mode == crate::ocr_engine::OcrSpeedMode::TurboSearch,
+        crate::settings::ImageOcr::Never => false,
     }
 }
 

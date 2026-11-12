@@ -703,6 +703,8 @@ pub enum PaletteCommand {
     OpenFileDialog,
     OpenSearch,
     OpenDeepOcrDialog,
+    ShowShortcuts,
+    OpenSettings,
     SaveAnnotatedPdf,
     SaveAs,
     Print,
@@ -882,7 +884,9 @@ fn action_specs() -> Vec<ActionSpec> {
         ActionSpec::new("Affichage", "Afficher la page entière", "", "ajuster page entiere zoom", "Ctrl+0", C::FitToPage),
         ActionSpec::new("Affichage", "Zoom à 100 %", "", "zoom", "100%", C::ZoomReset100),
         ActionSpec::new("Affichage", "Épingler ou masquer la barre latérale", "", "barre laterale epingler masquer", "Ctrl+B", C::ToggleSidebarPin),
-        ActionSpec::new("Mémoire", "Libérer la mémoire des onglets inactifs", "", "memoire liberer", "Purge", C::HibernateInactiveTabs),
+        ActionSpec::new("Aide", "Réglages", "Zoom à l'ouverture, lecture des images, historique…", "reglages parametres options preferences configuration", "Ctrl+,", C::OpenSettings),
+        ActionSpec::new("Aide", "Raccourcis clavier", "Tous les raccourcis, par thème", "aide raccourcis clavier touches help", "F1", C::ShowShortcuts),
+        ActionSpec::new("Mémoire", "Libérer la mémoire des onglets inactifs", "Met en veille les onglets que vous ne regardez pas", "memoire liberer", "", C::HibernateInactiveTabs),
     ];
     for tool in ActiveTool::all() {
         let (_, name, key) = tool.icon_and_label();

@@ -311,8 +311,10 @@ pub struct SearchMatch {
     pub page_index: usize,
     pub snippet: String,
     pub highlight_boxes: Vec<PdfTopDownRect>,
+    /// Orientation du texte trouvé (vérifiée par les tests de l'OCR)
+    #[cfg_attr(not(test), allow(dead_code))]
     pub angle_deg: f32,
-    #[allow(dead_code)]
+    /// Trouvé dans le texte d'une image (OCR)
     pub is_ocr: bool,
 }
 

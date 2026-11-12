@@ -121,6 +121,12 @@ impl RecentFiles {
         self.items.iter_mut().find(|f| same_path(&f.path, &canonical))
     }
 
+    /// Efface tout l'historique (et les pages où chaque lecture s'était arrêtée).
+    pub fn clear(&mut self) {
+        self.items.clear();
+        self.save();
+    }
+
     pub fn remove(&mut self, path: &Path) {
         self.items.retain(|f| !same_path(&f.path, path));
         self.save();

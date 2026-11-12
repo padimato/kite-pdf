@@ -9,7 +9,7 @@
 # Pour passer à une nouvelle version : changer `version`, `url` et `sha256`, puis lancer `cargo test`.
 
 [[dependency]]
-name = "PDFium"
+name = "Moteur PDF (PDFium)"
 version = "chromium/8138"
 required = true
 url = "https://github.com/bblanchon/pdfium-binaries/releases/download/chromium%2F8138/pdfium-win-x64.tgz"
@@ -18,7 +18,7 @@ destination = "pdfium.dll"
 sha256 = "71a3e63e6ab8f5746a0fc9de9bc3d0c0dc07eb60990dfd37d9db7fc891821943"
 
 [[dependency]]
-name = "ONNX Runtime"
+name = "Lecture des images : moteur (ONNX Runtime)"
 version = "1.28.0"
 required = false
 url = "https://github.com/microsoft/onnxruntime/releases/download/v1.28.0/onnxruntime-win-x64-1.28.0.zip"
@@ -27,7 +27,7 @@ destination = "assets/models/onnxruntime.dll"
 sha256 = "18370c375f07357fa5874344a9d9ac17e6b6fe1eb18b1dd209d79483b4470257"
 
 [[dependency]]
-name = "Modèle OCR : détection (PP-OCRv5)"
+name = "Lecture des images : repérage du texte"
 version = "oar-ocr v0.3.0"
 required = false
 url = "https://github.com/GreatV/oar-ocr/releases/download/v0.3.0/pp-ocrv5_mobile_det.onnx"
@@ -35,7 +35,7 @@ destination = "assets/models/pp-ocrv5_mobile_det.onnx"
 sha256 = "1eb7b4f7ab657ebd1c66d5f79bca7497f29768a2e3c15e52daecbba1a8e4a039"
 
 [[dependency]]
-name = "Modèle OCR : reconnaissance latine (PP-OCRv5)"
+name = "Lecture des images : reconnaissance des lettres"
 version = "oar-ocr v0.3.0"
 required = false
 url = "https://github.com/GreatV/oar-ocr/releases/download/v0.3.0/latin_pp-ocrv5_mobile_rec.onnx"
@@ -43,7 +43,7 @@ destination = "assets/models/latin_pp-ocrv5_mobile_rec.onnx"
 sha256 = "e3a6bfeea1c8a01d6fccfd480a0bd363fd907f8c65931e228bb2736f5c3e142f"
 
 [[dependency]]
-name = "Modèle OCR : dictionnaire latin"
+name = "Lecture des images : alphabet"
 version = "oar-ocr v0.3.0"
 required = false
 url = "https://github.com/GreatV/oar-ocr/releases/download/v0.3.0/ppocrv5_latin_dict.txt"
@@ -51,7 +51,7 @@ destination = "assets/models/ppocrv5_latin_dict.txt"
 sha256 = "ccbcc45730b3fbbd9050c5bc74db6a99067141ef1035e3d14889a84a6b9b1aff"
 
 [[dependency]]
-name = "Modèle OCR : orientation des lignes"
+name = "Lecture des images : sens des lignes"
 version = "oar-ocr v0.3.0"
 required = false
 url = "https://github.com/GreatV/oar-ocr/releases/download/v0.3.0/pp-lcnet_x0_25_textline_ori.onnx"

@@ -127,8 +127,9 @@ impl SetupScreen {
                             ui.label(RichText::new("Installation des composants").size(18.0).color(Color32::WHITE));
                             ui.label(
                                 RichText::new(
-                                    "Premier lancement : téléchargement du moteur PDF et de l'OCR \
-                                     depuis leur source officielle.",
+                                    "Kite PDF télécharge ses composants une seule fois, depuis leur \
+                                     source officielle : le moteur qui affiche les PDF et celui qui \
+                                     lit le texte des images.",
                                 )
                                 .size(12.0)
                                 .color(muted),
@@ -143,8 +144,8 @@ impl SetupScreen {
                                 if !self.job.required_ready() {
                                     ui.label(
                                         RichText::new(
-                                            "Le moteur PDF n'a pas pu être installé : vérifiez la \
-                                             connexion internet.",
+                                            "Le moteur qui affiche les PDF n'a pas pu être téléchargé. \
+                                             Vérifiez la connexion à Internet, puis réessayez.",
                                         )
                                         .color(Color32::from_rgb(255, 130, 120)),
                                     );
@@ -153,14 +154,18 @@ impl SetupScreen {
                                     }
                                 } else if !self.job.failures().is_empty() {
                                     ui.label(
-                                        RichText::new("L'OCR n'a pas pu être installé ; tout le reste fonctionne.")
+                                        RichText::new(
+                                            "La lecture du texte des images n'a pas pu être installée. \
+                                             Tout le reste fonctionne ; vous pourrez réessayer plus tard \
+                                             depuis les Réglages.",
+                                        )
                                             .color(Color32::from_rgb(250, 200, 110)),
                                     );
                                     ui.horizontal(|ui| {
                                         if ui.button("Réessayer").clicked() {
                                             self.job = InstallJob::start(deps::missing(), ctx.clone());
                                         }
-                                        if ui.button("Continuer sans OCR").clicked() {
+                                        if ui.button("Continuer sans").clicked() {
                                             self.proceed = true;
                                         }
                                     });
@@ -186,8 +191,9 @@ fn show_item(ui: &mut egui::Ui, item: &InstallItem, muted: Color32) {
         } else {
             ui.label(RichText::new(mark).color(color));
         }
-        ui.label(RichText::new(&item.dependency.name).color(Color32::WHITE));
-        ui.label(RichText::new(&item.dependency.version).size(11.0).color(muted));
+        // La version n'intéresse que les curieux : au survol.
+        ui.label(RichText::new(&item.dependency.name).color(Color32::WHITE))
+            .on_hover_text(format!("Version {}", item.dependency.version));
         if let InstallStatus::Downloading { received, total } = item.status {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let text = match total {

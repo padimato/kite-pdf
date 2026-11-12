@@ -55,12 +55,12 @@ pub struct UntestedVersion {
 impl UntestedVersion {
     pub fn warning(&self) -> String {
         format!(
-            "{} ({}) n'est pas la version testée ({}). Si quelque chose ne fonctionne pas, \
-             installez cette version : {}",
+            "{} : la version installée n'est pas celle testée avec Kite PDF ({}). Si quelque \
+             chose ne fonctionne pas, installez la version testée : {} (fichier concerné : {})",
             self.dependency.name,
-            self.path.display(),
             self.dependency.version,
-            self.dependency.url
+            self.dependency.url,
+            self.path.display()
         )
     }
 }

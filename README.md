@@ -20,6 +20,7 @@ Une seule fenêtre est ouverte à la fois : un PDF ouvert depuis l'Explorateur a
 - **Recherche `Ctrl+F`** dans le texte du document, y compris le texte des figures et des scans grâce à l'OCR.
 - **OCR des images** (PaddleOCR PP-OCRv5, ONNX Runtime) en tâche de fond. Le texte reconnu est enregistré dans le PDF sous forme de couche invisible : il devient cherchable dans Acrobat, et les pages déjà analysées ne le sont plus à la réouverture.
 - **Pavé tactile** : défilement fluide et zoom par pincement centré sur le pointeur.
+- **Pour bien démarrer** : un écran d'accueil au premier lancement, l'aide-mémoire des raccourcis (`F1`) et une page de réglages (`Ctrl+,`) : zoom à l'ouverture, lecture du texte des images, reprise de la lecture, historique, vérification des mises à jour.
 - **Usage courant** : sommaire du document (signets), formulaires à remplir (texte, cases, boutons radio, listes), impression, PDF protégés par mot de passe, reprise de la lecture à la page et au zoom où on l'avait laissée.
 
 ## Raccourcis
@@ -38,6 +39,8 @@ Une seule fenêtre est ouverte à la fois : un PDF ouvert depuis l'Explorateur a
 | `Ctrl+9` / `Ctrl+0` | Ajuster à la largeur / à la page |
 | `V` `H` `T` `D` `R` `N` `M` | Outils : sélection, surlignage, texte, dessin, flèche, note, mesure |
 | `Ctrl+Z` / `Ctrl+Y` | Annuler / rétablir |
+| `Ctrl+,` | Réglages |
+| `F1` | Aide-mémoire des raccourcis |
 
 ## Compilation
 

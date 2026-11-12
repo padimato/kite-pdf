@@ -268,7 +268,7 @@ impl PdfEngine {
             Err(PdfiumError::PdfiumLibraryInternalError(PdfiumInternalError::PasswordError)) => {
                 Err(anyhow::Error::new(PasswordRequired { wrong_password: password.is_some() }))
             }
-            Err(e) => Err(e).with_context(|| format!("Échec d'ouverture du fichier PDF : {}", path.display())),
+            Err(e) => Err(anyhow::anyhow!(open_error_message(path, &e))),
         }
     }
 
@@ -454,6 +454,30 @@ impl RawDocument<'_> {
         unsafe { (self.render)(dc, page.cast(), x, y, size_x, size_y, rotate, flags) };
         bindings.FPDF_ClosePage(page);
         Ok(())
+    }
+}
+
+/// Phrase compréhensible pour un PDF qui ne s'ouvre pas.
+fn open_error_message(path: &Path, error: &PdfiumError) -> String {
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
+    if !path.exists() {
+        return format!("« {name} » est introuvable : il a peut-être été déplacé ou supprimé.");
+    }
+    match error {
+        PdfiumError::IoError(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            format!("Vous n'avez pas le droit d'ouvrir « {name} ».")
+        }
+        PdfiumError::PdfiumLibraryInternalError(PdfiumInternalError::FileError) | PdfiumError::IoError(_) => format!(
+            "Impossible de lire « {name} » : il est peut-être utilisé par une autre application, \
+             ou vous n'avez pas le droit de l'ouvrir."
+        ),
+        PdfiumError::PdfiumLibraryInternalError(PdfiumInternalError::FormatError) => {
+            format!("« {name} » n'est pas un PDF valide, ou il est endommagé.")
+        }
+        PdfiumError::PdfiumLibraryInternalError(PdfiumInternalError::SecurityError) => {
+            format!("« {name} » est protégé d'une façon que Kite PDF ne sait pas ouvrir.")
+        }
+        _ => format!("Impossible d'ouvrir « {name} »."),
     }
 }
 
@@ -1284,6 +1308,19 @@ pub fn ensure_sample_pdf(path: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn test_open_error_messages_are_plain() {
+        let missing = Path::new("test_pdfs/introuvable_kite.pdf");
+        let format = PdfiumError::PdfiumLibraryInternalError(PdfiumInternalError::FormatError);
+        assert_eq!(
+            open_error_message(missing, &format),
+            "« introuvable_kite.pdf » est introuvable : il a peut-être été déplacé ou supprimé."
+        );
+        let existing = Path::new("Cargo.toml");
+        assert_eq!(open_error_message(existing, &format), "« Cargo.toml » n'est pas un PDF valide, ou il est endommagé.");
+        let unknown = PdfiumError::PdfiumLibraryInternalError(PdfiumInternalError::Unknown);
+        assert_eq!(open_error_message(existing, &unknown), "Impossible d'ouvrir « Cargo.toml ».");
+    }
     #[test]
     fn test_outline_is_read_in_reading_order_with_depth() {
         let path = PathBuf::from("test_pdfs/unit_test_outline.pdf");

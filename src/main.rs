@@ -3,7 +3,9 @@
 
 mod annotations;mod bench;
 mod deps;
+mod help;
 mod settings;
+mod settings_page;
 mod setup;
 mod app;
 mod memory_manager;
@@ -205,6 +207,15 @@ fn parse_args() -> AutomationConfig {
             "--deep-ocr-dialog" => {
                 cfg.deep_ocr_dialog = true;
             }
+            "--welcome" => {
+                cfg.show_welcome = true;
+            }
+            "--settings" => {
+                cfg.show_settings = true;
+            }
+            "--shortcuts" => {
+                cfg.show_shortcuts = true;
+            }
             "--deep-ocr-all" => {
                 cfg.deep_ocr_all = true;
             }
@@ -376,7 +387,7 @@ fn main() -> eframe::Result<()> {
         Box::new(move |cc| {
             single_instance::set_repaint_context(&cc.egui_ctx);
             // Version distribuée seulement : une compilation de développement ne consulte pas GitHub.
-            if !automated && !cfg!(debug_assertions) {
+            if !automated && !cfg!(debug_assertions) && settings::Settings::load().prefs.check_updates {
                 updates::check_in_background(cc.egui_ctx.clone());
             }
             let pdfium_installed = deps::by_file_name("pdfium.dll")
