@@ -10,7 +10,7 @@ Téléchargez `KitePDF-Setup-x.y.z.exe` dans les [Releases](https://github.com/p
 
 Au premier lancement, l'application télécharge PDFium et l'OCR depuis leur source officielle (voir [Composants](#compilation)). L'exécutable n'est pas signé : Windows SmartScreen peut afficher « Windows a protégé votre ordinateur » ; cliquez sur « Informations complémentaires » puis « Exécuter quand même ».
 
-Une seule fenêtre est ouverte à la fois : un PDF ouvert depuis l'Explorateur arrive dans un nouvel onglet. L'application signale discrètement les nouvelles versions publiées (une vérification par jour au plus, rien n'est installé sans vous).
+Une seule fenêtre est ouverte à la fois : un PDF ouvert depuis l'Explorateur arrive dans un nouvel onglet. L'application signale discrètement les nouvelles versions publiées (une vérification par jour au plus, rien n'est installé sans vous) ; le bouton « Rechercher une mise à jour » des Réglages vérifie à la demande.
 
 ## Fonctionnalités
 

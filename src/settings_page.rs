@@ -20,6 +20,8 @@ pub struct PageInfo {
     pub history_len: usize,
     /// « Effacer l'historique » cliqué une première fois
     pub confirm_clear_history: bool,
+    /// Résultat de « Rechercher une mise à jour »
+    pub update_check: crate::updates::ManualCheck,
 }
 
 /// Demandes faites depuis la page, exécutées par l'application.
@@ -34,6 +36,8 @@ pub enum Action {
     ShowShortcuts,
     ShowWelcome,
     OpenProjectPage,
+    CheckUpdatesNow,
+    OpenNewRelease,
 }
 
 fn section(ui: &mut egui::Ui, title: &str) {
@@ -136,9 +140,43 @@ pub fn show(ctx: &egui::Context, prefs: &mut Preferences, info: &PageInfo) -> Ve
                         }
                     }
                 });
+
+                section(ui, "Mises à jour");
+                note(ui, &format!("Version installée : {}", env!("CARGO_PKG_VERSION")));
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    use crate::updates::ManualCheck;
+                    let checking = info.update_check == ManualCheck::Checking;
+                    if ui.add_enabled(!checking, egui::Button::new("Rechercher une mise à jour")).clicked() {
+                        actions.push(Action::CheckUpdatesNow);
+                    }
+                    match &info.update_check {
+                        ManualCheck::Idle => {}
+                        ManualCheck::Checking => {
+                            ui.add(egui::Spinner::new().size(12.0));
+                            note(ui, "Recherche…");
+                        }
+                        ManualCheck::UpToDate => {
+                            ui.label(RichText::new("✔ Kite PDF est à jour.").size(12.0).color(Color32::from_rgb(120, 210, 150)));
+                        }
+                        ManualCheck::Available(release) => {
+                            ui.label(
+                                RichText::new(format!("Kite PDF {} est disponible.", release.version))
+                                    .size(12.0)
+                                    .color(Color32::WHITE),
+                            );
+                            if ui.small_button("Voir la nouvelle version").clicked() {
+                                actions.push(Action::OpenNewRelease);
+                            }
+                        }
+                        ManualCheck::Failed(reason) => {
+                            ui.label(RichText::new(reason).size(12.0).color(Color32::from_rgb(250, 200, 110)));
+                        }
+                    }
+                });
                 ui.add_space(6.0);
-                ui.checkbox(&mut prefs.check_updates, "Signaler les nouvelles versions de Kite PDF");
-                note(ui, "Une fois par jour au plus, Kite consulte la page des versions sur GitHub. Rien n'est installé sans vous.");
+                ui.checkbox(&mut prefs.check_updates, "Vérifier automatiquement (une fois par jour)");
+                note(ui, "Kite consulte la page des versions sur GitHub et vous prévient. Rien n'est installé sans vous.");
 
                 section(ui, "Windows");
                 if ui.button("Faire de Kite PDF le lecteur PDF par défaut…").clicked() {

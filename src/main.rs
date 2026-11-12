@@ -210,6 +210,9 @@ fn parse_args() -> AutomationConfig {
             "--welcome" => {
                 cfg.show_welcome = true;
             }
+            "--check-update" => {
+                cfg.check_update_now = true;
+            }
             "--settings" => {
                 cfg.show_settings = true;
             }

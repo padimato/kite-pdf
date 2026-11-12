@@ -394,6 +394,8 @@ pub struct AutomationConfig {
     pub show_shortcuts: bool,
     /// Montre la page Réglages (captures QA)
     pub show_settings: bool,
+    /// Lance « Rechercher une mise à jour » au démarrage (captures QA)
+    pub check_update_now: bool,
     pub save_annotated_output: Option<PathBuf>,
     pub screenshot_output: Option<PathBuf>,
     /// Délai avant la capture (permet à un script QA d'envoyer des événements à la fenêtre)
@@ -672,6 +674,9 @@ impl KiteApp {
         }
         if let Some(settings) = &app.settings {
             app.prefs = settings.prefs.clone();
+        }
+        if automation.check_update_now {
+            crate::updates::check_now(egui_ctx.clone());
         }
         // Premier lancement : quelques gestes pour bien démarrer.
         app.welcome_open = automation.show_welcome || app.settings.as_ref().is_some_and(|s| !s.welcome_seen);
@@ -5604,6 +5609,7 @@ impl KiteApp {
             ocr,
             history_len: self.recent_files.items.len(),
             confirm_clear_history: self.confirm_clear_history,
+            update_check: crate::updates::manual_status(),
         };
         let mut prefs = self.prefs.clone();
         let actions = crate::settings_page::show(ctx, &mut prefs, &info);
@@ -5632,6 +5638,12 @@ impl KiteApp {
                 Action::MakeDefaultReader => {
                     let uri = format!("ms-settings:defaultapps?registeredAppUser={}", crate::APP_NAME);
                     let _ = std::process::Command::new("explorer").arg(uri).spawn();
+                }
+                Action::CheckUpdatesNow => crate::updates::check_now(ctx.clone()),
+                Action::OpenNewRelease => {
+                    if let crate::updates::ManualCheck::Available(release) = crate::updates::manual_status() {
+                        let _ = std::process::Command::new("explorer").arg(&release.page_url).spawn();
+                    }
                 }
                 Action::OpenProjectPage => {
                     let _ = std::process::Command::new("explorer").arg("https://github.com/padimato/kite-pdf").spawn();
