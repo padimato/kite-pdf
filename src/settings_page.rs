@@ -1,7 +1,7 @@
 //! Page Réglages (`Ctrl+,`) : préférences de lecture, OCR des images, historique, mises à jour.
 //! Chaque changement s'applique tout de suite ; l'application l'enregistre.
 
-use crate::settings::{ImageOcr, OpenZoom, Preferences};
+use crate::settings::{ImageOcr, Layout, OpenZoom, Preferences};
 use egui::{Color32, CornerRadius, Margin, RichText, Stroke};
 
 const MUTED: Color32 = Color32::from_rgb(150, 160, 182);
@@ -77,6 +77,12 @@ pub fn show(ctx: &egui::Context, prefs: &mut Preferences, info: &PageInfo) -> Ve
             .min_scrolled_height(max_height.min(620.0))
             .show(ui, |ui| {
                 ui.set_width(width - 56.0);
+
+                section(ui, "Disposition");
+                ui.radio_value(&mut prefs.layout, Layout::Auto, "Automatique (recommandé)");
+                note(ui, "Barre latérale quand la fenêtre est plus large que haute, barre en haut sur un écran en portrait.");
+                ui.radio_value(&mut prefs.layout, Layout::Sidebar, "Toujours la barre latérale");
+                ui.radio_value(&mut prefs.layout, Layout::TopBar, "Toujours la barre en haut");
 
                 section(ui, "Ouverture des documents");
                 ui.label(RichText::new("Zoom d'un PDF ouvert pour la première fois").size(12.5).color(Color32::WHITE));

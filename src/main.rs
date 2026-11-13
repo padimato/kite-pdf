@@ -80,6 +80,23 @@ fn parse_args() -> AutomationConfig {
                     i += 1;
                 }
             }
+            "--window-size" => {
+                if let Some((w, h)) = args.get(i + 1).and_then(|s| s.split_once('x')) {
+                    if let (Ok(w), Ok(h)) = (w.parse::<f32>(), h.parse::<f32>()) {
+                        cfg.window_size = Some([w, h]);
+                    }
+                    i += 1;
+                }
+            }
+            "--tabs-menu" => {
+                cfg.open_tabs_menu = true;
+            }
+            "--ui-zoom" => {
+                if let Some(z) = args.get(i + 1).and_then(|s| s.parse::<f32>().ok()) {
+                    cfg.ui_zoom = Some(z);
+                    i += 1;
+                }
+            }
             "--screenshot-visible" => {
                 cfg.screenshot_visible = true;
             }
@@ -373,6 +390,9 @@ fn main() -> eframe::Result<()> {
         }
         viewport = viewport.with_maximized(saved.maximized);
     }
+    if let Some(size) = cfg.window_size.filter(|_| automated) {
+        viewport = viewport.with_inner_size(size).with_min_inner_size([200.0, 200.0]);
+    }
     if cfg.screenshot_output.is_some() && !cfg.screenshot_visible {
         // Capture automatisée : fenêtre hors écran, sans focus ni bouton dans la barre des tâches,
         // pour ne pas déranger l'utilisateur qui travaille sur la machine.
@@ -389,6 +409,10 @@ fn main() -> eframe::Result<()> {
         native_options,
         Box::new(move |cc| {
             single_instance::set_repaint_context(&cc.egui_ctx);
+            // Capture d'un écran plus grand que celui de la machine : interface réduite (QA).
+            if let Some(zoom) = cfg.ui_zoom.filter(|_| automated) {
+                cc.egui_ctx.set_zoom_factor(zoom);
+            }
             // Version distribuée seulement : une compilation de développement ne consulte pas GitHub.
             if !automated && !cfg!(debug_assertions) && settings::Settings::load().prefs.check_updates {
                 updates::check_in_background(cc.egui_ctx.clone());

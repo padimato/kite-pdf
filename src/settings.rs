@@ -37,11 +37,36 @@ pub enum OpenZoom {
     FitPage,
 }
 
+/// Place des commandes : barre latérale, ou barre en haut (écran portrait).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Layout {
+    /// Barre en haut quand la fenêtre est plus haute que large, barre latérale sinon
+    #[default]
+    Auto,
+    Sidebar,
+    TopBar,
+}
+
+impl Layout {
+    /// Barre en haut pour une fenêtre de cette taille. `current` (disposition affichée) évite les
+    /// bascules répétées quand la fenêtre est presque carrée.
+    pub fn top_bar(self, size: [f32; 2], current: bool) -> bool {
+        let [width, height] = size;
+        match self {
+            Layout::Sidebar => false,
+            Layout::TopBar => true,
+            Layout::Auto if current => height > width * 0.95,
+            Layout::Auto => height > width * 1.05,
+        }
+    }
+}
+
 /// Préférences modifiables dans la page Réglages.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Preferences {
     pub image_ocr: ImageOcr,
     pub open_zoom: OpenZoom,
+    pub layout: Layout,
     /// Rouvrir un PDF à la page et au zoom où on l'avait laissé
     pub resume_reading: bool,
     /// Garder la liste des PDF ouverts récemment
@@ -55,6 +80,7 @@ impl Default for Preferences {
         Self {
             image_ocr: ImageOcr::Auto,
             open_zoom: OpenZoom::Actual,
+            layout: Layout::Auto,
             resume_reading: true,
             keep_history: true,
             check_updates: true,
@@ -144,6 +170,13 @@ impl Settings {
                         _ => OpenZoom::Actual,
                     }
                 }
+                "layout" => {
+                    settings.prefs.layout = match value.trim() {
+                        "sidebar" => Layout::Sidebar,
+                        "top" => Layout::TopBar,
+                        _ => Layout::Auto,
+                    }
+                }
                 "resume_reading" => settings.prefs.resume_reading = value.trim() != "0",
                 "keep_history" => settings.prefs.keep_history = value.trim() != "0",
                 "check_updates" => settings.prefs.check_updates = value.trim() != "0",
@@ -182,7 +215,12 @@ impl Settings {
             OpenZoom::FitWidth => "width",
             OpenZoom::FitPage => "page",
         };
-        text.push_str(&format!("image_ocr={image_ocr}\nopen_zoom={open_zoom}\n"));
+        let layout = match prefs.layout {
+            Layout::Auto => "auto",
+            Layout::Sidebar => "sidebar",
+            Layout::TopBar => "top",
+        };
+        text.push_str(&format!("image_ocr={image_ocr}\nopen_zoom={open_zoom}\nlayout={layout}\n"));
         for (key, value) in [
             ("resume_reading", prefs.resume_reading),
             ("keep_history", prefs.keep_history),
@@ -229,6 +267,7 @@ mod tests {
             prefs: Preferences {
                 image_ocr: ImageOcr::OnSearch,
                 open_zoom: OpenZoom::FitWidth,
+                layout: Layout::TopBar,
                 resume_reading: false,
                 keep_history: true,
                 check_updates: false,
@@ -241,5 +280,18 @@ mod tests {
         // Fenêtre restée sur un écran débranché : ignorée.
         let lost = Settings { window: Some([-5000.0, 80.0, 1280.0, 820.0]), ..Default::default() };
         assert!(!lost.window_is_plausible());
+    }
+
+    #[test]
+    fn test_layout_follows_window_shape() {
+        // Écran portrait : barre en haut ; paysage : barre latérale.
+        assert!(Layout::Auto.top_bar([1080.0, 1870.0], false));
+        assert!(!Layout::Auto.top_bar([1920.0, 1040.0], true));
+        // Fenêtre presque carrée : la disposition affichée est gardée.
+        assert!(Layout::Auto.top_bar([1000.0, 1000.0], true));
+        assert!(!Layout::Auto.top_bar([1000.0, 1000.0], false));
+        // Choix imposé dans les Réglages.
+        assert!(Layout::TopBar.top_bar([1920.0, 1040.0], false));
+        assert!(!Layout::Sidebar.top_bar([1080.0, 1870.0], true));
     }
 }

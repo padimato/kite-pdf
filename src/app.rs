@@ -245,6 +245,12 @@ const SIDEBAR_ONE_ROW_TOOLS_WIDTH: f32 = 430.0;
 const OUTLINE_TARGET_MARGIN_PX: f32 = 16.0;
 /// Hauteur du séparateur réglable entre la liste des onglets et le tiroir du bas.
 const DRAWER_SPLITTER_PX: f32 = 8.0;
+/// Hauteur de la barre du haut (disposition portrait)
+const TOP_BAR_HEIGHT: f32 = 44.0;
+/// Boutons de la barre du haut
+const TOP_BAR_BUTTON: Vec2 = Vec2::new(30.0, 28.0);
+/// Largeur minimale du bouton des onglets avant de replier les outils, puis le zoom, dans un menu
+const TOP_BAR_MIN_TABS_WIDTH: f32 = 150.0;
 
 /// Intervalle d'enregistrement de la session (endroit de lecture, fenêtre, barre latérale).
 const SESSION_SAVE_INTERVAL: Duration = Duration::from_secs(3);
@@ -402,6 +408,12 @@ pub struct AutomationConfig {
     pub screenshot_delay_ms: u64,
     /// Capture automatisée dans une fenêtre visible au premier plan (sinon hors écran, sans focus).
     pub screenshot_visible: bool,
+    /// Taille de la fenêtre de capture, `--window-size LxH` (ex. écran portrait)
+    pub window_size: Option<[f32; 2]>,
+    /// Facteur de zoom de l'interface, `--ui-zoom` (simule un écran plus grand que celui de la machine)
+    pub ui_zoom: Option<f32>,
+    /// Ouvre la liste des onglets de la barre du haut au démarrage (captures QA)
+    pub open_tabs_menu: bool,
 }
 
 pub struct KiteApp {
@@ -446,6 +458,10 @@ pub struct KiteApp {
     dependency_warning_closed: bool,
     /// Bandeau « nouvelle version » fermé pour cette session
     update_banner_closed: bool,
+    /// Commandes dans une barre en haut (écran portrait) plutôt que dans la barre latérale
+    top_layout: bool,
+    /// Liste des onglets à ouvrir dès la première image (captures QA)
+    open_tabs_menu_pending: bool,
     /// Logo affiché en haut de la barre latérale
     logo: Option<egui::TextureHandle>,
     /// Écran d'accueil du premier lancement affiché
@@ -632,6 +648,8 @@ impl KiteApp {
             dependency_warnings: crate::setup::check_versions_in_background(egui_ctx.clone()),
             dependency_warning_closed: false,
             update_banner_closed: false,
+            top_layout: false,
+            open_tabs_menu_pending: false,
             logo: load_logo(egui_ctx),
             welcome_open: false,
             settings_open: automation.show_settings,
@@ -680,6 +698,7 @@ impl KiteApp {
         }
         // Premier lancement : quelques gestes pour bien démarrer.
         app.welcome_open = automation.show_welcome || app.settings.as_ref().is_some_and(|s| !s.welcome_seen);
+        app.open_tabs_menu_pending = automation.open_tabs_menu;
         // Lancé sans fichier : la barre centrale propose directement les PDF récents.
         if app.tabs.is_empty()
             && !app.welcome_open
@@ -1788,7 +1807,9 @@ impl KiteApp {
                 self.switch_to_tab(idx);
             }
             PaletteCommand::ToggleSidebarPin => {
-                self.sidebar.toggle_pinned();
+                if !self.top_layout {
+                    self.sidebar.toggle_pinned();
+                }
             }
             PaletteCommand::OpenFileDialog => {
                 if let Some(path) = rfd::FileDialog::new()
@@ -2136,7 +2157,7 @@ impl KiteApp {
             let pages = &tab.page_dimensions;
 
             let pointer_pos = input.pointer.hover_pos();
-            let pointer_over_sidebar = self.sidebar.is_expanded()
+            let pointer_over_sidebar = sidebar_shown(&self.sidebar, self.top_layout)
                 && pointer_pos.map(|p| p.x <= self.sidebar.width).unwrap_or(false);
 
             let pointer_in_viewport = pointer_pos
@@ -2305,7 +2326,7 @@ impl KiteApp {
         if self.command_palette.is_open || self.deep_ocr_dialog.is_some() || self.password_prompt.is_some() {
             return;
         }
-        let pointer_over_sidebar = self.sidebar.is_expanded()
+        let pointer_over_sidebar = sidebar_shown(&self.sidebar, self.top_layout)
             && ctx
                 .input(|i| i.pointer.hover_pos())
                 .map(|p| p.x <= self.sidebar.width)
@@ -2854,7 +2875,23 @@ impl eframe::App for KiteApp {
         visuals.panel_fill = Color32::from_rgb(18, 20, 26);
         ctx.set_visuals(visuals);
 
-        if self.sidebar.pinned {
+        let screen = ctx.screen_rect().size();
+        self.top_layout = self.prefs.layout.top_bar([screen.x, screen.y], self.top_layout);
+        if self.top_layout {
+            // Écran portrait : une barre d'une ligne en haut, le tiroir (sommaire, résultats) en bas.
+            // Toujours affichée : Ctrl+B ne concerne que la barre latérale du mode paysage.
+            egui::TopBottomPanel::top("kite_top_bar")
+                .exact_height(TOP_BAR_HEIGHT)
+                .resizable(false)
+                .frame(
+                    egui::Frame::NONE
+                        .fill(Color32::from_rgb(23, 26, 34))
+                        .stroke(Stroke::new(1.0_f32, Color32::from_rgb(44, 50, 66)))
+                        .inner_margin(Margin::symmetric(8, 0)),
+                )
+                .show(ctx, |ui| self.render_top_bar(ui));
+            self.render_bottom_drawer(ctx);
+        } else if self.sidebar.pinned {
             // Largeur fixe : la poignée d'egui est recouverte par la zone du document, qui capte le
             // glissé ; une poignée propre, au premier plan, la remplace (voir `render_sidebar_resize_handle`).
             egui::SidePanel::left("kite_sidebar_pinned")
@@ -3498,10 +3535,12 @@ impl eframe::App for KiteApp {
                     self.render_floating_search_bar(ctx, canvas_rect);
                 }
 
-                if !self.sidebar.pinned {
+                if !self.sidebar.pinned && !self.top_layout {
                     self.render_autohide_sidebar_overlay(ctx, canvas_rect);
                 }
-                self.render_sidebar_resize_handle(ctx);
+                if !self.top_layout {
+                    self.render_sidebar_resize_handle(ctx);
+                }
 
 
                 self.render_no_text_hint(ctx);
@@ -4062,7 +4101,7 @@ impl KiteApp {
         let font = FontId::proportional(*font_size * scale_y);
         let text_color = Color32::from_rgb(text_rgb.0, text_rgb.1, text_rgb.2);
         // Un clic dans la barre latérale (couleurs, taille...) ne doit pas fermer le bloc en cours d'écriture.
-        let pointer_in_sidebar = self.sidebar.is_expanded()
+        let pointer_in_sidebar = sidebar_shown(&self.sidebar, self.top_layout)
             && ctx
                 .input(|i| i.pointer.hover_pos())
                 .is_some_and(|p| p.x <= self.sidebar.width);
@@ -5036,13 +5075,7 @@ impl KiteApp {
 
         ui.separator();
 
-        let has_search_drawer = self.search_bar.is_open && !self.search_bar.matches.is_empty();
-        let has_annot_inspector = self
-            .tabs
-            .get(self.active_tab)
-            .and_then(|t| t.annotations.selected())
-            .is_some();
-        let has_outline_drawer = self.outline_open && !self.tabs.is_empty();
+        let (has_annot_inspector, has_search_drawer, has_outline_drawer) = self.drawer_kinds();
         let has_drawer = has_annot_inspector || has_search_drawer || has_outline_drawer;
         // Bas de la barre (navigation) toujours réservé ; le tiroir prend la hauteur choisie, sans
         // jamais écraser la liste des onglets.
@@ -5103,41 +5136,7 @@ impl KiteApp {
                                         if row.clicked() {
                                             tab_to_select = Some(idx);
                                         }
-                                        row.context_menu(|ui| {
-                                            let mut choose = |ui: &mut egui::Ui,
-                                                              label: &str,
-                                                              action: TabMenuAction| {
-                                                if ui.button(label).clicked() {
-                                                    tab_menu_action = Some((idx, action));
-                                                    ui.close_menu();
-                                                }
-                                            };
-                                            choose(
-                                                ui,
-                                                "Afficher dans l'explorateur de fichiers",
-                                                TabMenuAction::RevealInExplorer,
-                                            );
-                                            choose(
-                                                ui,
-                                                "Ouvrir avec l'application par défaut",
-                                                TabMenuAction::OpenWithDefaultApp,
-                                            );
-                                            ui.separator();
-                                            if ui.button("Copier le chemin complet").clicked() {
-                                                let full = std::path::absolute(&tab.path)
-                                                    .unwrap_or_else(|_| tab.path.clone());
-                                                ui.ctx().copy_text(full.display().to_string());
-                                                ui.close_menu();
-                                            }
-                                            if ui.button("Copier le nom du fichier").clicked() {
-                                                ui.ctx().copy_text(tab.title.clone());
-                                                ui.close_menu();
-                                            }
-                                            ui.separator();
-                                            choose(ui, "Fermer", TabMenuAction::CloseThis);
-                                            choose(ui, "Fermer les autres onglets", TabMenuAction::CloseOthers);
-                                            choose(ui, "Fermer les onglets en dessous", TabMenuAction::CloseBelow);
-                                        });
+                                        row.context_menu(|ui| tab_context_menu(ui, idx, tab, &mut tab_menu_action));
 
                                         let mut name = egui::text::LayoutJob::single_section(
                                             format!(
@@ -5196,10 +5195,156 @@ impl KiteApp {
             }
             let drawer_height = self.sidebar.drawer_height;
             let width = ui.available_width();
+            let mut drawer_outcome = (None, None);
             ui.allocate_ui_with_layout(Vec2::new(width, drawer_height), egui::Layout::top_down(egui::Align::Min), |ui| {
             ui.set_height(drawer_height);
             ui.set_clip_rect(ui.max_rect());
 
+            drawer_outcome = self.render_drawer_contents(ui, drawer_height);
+            });
+            pending_cmd = drawer_outcome.0.or(pending_cmd);
+            match_to_select = drawer_outcome.1.or(match_to_select);
+        }
+        ui.separator();
+
+        // 5. Navigation : page, zoom et ajustement. L'état de l'OCR n'apparaît que pendant son travail.
+        let ocr_status = self.image_ocr_status();
+        egui::Frame::NONE
+            .inner_margin(Margin::symmetric(10, 6))
+            .show(ui, |ui| {
+                let muted = Color32::from_rgb(140, 150, 172);
+                let viewport_size = self.canvas_size;
+                self.render_deep_ocr_progress(ui);
+                let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+                    return;
+                };
+
+                if let Some((label, detail, working)) = ocr_status {
+                    ui.horizontal(|ui| {
+                        if working {
+                            ui.add(egui::Spinner::new().size(11.0).color(muted));
+                        }
+                        let response = ui.label(egui::RichText::new(label).size(10.5).color(muted));
+                        if let Some(detail) = detail {
+                            response.on_hover_text(detail);
+                        }
+                    });
+                    ui.add_space(2.0);
+                }
+
+                let pages = tab.page_dimensions.clone();
+                let page_count = pages.len();
+                let current_page = tab.viewport.current_page_index(viewport_size, &pages) + 1;
+
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(current_page > 1, egui::Button::new("◀").small())
+                        .on_hover_text("Page précédente")
+                        .clicked()
+                    {
+                        tab.viewport.jump_to_page(current_page - 2, viewport_size, &pages);
+                    }
+                    ui.label(
+                        egui::RichText::new(format!("{current_page} / {page_count}"))
+                            .size(12.0)
+                            .color(Color32::WHITE),
+                    );
+                    if ui
+                        .add_enabled(current_page < page_count, egui::Button::new("▶").small())
+                        .on_hover_text("Page suivante")
+                        .clicked()
+                    {
+                        tab.viewport.jump_to_page(current_page, viewport_size, &pages);
+                    }
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("+").on_hover_text("Zoom avant").clicked() {
+                            tab.viewport.apply_zoom_around_anchor(
+                                1.2,
+                                viewport_size * 0.5,
+                                viewport_size,
+                                &pages,
+                            );
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new(format!("{:.0} %", tab.viewport.zoom * 100.0))
+                                        .size(11.5),
+                                )
+                                .frame(false),
+                            )
+                            .on_hover_text("Revenir à 100 %")
+                            .clicked()
+                        {
+                            pending_cmd = Some(PaletteCommand::ZoomReset100);
+                        }
+                        if ui.small_button("−").on_hover_text("Zoom arrière").clicked() {
+                            tab.viewport.apply_zoom_around_anchor(
+                                1.0 / 1.2,
+                                viewport_size * 0.5,
+                                viewport_size,
+                                &pages,
+                            );
+                        }
+                    });
+                });
+
+                ui.horizontal(|ui| {
+                    let half = (ui.available_width() - ui.spacing().item_spacing.x) * 0.5;
+                    if ui
+                        .add_sized([half, 20.0], egui::Button::new("↔ Largeur"))
+                        .on_hover_text("Ajuster à la largeur (Ctrl+9)")
+                        .clicked()
+                    {
+                        pending_cmd = Some(PaletteCommand::FitToWidth);
+                    }
+                    if ui
+                        .add_sized([half, 20.0], egui::Button::new("↕ Page entière"))
+                        .on_hover_text("Afficher la page entière (Ctrl+0)")
+                        .clicked()
+                    {
+                        pending_cmd = Some(PaletteCommand::FitToPage);
+                    }
+                });
+            });
+
+        if let Some((idx, action)) = tab_menu_action {
+            self.apply_tab_menu_action(idx, action);
+        }
+        if let Some(idx) = tab_to_select {
+            self.switch_to_tab(idx);
+        }
+        if let Some(idx) = tab_to_close {
+            self.close_tab(idx);
+        }
+        if let Some(m_idx) = match_to_select {
+            self.search_bar.current_match_index = m_idx;
+            self.scroll_to_current_search_match(self.canvas_size);
+        }
+        if let Some(cmd) = pending_cmd {
+            self.execute_palette_command(cmd, self.canvas_size);
+        }
+    }
+
+    /// Ce que le tiroir doit montrer : (inspecteur d'annotation, résultats de recherche, sommaire).
+    fn drawer_kinds(&self) -> (bool, bool, bool) {
+        let annotation = self
+            .tabs
+            .get(self.active_tab)
+            .and_then(|t| t.annotations.selected())
+            .is_some();
+        let search = self.search_bar.is_open && !self.search_bar.matches.is_empty();
+        let outline = self.outline_open && !self.tabs.is_empty();
+        (annotation, search, outline)
+    }
+
+    /// Contenu du tiroir (bas de la barre latérale, ou volet du bas en portrait) : inspecteur de
+    /// l'annotation choisie, résultats de `Ctrl+F` ou sommaire. Renvoie la commande et le résultat choisis.
+    fn render_drawer_contents(&mut self, ui: &mut egui::Ui, drawer_height: f32) -> (Option<PaletteCommand>, Option<usize>) {
+        let mut pending_cmd: Option<PaletteCommand> = None;
+        let mut match_to_select: Option<usize> = None;
+        let (has_annot_inspector, has_search_drawer, has_outline_drawer) = self.drawer_kinds();
             if has_annot_inspector {
                 ui.separator();
                 if let Some(tab) = self.tabs.get_mut(self.active_tab) {
@@ -5266,7 +5411,7 @@ impl KiteApp {
                                         let field = ui.add(
                                             egui::TextEdit::multiline(text)
                                                 .desired_rows(2)
-                                                .desired_width(self.sidebar.width - 24.0),
+                                                .desired_width(f32::INFINITY),
                                         );
                                         self.text_field_focused_now |= field.has_focus();
                                     }
@@ -5274,7 +5419,7 @@ impl KiteApp {
                                         let field = ui.add(
                                             egui::TextEdit::multiline(comment)
                                                 .desired_rows(2)
-                                                .desired_width(self.sidebar.width - 24.0),
+                                                .desired_width(f32::INFINITY),
                                         );
                                         self.text_field_focused_now |= field.has_focus();
                                     }
@@ -5373,129 +5518,447 @@ impl KiteApp {
                     });
                 }
             }
-            });
+        (pending_cmd, match_to_select)
+    }
+
+    /// Lecture approfondie en cours sur l'onglet affiché.
+    fn deep_ocr_visible(&self) -> bool {
+        self.deep_ocr.as_ref().is_some_and(|run| {
+            self.tabs.get(self.active_tab).is_some_and(|t| t.id == run.tab_id)
+                && run.progress.lock().is_ok_and(|p| !p.finished)
+        })
+    }
+
+    /// État de la lecture du texte des images, s'il y a quelque chose à dire :
+    /// (texte, détail au survol, travail en cours).
+    fn image_ocr_status(&mut self) -> Option<(String, Option<String>, bool)> {
+        let image_ocr = self.prefs.image_ocr;
+        let installing = self.ocr_install.is_some();
+        let tab = self.tabs.get(self.active_tab)?;
+        if tab.ocr.deep_running {
+            // L'avancement de la lecture approfondie est affiché à part.
+            return None;
         }
-        ui.separator();
+        if installing {
+            return Some(("Installation de la lecture des images".to_string(), None, true));
+        }
+        if let Some(reason) = &tab.ocr.unavailable_reason {
+            return Some(("Lecture des images indisponible".to_string(), Some(reason.clone()), false));
+        }
+        // Affiché tant qu'il reste des pages, pas seulement pendant le calcul : en mode éco, l'OCR se
+        // repose entre deux pages, et la ligne disparaissait puis réapparaissait.
+        if image_ocr_working(image_ocr, tab.ocr.mode) && tab.ocr.page_scanned.iter().any(|scanned| !scanned) {
+            if let Some(page) = tab.ocr.in_flight_page {
+                self.last_image_ocr_page = Some((tab.id, page));
+            }
+            let label = match self.last_image_ocr_page {
+                Some((tab_id, page)) if tab_id == tab.id => format!("Lecture des images, page {}", page + 1),
+                _ => "Lecture des images…".to_string(),
+            };
+            return Some((label, None, true));
+        }
+        None
+    }
 
-        // 5. Navigation : page, zoom et ajustement. L'état de l'OCR n'apparaît que pendant son travail.
-        egui::Frame::NONE
-            .inner_margin(Margin::symmetric(10, 6))
-            .show(ui, |ui| {
-                let muted = Color32::from_rgb(140, 150, 172);
-                let viewport_size = self.canvas_size;
-                let image_ocr = self.prefs.image_ocr;
-                self.render_deep_ocr_progress(ui);
-                let Some(tab) = self.tabs.get_mut(self.active_tab) else {
-                    return;
-                };
+    /// Barre du haut (écran portrait) : tout sur une ligne. Onglets rangés dans un bouton, outils,
+    /// annuler/rétablir/enregistrer, puis à droite page, zoom, sommaire, recherche et réglages.
+    /// Si la fenêtre est étroite, les outils puis le zoom passent dans un menu.
+    fn render_top_bar(&mut self, ui: &mut egui::Ui) {
+        #[derive(Clone, Copy)]
+        enum Nav {
+            Previous,
+            Next,
+            ZoomIn,
+            ZoomOut,
+        }
+        let mut pending_cmd: Option<PaletteCommand> = None;
+        let mut tab_to_select: Option<usize> = None;
+        let mut tab_to_close: Option<usize> = None;
+        let mut tab_menu_action: Option<(usize, TabMenuAction)> = None;
+        let mut nav: Option<Nav> = None;
 
-                if tab.ocr.deep_running {
-                    // L'avancement de la lecture approfondie est affiché juste au-dessus.
-                } else if self.ocr_install.is_some() {
-                    ui.horizontal(|ui| {
-                        ui.add(egui::Spinner::new().size(11.0).color(muted));
-                        ui.label(egui::RichText::new("Installation de la lecture des images").size(10.5).color(muted));
+        let gap = 4.0;
+        ui.spacing_mut().item_spacing = Vec2::new(gap, 0.0);
+        let button = TOP_BAR_BUTTON;
+        let sep = 9.0;
+        // Largeur de tout sauf le bouton des onglets, selon ce qui est replié.
+        let fixed = |full_tools: bool, full_zoom: bool| {
+            let tools = if full_tools { 8.0 * button.x + 7.0 * gap } else { 52.0 };
+            let zoom = if full_zoom { 4.0 * button.x + 56.0 + 4.0 * gap } else { 78.0 };
+            let edit = 3.0 * button.x + 2.0 * gap;
+            let page = 2.0 * button.x + 62.0 + 2.0 * gap;
+            let right = 3.0 * button.x + 2.0 * gap;
+            26.0 + tools + edit + page + zoom + right + 5.0 * sep + 10.0 * gap + 6.0
+        };
+        let width = ui.available_width();
+        let (full_tools, full_zoom) = if width - fixed(true, true) >= TOP_BAR_MIN_TABS_WIDTH {
+            (true, true)
+        } else if width - fixed(false, true) >= TOP_BAR_MIN_TABS_WIDTH {
+            (false, true)
+        } else {
+            (false, false)
+        };
+        let tabs_width = (width - fixed(full_tools, full_zoom)).clamp(90.0, 300.0);
+
+        let active_fill = Color32::from_rgb(52, 105, 210);
+        let icon_button = |text: &str, selected: bool| {
+            let mut b = egui::Button::new(
+                egui::RichText::new(text)
+                    .size(14.0)
+                    .color(if selected { Color32::WHITE } else { Color32::from_rgb(190, 200, 220) }),
+            )
+            .min_size(button)
+            .corner_radius(CornerRadius::same(7));
+            if selected {
+                b = b.fill(active_fill);
+            }
+            b
+        };
+
+        let viewport_size = self.canvas_size;
+        let page_info = self.tabs.get(self.active_tab).map(|tab| {
+            let current = tab.viewport.current_page_index(viewport_size, &tab.page_dimensions) + 1;
+            (current, tab.page_dimensions.len(), tab.viewport.zoom)
+        });
+        let has_tabs = !self.tabs.is_empty();
+        let ocr_status = self.image_ocr_status();
+
+        ui.horizontal_centered(|ui| {
+            // Logo
+            if let Some(logo) = &self.logo {
+                ui.add(egui::Image::new(logo).fit_to_exact_size(Vec2::splat(22.0)));
+            }
+
+            // Onglets : le document affiché et le nombre d'onglets ; la liste s'ouvre au clic.
+            let popup_id = ui.make_persistent_id("kite_tabs_popup");
+            let popup_open = ui.memory(|m| m.is_popup_open(popup_id));
+            let (rect, response) = ui.allocate_exact_size(Vec2::new(tabs_width, 30.0), Sense::click());
+            let response = response.on_hover_text("Onglets ouverts (Ctrl+Tab : onglet suivant)");
+            let active = self.tabs.get(self.active_tab);
+            let accent = active.map(|t| t.badge_color).unwrap_or(Color32::from_rgb(80, 120, 220));
+            let fill = if popup_open || response.hovered() {
+                Color32::from_rgb(46, 56, 80)
+            } else {
+                Color32::from_rgb(36, 43, 61)
+            };
+            let painter = ui.painter();
+            painter.rect(rect, CornerRadius::same(7), fill, Stroke::new(1.2_f32, accent), StrokeKind::Inside);
+            let count = egui::RichText::new(format!("{} ⏷", self.tabs.len())).size(11.5).strong();
+            let count_galley = egui::WidgetText::from(count).into_galley(
+                ui,
+                Some(egui::TextWrapMode::Extend),
+                f32::INFINITY,
+                egui::TextStyle::Button,
+            );
+            let title = match active {
+                Some(tab) => format!("{}{}", tab.title, if tab.is_modified { " *" } else { "" }),
+                None => "Aucun PDF ouvert".to_string(),
+            };
+            let mut job = egui::text::LayoutJob::single_section(
+                title,
+                egui::TextFormat {
+                    font_id: FontId::proportional(12.5),
+                    color: Color32::WHITE,
+                    ..Default::default()
+                },
+            );
+            job.wrap.max_width = (rect.width() - count_galley.size().x - 28.0).max(10.0);
+            job.wrap.max_rows = 1;
+            job.wrap.break_anywhere = true;
+            job.wrap.overflow_character = Some('…');
+            let title_galley = ui.fonts(|f| f.layout_job(job));
+            let painter = ui.painter();
+            painter.galley(
+                Pos2::new(rect.left() + 9.0, rect.center().y - title_galley.size().y * 0.5),
+                title_galley,
+                Color32::WHITE,
+            );
+            painter.galley(
+                Pos2::new(rect.right() - 9.0 - count_galley.size().x, rect.center().y - count_galley.size().y * 0.5),
+                count_galley,
+                Color32::from_rgb(170, 195, 255),
+            );
+            if response.clicked() || std::mem::take(&mut self.open_tabs_menu_pending) {
+                ui.memory_mut(|m| m.toggle_popup(popup_id));
+            }
+            egui::popup_below_widget(
+                ui,
+                popup_id,
+                &response,
+                egui::PopupCloseBehavior::CloseOnClickOutside,
+                |ui| {
+                    ui.set_min_width(420.0);
+                    ui.spacing_mut().item_spacing = Vec2::new(6.0, 4.0);
+                    egui::ScrollArea::vertical().max_height(520.0).show(ui, |ui| {
+                        for (idx, tab) in self.tabs.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                let is_active = idx == self.active_tab;
+                                // Ligne cliquable : pastille de couleur de l'onglet et nom, aligné à gauche.
+                                let row_width = (ui.available_width() - 30.0).max(120.0);
+                                let (rect, row) = ui.allocate_exact_size(Vec2::new(row_width, 28.0), Sense::click());
+                                let fill = if is_active {
+                                    Color32::from_rgb(40, 52, 80)
+                                } else if row.hovered() {
+                                    Color32::from_rgb(34, 40, 54)
+                                } else {
+                                    Color32::TRANSPARENT
+                                };
+                                ui.painter().rect_filled(rect, CornerRadius::same(6), fill);
+                                ui.painter().circle_filled(
+                                    Pos2::new(rect.left() + 12.0, rect.center().y),
+                                    4.0,
+                                    tab.badge_color,
+                                );
+                                let mut name = egui::text::LayoutJob::single_section(
+                                    format!("{}{}", tab.title, if tab.is_modified { " *" } else { "" }),
+                                    egui::TextFormat {
+                                        font_id: FontId::proportional(12.5),
+                                        color: if is_active { Color32::WHITE } else { Color32::from_rgb(190, 200, 218) },
+                                        ..Default::default()
+                                    },
+                                );
+                                name.wrap.max_width = rect.width() - 34.0;
+                                name.wrap.max_rows = 1;
+                                name.wrap.break_anywhere = true;
+                                name.wrap.overflow_character = Some('…');
+                                let galley = ui.fonts(|f| f.layout_job(name));
+                                ui.painter().galley(
+                                    Pos2::new(rect.left() + 24.0, rect.center().y - galley.size().y * 0.5),
+                                    galley,
+                                    Color32::WHITE,
+                                );
+                                let row = row.on_hover_text(tab.path.display().to_string());
+                                if row.clicked() {
+                                    tab_to_select = Some(idx);
+                                }
+                                row.context_menu(|ui| tab_context_menu(ui, idx, tab, &mut tab_menu_action));
+                                if ui.small_button("✖").on_hover_text("Fermer cet onglet (Ctrl+W)").clicked() {
+                                    tab_to_close = Some(idx);
+                                }
+                            });
+                        }
                     });
-                    ui.add_space(2.0);
-                } else if let Some(reason) = &tab.ocr.unavailable_reason {
-                    ui.label(egui::RichText::new("Lecture des images indisponible").size(10.5).color(muted))
-                        .on_hover_text(reason.as_str());
-                    ui.add_space(2.0);
-                } else if image_ocr_working(image_ocr, tab.ocr.mode) && tab.ocr.page_scanned.iter().any(|scanned| !scanned) {
-                    // Affichée tant qu'il reste des pages, pas seulement pendant le calcul : en mode
-                    // éco, l'OCR se repose entre deux pages, et la ligne disparaissait puis
-                    // réapparaissait en faisant sauter les boutons du dessous.
-                    if let Some(page) = tab.ocr.in_flight_page {
-                        self.last_image_ocr_page = Some((tab.id, page));
+                    if has_tabs {
+                        ui.separator();
                     }
-                    let label = match self.last_image_ocr_page {
-                        Some((tab_id, page)) if tab_id == tab.id => format!("Lecture des images, page {}", page + 1),
-                        _ => "Lecture des images…".to_string(),
-                    };
-                    ui.horizontal(|ui| {
-                        ui.add(egui::Spinner::new().size(11.0).color(muted));
-                        ui.label(egui::RichText::new(label).size(10.5).color(muted));
-                    });
-                    ui.add_space(2.0);
+                    if ui.button("Ouvrir un PDF…   Ctrl+O").clicked() {
+                        pending_cmd = Some(PaletteCommand::OpenFileDialog);
+                        ui.memory_mut(|m| m.close_popup());
+                    }
+                    if ui.button("Rouvrir un PDF récent…   Ctrl+T").clicked() {
+                        self.command_palette.open();
+                        ui.memory_mut(|m| m.close_popup());
+                    }
+                },
+            );
+            if tab_to_select.is_some() || tab_to_close.is_some() {
+                ui.memory_mut(|m| m.close_popup());
+            }
+
+            ui.separator();
+
+            // Outils
+            if full_tools {
+                for tool in ActiveTool::all() {
+                    let (icon, label, shortcut) = tool.icon_and_label();
+                    if ui
+                        .add(icon_button(icon, self.active_tool == *tool))
+                        .on_hover_text(format!("{label} (touche {shortcut})"))
+                        .clicked()
+                    {
+                        self.active_tool = *tool;
+                    }
                 }
-
-                let pages = tab.page_dimensions.clone();
-                let page_count = pages.len();
-                let current_page = tab.viewport.current_page_index(viewport_size, &pages) + 1;
-
-                ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(current_page > 1, egui::Button::new("◀").small())
-                        .on_hover_text("Page précédente")
-                        .clicked()
-                    {
-                        tab.viewport.jump_to_page(current_page - 2, viewport_size, &pages);
-                    }
-                    ui.label(
-                        egui::RichText::new(format!("{current_page} / {page_count}"))
-                            .size(12.0)
-                            .color(Color32::WHITE),
-                    );
-                    if ui
-                        .add_enabled(current_page < page_count, egui::Button::new("▶").small())
-                        .on_hover_text("Page suivante")
-                        .clicked()
-                    {
-                        tab.viewport.jump_to_page(current_page, viewport_size, &pages);
-                    }
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("+").on_hover_text("Zoom avant").clicked() {
-                            tab.viewport.apply_zoom_around_anchor(
-                                1.2,
-                                viewport_size * 0.5,
-                                viewport_size,
-                                &pages,
-                            );
+            } else {
+                let (icon, _, _) = self.active_tool.icon_and_label();
+                let tools_popup = ui.make_persistent_id("kite_tools_popup");
+                let response = ui
+                    .add(icon_button(&format!("{icon} ⏷"), true).min_size(Vec2::new(52.0, button.y)))
+                    .on_hover_text("Outil");
+                if response.clicked() {
+                    ui.memory_mut(|m| m.toggle_popup(tools_popup));
+                }
+                egui::popup_below_widget(
+                    ui,
+                    tools_popup,
+                    &response,
+                    egui::PopupCloseBehavior::CloseOnClick,
+                    |ui| {
+                        ui.set_min_width(220.0);
+                        for tool in ActiveTool::all() {
+                            let (icon, label, shortcut) = tool.icon_and_label();
+                            let text = format!("{icon}  {label}   {shortcut}");
+                            if ui.selectable_label(self.active_tool == *tool, text).clicked() {
+                                self.active_tool = *tool;
+                            }
                         }
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    egui::RichText::new(format!("{:.0} %", tab.viewport.zoom * 100.0))
-                                        .size(11.5),
-                                )
-                                .frame(false),
-                            )
-                            .on_hover_text("Revenir à 100 %")
-                            .clicked()
-                        {
-                            pending_cmd = Some(PaletteCommand::ZoomReset100);
-                        }
-                        if ui.small_button("−").on_hover_text("Zoom arrière").clicked() {
-                            tab.viewport.apply_zoom_around_anchor(
-                                1.0 / 1.2,
-                                viewport_size * 0.5,
-                                viewport_size,
-                                &pages,
-                            );
-                        }
-                    });
-                });
+                    },
+                );
+            }
 
-                ui.horizontal(|ui| {
-                    let half = (ui.available_width() - ui.spacing().item_spacing.x) * 0.5;
+            ui.separator();
+
+            // Annuler, rétablir, enregistrer
+            if ui.add(icon_button("↩", false)).on_hover_text("Annuler (Ctrl+Z)").clicked() {
+                pending_cmd = Some(PaletteCommand::UndoAnnotation);
+            }
+            if ui.add(icon_button("↪", false)).on_hover_text("Rétablir (Ctrl+Y)").clicked() {
+                pending_cmd = Some(PaletteCommand::RedoAnnotation);
+            }
+            if ui
+                .add(icon_button("💾", false))
+                .on_hover_text("Enregistrer les annotations dans le PDF (Ctrl+S)")
+                .clicked()
+            {
+                pending_cmd = Some(PaletteCommand::SaveAnnotatedPdf);
+            }
+
+            // À droite, de droite à gauche : réglages, recherche, sommaire, zoom, page.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.add(icon_button("⚙", false)).on_hover_text("Réglages (Ctrl+,)").clicked() {
+                    self.settings_open = true;
+                }
+                if ui
+                    .add(icon_button("🔎", self.search_bar.is_open))
+                    .on_hover_text("Chercher un mot dans le PDF (Ctrl+F)")
+                    .clicked()
+                {
+                    pending_cmd = Some(PaletteCommand::OpenSearch);
+                }
+                if ui
+                    .add_enabled(has_tabs, icon_button("☰", self.outline_open))
+                    .on_hover_text("Sommaire du document")
+                    .clicked()
+                {
+                    self.outline_open = !self.outline_open;
+                }
+                ui.separator();
+
+                let zoom = page_info.map(|(_, _, z)| z).unwrap_or(1.0);
+                if full_zoom {
                     if ui
-                        .add_sized([half, 20.0], egui::Button::new("↔ Largeur"))
-                        .on_hover_text("Ajuster à la largeur (Ctrl+9)")
-                        .clicked()
-                    {
-                        pending_cmd = Some(PaletteCommand::FitToWidth);
-                    }
-                    if ui
-                        .add_sized([half, 20.0], egui::Button::new("↕ Page entière"))
-                        .on_hover_text("Afficher la page entière (Ctrl+0)")
+                        .add_enabled(has_tabs, icon_button("↕", false))
+                        .on_hover_text("Page entière (Ctrl+0)")
                         .clicked()
                     {
                         pending_cmd = Some(PaletteCommand::FitToPage);
                     }
-                });
-            });
+                    if ui
+                        .add_enabled(has_tabs, icon_button("↔", false))
+                        .on_hover_text("Toute la largeur (Ctrl+9)")
+                        .clicked()
+                    {
+                        pending_cmd = Some(PaletteCommand::FitToWidth);
+                    }
+                    if ui.add_enabled(has_tabs, icon_button("+", false)).on_hover_text("Zoom avant").clicked() {
+                        nav = Some(Nav::ZoomIn);
+                    }
+                    let label = egui::Button::new(egui::RichText::new(format!("{:.0} %", zoom * 100.0)).size(12.0))
+                        .frame(false);
+                    if ui
+                        .add_enabled_ui(has_tabs, |ui| ui.add_sized([56.0, 28.0], label))
+                        .inner
+                        .on_hover_text("Revenir à 100 %")
+                        .clicked()
+                    {
+                        pending_cmd = Some(PaletteCommand::ZoomReset100);
+                    }
+                    if ui.add_enabled(has_tabs, icon_button("−", false)).on_hover_text("Zoom arrière").clicked() {
+                        nav = Some(Nav::ZoomOut);
+                    }
+                } else {
+                    ui.add_enabled_ui(has_tabs, |ui| {
+                        ui.menu_button(egui::RichText::new(format!("{:.0} % ⏷", zoom * 100.0)).size(12.5), |ui| {
+                            let entry = |ui: &mut egui::Ui, text: &str| {
+                                let clicked = ui.button(text).clicked();
+                                if clicked {
+                                    ui.close_menu();
+                                }
+                                clicked
+                            };
+                            if entry(ui, "＋  Zoom avant") {
+                                nav = Some(Nav::ZoomIn);
+                            }
+                            if entry(ui, "−  Zoom arrière") {
+                                nav = Some(Nav::ZoomOut);
+                            }
+                            if entry(ui, "100 %") {
+                                pending_cmd = Some(PaletteCommand::ZoomReset100);
+                            }
+                            if entry(ui, "↔  Toute la largeur   Ctrl+9") {
+                                pending_cmd = Some(PaletteCommand::FitToWidth);
+                            }
+                            if entry(ui, "↕  Page entière   Ctrl+0") {
+                                pending_cmd = Some(PaletteCommand::FitToPage);
+                            }
+                        });
+                    });
+                }
+                ui.separator();
 
+                let (current, count) = page_info.map(|(c, n, _)| (c, n)).unwrap_or((0, 0));
+                if ui
+                    .add_enabled(current < count, icon_button("▶", false))
+                    .on_hover_text("Page suivante")
+                    .clicked()
+                {
+                    nav = Some(Nav::Next);
+                }
+                let page_label = egui::Button::new(
+                    egui::RichText::new(format!("{current} / {count}")).size(12.0).color(Color32::WHITE),
+                )
+                .frame(false);
+                if ui
+                    .add_enabled_ui(has_tabs, |ui| ui.add_sized([62.0, 28.0], page_label))
+                    .inner
+                    .on_hover_text("Aller à une page : Ctrl+T, puis le numéro")
+                    .clicked()
+                {
+                    self.command_palette.open();
+                }
+                if ui
+                    .add_enabled(current > 1, icon_button("◀", false))
+                    .on_hover_text("Page précédente")
+                    .clicked()
+                {
+                    nav = Some(Nav::Previous);
+                }
+
+                // Lecture des images en cours : une roue discrète, le détail au survol.
+                if let Some((label, detail, working)) = &ocr_status {
+                    let hover = match detail {
+                        Some(detail) => format!("{label}\n{detail}"),
+                        None => label.clone(),
+                    };
+                    if *working {
+                        ui.add(egui::Spinner::new().size(13.0).color(Color32::from_rgb(140, 150, 172)))
+                            .on_hover_text(hover);
+                    } else {
+                        ui.label(egui::RichText::new("⚠").color(Color32::from_rgb(250, 200, 110)))
+                            .on_hover_text(hover);
+                    }
+                }
+            });
+        });
+
+        if let (Some(nav), Some(tab)) = (nav, self.tabs.get_mut(self.active_tab)) {
+            let pages = tab.page_dimensions.clone();
+            let current = tab.viewport.current_page_index(viewport_size, &pages);
+            match nav {
+                Nav::Previous => {
+                    tab.viewport.jump_to_page(current.saturating_sub(1), viewport_size, &pages);
+                }
+                Nav::Next => {
+                    tab.viewport.jump_to_page(current + 1, viewport_size, &pages);
+                }
+                Nav::ZoomIn => {
+                    tab.viewport.apply_zoom_around_anchor(1.2, viewport_size * 0.5, viewport_size, &pages);
+                }
+                Nav::ZoomOut => {
+                    tab.viewport.apply_zoom_around_anchor(1.0 / 1.2, viewport_size * 0.5, viewport_size, &pages);
+                }
+            }
+        }
         if let Some((idx, action)) = tab_menu_action {
             self.apply_tab_menu_action(idx, action);
         }
@@ -5505,11 +5968,75 @@ impl KiteApp {
         if let Some(idx) = tab_to_close {
             self.close_tab(idx);
         }
-        if let Some(m_idx) = match_to_select {
+        if let Some(cmd) = pending_cmd {
+            self.execute_palette_command(cmd, self.canvas_size);
+        }
+    }
+
+    /// Volet du bas (disposition portrait) : lecture approfondie en cours et tiroir (sommaire,
+    /// résultats de recherche, annotation choisie), avec un bord à glisser pour sa hauteur.
+    fn render_bottom_drawer(&mut self, ctx: &Context) {
+        let (annotation, search, outline) = self.drawer_kinds();
+        let has_drawer = annotation || search || outline;
+        let deep_ocr = self.deep_ocr_visible();
+        if !has_drawer && !deep_ocr {
+            return;
+        }
+        let max_height = (ctx.screen_rect().height() * 0.6).max(120.0);
+        self.sidebar.drawer_height = self.sidebar.drawer_height.clamp(80.0, max_height);
+        let drawer_height = self.sidebar.drawer_height;
+        let mut outcome = (None, None);
+        egui::TopBottomPanel::bottom("kite_bottom_drawer")
+            .resizable(false)
+            .frame(
+                egui::Frame::NONE
+                    .fill(Color32::from_rgb(23, 26, 34))
+                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(44, 50, 66)))
+                    .inner_margin(Margin::symmetric(8, 0)),
+            )
+            .show(ctx, |ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(6.0, 4.0);
+                if has_drawer {
+                    let (splitter, response) =
+                        ui.allocate_exact_size(Vec2::new(ui.available_width(), DRAWER_SPLITTER_PX), Sense::drag());
+                    let active = response.hovered() || response.dragged();
+                    let handle = Rect::from_center_size(splitter.center(), Vec2::new(48.0, 4.0));
+                    ui.painter().rect_filled(
+                        handle,
+                        CornerRadius::same(2),
+                        if active { Color32::from_rgb(110, 150, 230) } else { Color32::from_rgb(58, 69, 96) },
+                    );
+                    if active {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+                    }
+                    if response.dragged() {
+                        self.sidebar.drawer_height =
+                            (self.sidebar.drawer_height - response.drag_delta().y).clamp(80.0, max_height);
+                    }
+                }
+                if deep_ocr {
+                    ui.add_space(4.0);
+                    self.render_deep_ocr_progress(ui);
+                }
+                if has_drawer {
+                    let width = ui.available_width();
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(width, drawer_height),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            ui.set_height(drawer_height);
+                            ui.set_clip_rect(ui.max_rect());
+                            outcome = self.render_drawer_contents(ui, drawer_height);
+                        },
+                    );
+                }
+            });
+        let (cmd, matched) = outcome;
+        if let Some(m_idx) = matched {
             self.search_bar.current_match_index = m_idx;
             self.scroll_to_current_search_match(self.canvas_size);
         }
-        if let Some(cmd) = pending_cmd {
+        if let Some(cmd) = cmd {
             self.execute_palette_command(cmd, self.canvas_size);
         }
     }
@@ -6374,6 +6901,38 @@ fn palette_entry_icon(entry: &crate::tabs::PaletteEntry) -> (&'static str, Color
 }
 
 /// L'OCR des images travaille-t-il en ce moment, d'après les réglages ? (sinon, pas de ligne d'état)
+/// La barre latérale occupe le bord gauche de l'écran (épinglée, ou ouverte au survol). Dans la
+/// disposition portrait, la barre du haut la remplace : rien à gauche.
+fn sidebar_shown(sidebar: &SidebarState, top_layout: bool) -> bool {
+    !top_layout && sidebar.is_expanded()
+}
+
+/// Menu du clic droit sur un onglet (liste de la barre latérale ou de la barre du haut).
+fn tab_context_menu(ui: &mut egui::Ui, idx: usize, tab: &DocumentTab, chosen: &mut Option<(usize, TabMenuAction)>) {
+    let mut choose = |ui: &mut egui::Ui, label: &str, action: TabMenuAction| {
+        if ui.button(label).clicked() {
+            *chosen = Some((idx, action));
+            ui.close_menu();
+        }
+    };
+    choose(ui, "Afficher dans l'explorateur de fichiers", TabMenuAction::RevealInExplorer);
+    choose(ui, "Ouvrir avec l'application par défaut", TabMenuAction::OpenWithDefaultApp);
+    ui.separator();
+    if ui.button("Copier le chemin complet").clicked() {
+        let full = std::path::absolute(&tab.path).unwrap_or_else(|_| tab.path.clone());
+        ui.ctx().copy_text(full.display().to_string());
+        ui.close_menu();
+    }
+    if ui.button("Copier le nom du fichier").clicked() {
+        ui.ctx().copy_text(tab.title.clone());
+        ui.close_menu();
+    }
+    ui.separator();
+    choose(ui, "Fermer", TabMenuAction::CloseThis);
+    choose(ui, "Fermer les autres onglets", TabMenuAction::CloseOthers);
+    choose(ui, "Fermer les onglets en dessous", TabMenuAction::CloseBelow);
+}
+
 fn image_ocr_working(setting: crate::settings::ImageOcr, mode: crate::ocr_engine::OcrSpeedMode) -> bool {
     match setting {
         crate::settings::ImageOcr::Auto => true,

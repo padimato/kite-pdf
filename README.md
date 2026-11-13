@@ -15,6 +15,7 @@ Une seule fenêtre est ouverte à la fois : un PDF ouvert depuis l'Explorateur a
 ## Fonctionnalités
 
 - **Onglets verticaux** dans une barre latérale épinglable ou masquée au survol (`Ctrl+B`). Les onglets en arrière-plan sont mis en veille pour libérer la mémoire.
+- **Écran portrait** : quand la fenêtre est plus haute que large, la barre latérale laisse place à une barre d'une ligne en haut (onglets dans un menu, outils, page, zoom) et le sommaire s'ouvre en bas. Réglable dans les Réglages : automatique, toujours la barre latérale, ou toujours la barre du haut.
 - **Barre centrale `Ctrl+T`** : rouvre un PDF de l'historique (recherche tolérante aux accents et aux abréviations), va à une page, ou trouve un outil en langage courant (« commentaire », « stabilo », « sauvegarder »). `Ctrl+Maj+T` rouvre le dernier onglet fermé.
 - **Annotations** : surlignage, texte libre, dessin, flèches et rectangles, notes avec fils de discussion. Elles sont enregistrées au format standard (ISO 32000) et relues par Acrobat.
 - **Recherche `Ctrl+F`** dans le texte du document, y compris le texte des figures et des scans grâce à l'OCR.
@@ -35,7 +36,7 @@ Une seule fenêtre est ouverte à la fois : un PDF ouvert depuis l'Explorateur a
 | `Ctrl+P` | Imprimer |
 | `Ctrl+F` | Rechercher dans le document |
 | `Ctrl+W` / `Ctrl+Tab` | Fermer / changer d'onglet |
-| `Ctrl+B` | Épingler ou masquer la barre latérale |
+| `Ctrl+B` | Épingler ou masquer la barre latérale (la barre du haut du mode portrait reste affichée) |
 | `Ctrl+9` / `Ctrl+0` | Ajuster à la largeur / à la page |
 | `V` `H` `T` `D` `R` `N` `M` | Outils : sélection, surlignage, texte, dessin, flèche, note, mesure |
 | `Ctrl+Z` / `Ctrl+Y` | Annuler / rétablir |
